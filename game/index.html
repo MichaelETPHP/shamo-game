@@ -3774,9 +3774,9 @@
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
-  <script src="/api/public/env.js"></script>
+  <!-- SHAMO_ENV -->
   <script>
-    // ═══ CONFIG: from .env via /api/public/env.js; VPS uses /shamo/api path ═══
+    // ═══ CONFIG: injected from server .env (SHAMO_*); VPS uses /shamo/api path ═══
     const SUPABASE_URL = (typeof window.SHAMO_SUPABASE_URL === 'string' && window.SHAMO_SUPABASE_URL)
       ? window.SHAMO_SUPABASE_URL.replace(/\/$/, '') : '';
     const SUPABASE_ANON = (typeof window.SHAMO_SUPABASE_ANON_KEY === 'string') ? window.SHAMO_SUPABASE_ANON_KEY : '';

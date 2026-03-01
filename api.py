@@ -20,8 +20,9 @@ load_dotenv(_env_path)
 
 from fastapi import FastAPI, HTTPException, Request, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 
 from supabase import create_client, Client
@@ -45,6 +46,56 @@ ADMIN_USER    = (os.getenv("ADMIN_USERNAME") or "").strip()
 ADMIN_PASS    = (os.getenv("ADMIN_PASSWORD") or "").strip()
 if not BOT_TOKEN:
     logger.warning("TELEGRAM_BOT_TOKEN not set in .env — /api/player/avatar-url will return 503")
+
+
+def _shamo_env_script() -> str:
+    """Public config from .env injected into HTML (no separate env.js)."""
+    def esc(s):
+        return (s or "").replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ").replace("</", "<\\/")
+    base = esc(API_BASE_URL)
+    port = esc(str(PORT))
+    supabase_url = esc(SUPABASE_URL)
+    supabase_anon = esc(os.getenv("SUPABASE_ANON_KEY", ""))
+    return (
+        f"<script>\n"
+        f"  window.SHAMO_API_BASE_URL = '{base}';\n"
+        f"  window.SHAMO_PORT = '{port}';\n"
+        f"  window.SHAMO_SUPABASE_URL = '{supabase_url}';\n"
+        f"  window.SHAMO_SUPABASE_ANON_KEY = '{supabase_anon}';\n"
+        f"</script>"
+    )
+
+
+class ShamoEnvInjectMiddleware(BaseHTTPMiddleware):
+    """Inject config from .env into HTML when serving /admin/* and /game/* (replaces env.js)."""
+    PLACEHOLDER = "<!-- SHAMO_ENV -->"
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        path = request.scope.get("path") or ""
+        if "/admin" not in path and "/game" not in path:
+            return response
+        if not (response.media_type or "").startswith("text/html"):
+            return response
+        try:
+            body_chunks = []
+            async for chunk in response.body_iterator:
+                body_chunks.append(chunk)
+            body = b"".join(body_chunks)
+        except Exception:
+            return response
+        try:
+            text = body.decode("utf-8", errors="replace")
+        except Exception:
+            return response
+        if self.PLACEHOLDER not in text:
+            return Response(content=body, status_code=response.status_code, media_type=response.media_type)
+        injected = text.replace(self.PLACEHOLDER, _shamo_env_script(), 1)
+        return Response(
+            content=injected.encode("utf-8"),
+            status_code=response.status_code,
+            media_type=response.media_type,
+        )
+
 
 # ─── Balance helpers (spin_results.amount_etb where w-status = active) ─────────
 def _extract_rpc_scalar(raw) -> float:
@@ -197,6 +248,7 @@ app.add_middleware(
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
+app.add_middleware(ShamoEnvInjectMiddleware)
 
 # Static files: /game and /admin (and /shamo/game, /shamo/admin for proxy)
 _admin_dir = os.path.join(os.path.dirname(__file__), "admin")
@@ -871,26 +923,6 @@ async def public_game_config():
     """Public: seconds per question and max wrong answers (for mini-app rules & timer). No auth."""
     sb = get_sb()
     return await _get_game_config(sb)
-
-@app.get("/api/public/env.js", include_in_schema=False)
-async def public_env_js():
-    """Public: JS from .env for admin + game (API_BASE_URL, SUPABASE_URL, SUPABASE_ANON_KEY)."""
-    def esc(s):
-        return (s or "").replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ")
-    base = esc(API_BASE_URL)
-    supabase_url = esc(SUPABASE_URL)
-    supabase_anon = esc(os.getenv("SUPABASE_ANON_KEY", ""))
-    body = (
-        f"window.SHAMO_API_BASE_URL = '{base}';\n"
-        f"window.SHAMO_PORT = '{PORT}';\n"
-        f"window.SHAMO_SUPABASE_URL = '{supabase_url}';\n"
-        f"window.SHAMO_SUPABASE_ANON_KEY = '{supabase_anon}';\n"
-    )
-    return StreamingResponse(
-        iter([body.encode("utf-8")]),
-        media_type="application/javascript",
-        headers={"Cache-Control": "no-store"},
-    )
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PUBLIC GAME ENDPOINTS — mini-app reads these (no admin token)

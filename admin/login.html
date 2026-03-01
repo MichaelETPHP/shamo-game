@@ -168,7 +168,7 @@
     <button class="btn-login" id="loginBtn" onclick="doLogin()">Sign In →</button>
     <div class="api-indicator"><span class="api-dot" id="apiDot"></span><span id="apiStatus">Checking API…</span></div>
   </div>
-  <script src="/api/public/env.js"></script>
+  <!-- SHAMO_ENV -->
   <script>
     const API = (typeof window.SHAMO_API_BASE_URL === 'string' && window.SHAMO_API_BASE_URL)
       ? (window.SHAMO_API_BASE_URL.replace(/\/$/, '') + '/api') : ('http://localhost:' + (window.SHAMO_PORT || '8001') + '/api');
