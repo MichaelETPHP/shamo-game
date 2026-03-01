@@ -2,7 +2,7 @@
 SHAMO Admin API — FastAPI backend  (v3.1 — Fixed for /shamo/ paths)
 
 Port and API base URL come from .env (PORT, API_BASE_URL).
-Run: uvicorn api:app --port $PORT --reload   (or use value from .env, default 8001)
+Run: uvicorn api:app --port $PORT --reload   (PORT from .env)
 """
 import os, json, logging, asyncio, secrets as _secrets
 from contextlib import asynccontextmanager
@@ -31,7 +31,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("shamo.api")
 
 # All from .env — see .env.example.local for descriptions
-PORT = int(os.getenv("PORT", {PORT}))
+PORT = int(os.getenv("PORT", "8001"))
 API_BASE_URL = (os.getenv("API_BASE_URL") or "").rstrip("/") or f"http://localhost:{PORT}"
 # local = redirects to /game, /admin. production/vps = redirects to /shamo/game, /shamo/admin
 APP_ENV = (os.getenv("APP_ENV") or "local").strip().lower()
@@ -882,6 +882,7 @@ async def public_env_js():
     supabase_anon = esc(os.getenv("SUPABASE_ANON_KEY", ""))
     body = (
         f"window.SHAMO_API_BASE_URL = '{base}';\n"
+        f"window.SHAMO_PORT = '{PORT}';\n"
         f"window.SHAMO_SUPABASE_URL = '{supabase_url}';\n"
         f"window.SHAMO_SUPABASE_ANON_KEY = '{supabase_anon}';\n"
     )

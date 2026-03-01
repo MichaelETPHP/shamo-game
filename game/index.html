@@ -4580,7 +4580,7 @@
       updateWithdrawButtonState();
       updateBalanceDisplay();
       if (errMsg && listAll.length === 0) {
-        el.innerHTML = '<div style="padding:20px;text-align:center;color:var(--muted);font-size:11px">Could not load. ' + errMsg + '<br><small>API: ' + (API_BASE || '') + '</small><br><small>Add ?api_base=http://localhost:8001 to URL if needed</small></div>';
+        el.innerHTML = '<div style="padding:20px;text-align:center;color:var(--muted);font-size:11px">Could not load. ' + errMsg + '<br><small>API: ' + (API_BASE || '') + '</small><br><small>Add ?api_base=http://localhost:' + (window.SHAMO_PORT || '8001') + ' to URL if needed</small></div>';
       }
     }
     var WD_PAGE_SIZE = 5;
