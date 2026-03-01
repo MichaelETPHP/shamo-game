@@ -1,15 +1,72 @@
-# Environment (never commit secrets)
-.env
-
-# Python
-.venv/
+# Python / Virtualenv
 __pycache__/
 *.py[cod]
-*.egg-info/
-.pytest_cache/
+*$py.class
+venv/
+.env
+.env.*
+!.env.example*
+!.env.example.local
+!.env.example.vps
 
-# IDE
-.idea/
-.vscode/
+# Logs & temp files
+*.log
+*.logs
+*.out
+*.err
+*.bak
 *.swp
-*.swo
+*.tmp
+*.temp
+
+# Editor & OS files
+.DS_Store
+Thumbs.db
+*.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Node.js / Frontend build (if you add npm/yarn later)
+node_modules/
+dist/
+build/
+*.min.js
+*.map
+
+# Database & migrations temp
+migrations/__pycache__/
+*.sqlite3
+*.db
+*.db-journal
+
+# Supabase / local DB
+supabase/
+.postgres/
+
+# PM2 / deployment
+.pm2/
+pm2.log
+dump.pm2
+*.pid
+
+# Misc / secrets
+*.key
+*.pem
+*.secret
+*.token
+credentials.json
+config.json
+
+# macOS / Windows junk
+.AppleDouble
+._*
+ehthumbs.db
+desktop.ini
+
+# Keep these (examples are safe)
+!.gitignore
+!README.md
+!requirements.txt
+!ecosystem.config.js
+!start_services.ps1
