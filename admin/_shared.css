@@ -184,6 +184,30 @@ body {
   border-top: 1px solid var(--border);
 }
 
+.admin-dev-footer {
+  margin-top: 0.75rem;
+  padding-top: 0.65rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: 0.05em;
+  text-align: center;
+}
+
+/* Page footer at bottom of main content */
+.admin-page-footer {
+  margin-top: auto;
+  padding: 0.75rem 1.25rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+  text-align: center;
+  background: var(--surface);
+}
+
 .user-chip {
   display: flex;
   align-items: center;

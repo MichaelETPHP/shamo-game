@@ -340,6 +340,7 @@ async function buildSidebar(activePage) {
         <div class="user-avatar">${initials}</div>
         <div class="info"><p>${user.username || 'Admin'}</p><span>Sign out</span></div>
       </div>
+      <div class="admin-dev-footer">Dev By MICHAEL</div>
     </div>`;
 
   // Load badges
@@ -351,6 +352,16 @@ async function buildSidebar(activePage) {
       if (el2 && v > 0) { el2.textContent = v; el2.style.display = ''; }
     });
   } catch { }
+
+  // Inject main-area footer (Dev By MICHAEL) if not present
+  const main = document.querySelector('.main-area');
+  if (main && !document.getElementById('admin-page-footer')) {
+    const footer = document.createElement('div');
+    footer.id = 'admin-page-footer';
+    footer.className = 'admin-page-footer';
+    footer.textContent = 'Dev By MICHAEL';
+    main.appendChild(footer);
+  }
 }
 
 // Show a full-page spinner when navigating between pages

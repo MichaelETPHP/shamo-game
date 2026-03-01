@@ -5,6 +5,7 @@ Port and API base URL come from .env (PORT, API_BASE_URL).
 Run: uvicorn api:app --port $PORT --reload   (PORT from .env)
 """
 import os, json, logging, asyncio, secrets as _secrets
+from urllib.parse import quote
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
@@ -240,15 +241,34 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
 
+# ─── Path rewrite: /shamo/api/* -> /api/* (so VPS/local can use same API under /shamo) ───
+class ShamoApiPathRewriteMiddleware:
+    """Rewrite /shamo/api/xxx to /api/xxx so routes defined as /api/... work at /shamo/api/..."""
+    def __init__(self, app):
+        self.app = app
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            path = scope.get("path") or ""
+            if path.startswith("/shamo/api"):
+                # New scope so routing sees /api/... (strip "/shamo" = 6 chars)
+                new_path = path[6:]
+                scope = {**scope, "path": new_path}
+                if "raw_path" in scope:
+                    scope["raw_path"] = new_path.encode("utf-8") if isinstance(new_path, str) else new_path
+        await self.app(scope, receive, send)
+
+
 # ─── App ──────────────────────────────────────────────────────────────────────
 app = FastAPI(title="SHAMO Admin API", version="3.1.0", docs_url="/api/docs", lifespan=lifespan)
 
+# Order: first added = innermost (runs last before routes). Path rewrite must run before route match.
+app.add_middleware(ShamoApiPathRewriteMiddleware)
+app.add_middleware(ShamoEnvInjectMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
-app.add_middleware(ShamoEnvInjectMiddleware)
 
 # Static files: /game and /admin (and /shamo/game, /shamo/admin for proxy)
 _admin_dir = os.path.join(os.path.dirname(__file__), "admin")
@@ -2197,6 +2217,9 @@ async def list_qr(_=Depends(require_admin), game_id: str = "", company_id: str =
     res = await run(_q)
     return res.data or []
 
+# External QR image API — store this URL in DB; never generate PNG locally
+QR_IMAGE_API_BASE = "https://api.qrserver.com/v1/create-qr-code/?size=160x160&data="
+
 @app.post("/api/qr")
 async def create_qr(body: QRCreateReq, _=Depends(require_admin)):
     sb = get_sb()
@@ -2206,9 +2229,12 @@ async def create_qr(body: QRCreateReq, _=Depends(require_admin)):
     expires_at = (datetime.now(timezone.utc) + timedelta(hours=body.expiry_hours)).isoformat() if body.expiry_hours > 0 else None
     base_url = body.base_url.rstrip("?")
     qr_url   = f"{base_url}?startapp={token}"
+    # Store exact external API URL for QR image (no local generation)
+    qr_image_url = QR_IMAGE_API_BASE + quote(qr_url, safe="")
     payload  = {
         "token": token, "game_id": body.game_id, "company_id": body.company_id or None,
         "created_by": created_by, "label": body.label, "qr_url": qr_url,
+        "qr_image_url": qr_image_url,
         "base_url": body.base_url, "max_scans": body.max_scans, "expires_at": expires_at,
         "status": "active", "scan_count": 0
     }
@@ -2310,23 +2336,18 @@ async def validate_qr_token(body: QRScanReq):
 
 @app.get("/api/qr/{qid}/image")
 async def get_qr_image(qid: str):
-    """Generate and stream a QR code PNG."""
-    import qrcode, io
+    """Redirect to stored QR image URL from api.qrserver.com (no local generation)."""
     sb = get_sb()
-    res = await run(lambda: sb.table("qr_codes").select("qr_url").eq("id", qid).limit(1).execute())
+    res = await run(lambda: sb.table("qr_codes").select("qr_image_url,qr_url").eq("id", qid).limit(1).execute())
     rows = res.data or []
-    if not rows: raise HTTPException(404, "QR code not found")
-    qr_url = rows[0]["qr_url"]
-
-    def _make_qr():
-        qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=10, border=2)
-        qr.add_data(qr_url); qr.make(fit=True)
-        img = qr.make_image(fill_color="#08070A", back_color="white")
-        buf = io.BytesIO(); img.save(buf, format="PNG"); buf.seek(0)
-        return buf
-
-    buf = await asyncio.to_thread(_make_qr)
-    return StreamingResponse(buf, media_type="image/png")
+    if not rows:
+        raise HTTPException(404, "QR code not found")
+    row = rows[0]
+    image_url = row.get("qr_image_url")
+    if not image_url:
+        # Backfill for rows created before qr_image_url existed
+        image_url = QR_IMAGE_API_BASE + quote((row.get("qr_url") or ""), safe="")
+    return RedirectResponse(url=image_url, status_code=302)
 
 @app.post("/api/qr/scan")
 async def record_qr_scan(body: QRScanReq):

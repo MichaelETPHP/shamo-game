@@ -438,8 +438,8 @@
             <input id="qrExpiry" type="number" value="24" min="0">
           </div>
           <div class="form-group" style="grid-column:1/-1;">
-            <label>Mini App Base URL *</label>
-            <input id="qrBaseUrl" type="url" placeholder="https://your-app.netlify.app/shamo-app.html">
+            <label style="text-transform:none;letter-spacing:0;">Base URL <span style="font-weight:normal;color:var(--muted);">(optional — filled from server config, read-only)</span></label>
+            <input id="qrBaseUrl" type="url" placeholder="Filled from config…" readonly>
           </div>
         </div>
 
@@ -524,6 +524,14 @@
       return 'SHQ_' + Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase().slice(0, 28);
     }
 
+    // Mini App base URL from server config (SHAMO_API_BASE_URL without /api)
+    function getDefaultBaseUrl() {
+      const apiBase = (typeof window.SHAMO_API_BASE_URL === 'string' && window.SHAMO_API_BASE_URL)
+        ? window.SHAMO_API_BASE_URL.replace(/\/$/, '').replace(/\/api\/?$/, '') : '';
+      if (apiBase) return apiBase;
+      return window.location.origin + (window.location.pathname.indexOf('/shamo/') !== -1 ? '/shamo/game' : '/game');
+    }
+
     // ── BUILD QR URL ────────────────────────────────────────────────
     function buildQRUrl(token, gameId, companyId, baseUrl) {
       const url = new URL(baseUrl);
@@ -578,9 +586,9 @@
 
     async function generatePreview() {
       const gameId = document.getElementById('qrGame').value;
-      const baseUrl = document.getElementById('qrBaseUrl').value.trim();
+      const baseUrl = (document.getElementById('qrBaseUrl').value.trim() || getDefaultBaseUrl());
       if (!gameId) { showToast('Select a game first!', 'error'); return; }
-      if (!baseUrl) { showToast('Enter the Mini App URL!', 'error'); return; }
+      if (!baseUrl) { showToast('Mini App base URL not set in server config.', 'error'); return; }
 
       currentToken = generateToken();
       const companyId = document.getElementById('qrCompany').value || null;
@@ -604,10 +612,10 @@
       const label = document.getElementById('qrLabel').value.trim() || 'SHAMO QR';
       const maxScans = parseInt(document.getElementById('qrMaxScans').value) || 0;
       const expiryHrs = parseInt(document.getElementById('qrExpiry').value) || 0;
-      const baseUrl = document.getElementById('qrBaseUrl').value.trim();
+      const baseUrl = (document.getElementById('qrBaseUrl').value.trim() || getDefaultBaseUrl());
 
       if (!gameId) { showToast('Select a game!', 'error'); return; }
-      if (!baseUrl) { showToast('Enter Mini App URL!', 'error'); return; }
+      if (!baseUrl) { showToast('Mini App base URL not set in server config.', 'error'); return; }
 
       const btn = document.getElementById('saveQrBtn');
       btn.disabled = true; btn.textContent = 'Saving…';
@@ -625,7 +633,6 @@
 
         btn.disabled = false; btn.textContent = '💾 Save & Download';
         showToast('QR Code saved! ✅', 'success');
-        localStorage.setItem('shamo_base_url', baseUrl);
         closeModal('createModal');
         openDetail(res);
         loadQRCodes();
@@ -672,7 +679,7 @@
       document.getElementById('qrGrid').innerHTML = list.map(qr => `
   <div class="qr-card" id="qrc_${qr.id}">
     <div class="qr-canvas-wrap" onclick="openDetail(${JSON.stringify(qr).replace(/"/g, '&quot;')})">
-      <img src="/api/qr/${qr.id}/image" width="160" height="160" alt="QR ${qr.id}" onerror="this.src='https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=${encodeURIComponent(qr.qr_url)}'"/>
+      <img src="${(qr.qr_image_url || ('/api/qr/' + qr.id + '/image'))}" width="160" height="160" alt="QR ${qr.id}" onerror="this.src='https://api.qrserver.com/v1/create-qr-code/?size=160x160&data='+encodeURIComponent(qr.qr_url||'')"/>
       <div class="qr-scan-overlay">👁 View / Download</div>
     </div>
     <div class="qr-card-body">
@@ -765,8 +772,8 @@
         a.click();
         showToast('QR PNG downloaded! ⬇', 'success');
       };
-      // Trigger load using our backend URL
-      img.src = `/api/qr/${_detailQR.id}/image`;
+      // Use stored api.qrserver.com URL from DB when present; else redirect via backend
+      img.src = _detailQR.qr_image_url || `/api/qr/${_detailQR.id}/image`;
     }
 
     // ── REVOKE QR ───────────────────────────────────────────────────
@@ -865,16 +872,11 @@
       document.getElementById('qrLabel').value = '';
       document.getElementById('qrMaxScans').value = '0';
       document.getElementById('qrExpiry').value = '24';
-      document.getElementById('qrBaseUrl').value = localStorage.getItem('shamo_base_url') || '';
+      document.getElementById('qrBaseUrl').value = getDefaultBaseUrl();
       document.getElementById('qrPreviewSection').style.display = 'none';
       currentToken = ''; currentUrl = '';
       openModal('createModal');
     }
-
-    // Remember base URL
-    document.getElementById('qrBaseUrl')?.addEventListener('change', function () {
-      localStorage.setItem('shamo_base_url', this.value);
-    });
 
     // ── REALTIME ────────────────────────────────────────────────────
     sb.channel('admin-qr')
