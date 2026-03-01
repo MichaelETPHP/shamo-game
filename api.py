@@ -31,7 +31,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("shamo.api")
 
 # All from .env — see .env.example.local for descriptions
-PORT = int(os.getenv("PORT", "8001"))
+PORT = int(os.getenv("PORT", {PORT}))
 API_BASE_URL = (os.getenv("API_BASE_URL") or "").rstrip("/") or f"http://localhost:{PORT}"
 # local = redirects to /game, /admin. production/vps = redirects to /shamo/game, /shamo/admin
 APP_ENV = (os.getenv("APP_ENV") or "local").strip().lower()
@@ -948,9 +948,9 @@ async def public_active_game():
 
 @app.get("/api/public/games/debug")
 async def debug_active_games():
-    """
+    f"""
     Public debug: shows all games with status, question count, QR count.
-    Open http://localhost:8001/api/public/games/debug to diagnose display issues.
+    Open http://localhost:{PORT}/api/public/games/debug to diagnose display issues.
     No auth required.
     """
     sb = get_sb()
