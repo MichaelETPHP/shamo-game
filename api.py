@@ -4,7 +4,7 @@ SHAMO Admin API — FastAPI backend  (v3.1 — Fixed for /shamo/ paths)
 Port and API base URL come from .env (PORT, API_BASE_URL).
 Run: uvicorn api:app --port $PORT --reload   (PORT from .env)
 """
-import os, json, logging, asyncio, secrets as _secrets
+import os, json, logging, asyncio, secrets as _secrets, uuid
 from urllib.parse import quote
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
@@ -1027,6 +1027,7 @@ async def debug_active_games():
         })
     return {"games": out, "tip": "A game shows in the mini-app when status='active'. Click ▶ Go Live in the Admin → Games page to activate."}
 
+
 @app.get("/api/public/games/active")
 async def public_active_games_list():
     """
@@ -1092,6 +1093,34 @@ async def public_active_games_list():
                      g.get("title"), g.get("company_id"), co.get("name"), co.get("logo_url"), co.get("primary_color"))
 
     return {"games": games}
+
+
+@app.get("/api/public/games/{game_id}")
+async def public_game_by_id(game_id: str):
+    """
+    Public — single game by id with company (for mini-app join sheet after QR validate).
+    No auth. Uses service key. Rejects non-UUID path segments (e.g. "active") so they hit the list route.
+    """
+    try:
+        uuid.UUID(game_id)
+    except (ValueError, TypeError):
+        raise HTTPException(404, "Game not found")
+    sb = get_sb()
+    res = await run(lambda: sb.table("games")
+        .select("id,title,status,game_date,prize_pool_etb,prize_pool_remaining,total_players,company_id")
+        .eq("id", game_id).limit(1).execute())
+    rows = res.data or []
+    if not rows:
+        raise HTTPException(404, "Game not found")
+    g = rows[0]
+    cid = g.get("company_id")
+    if cid:
+        co_res = await run(lambda: sb.table("companies")
+            .select("id,name,logo_url,primary_color").eq("id", cid).limit(1).execute())
+        g["companies"] = (co_res.data or [{}])[0] if co_res.data else {}
+    else:
+        g["companies"] = {}
+    return g
 
 
 @app.get("/api/public/leaderboard")
@@ -2522,8 +2551,7 @@ async def get_game_questions_public(game_id: str, session_id: str = ""):
         answered_ids = {r["question_id"] for r in (ans_res.data or [])}
 
     gq_res = await run(lambda: sb.table("game_questions").select(
-        "sort_order, questions!game_questions_question_id_fkey"
-        "(id,icon,question_text,category,explanation,status)"
+        "sort_order, questions(id, icon, question_text, category, explanation, status)"
     ).eq("game_id", game_id).order("sort_order").execute())
 
     rows = gq_res.data or []
@@ -2569,10 +2597,16 @@ async def submit_answer(body: AnswerReq):
 
     if body.selected_option_id:
         # Server-side truth check — client never knows is_correct in advance
-        opt_res = await run(lambda: sb.table("answer_options")
-            .select("is_correct").eq("id", body.selected_option_id).single().execute())
-        is_correct = bool((opt_res.data or {}).get("is_correct", False))
-        status_val = "correct" if is_correct else "wrong"
+        try:
+            opt_res = await run(lambda: sb.table("answer_options")
+                .select("is_correct").eq("id", str(body.selected_option_id).strip()).limit(1).execute())
+            row = (opt_res.data or [{}])[0] if opt_res.data else {}
+            is_correct = row.get("is_correct") is True
+            status_val = "correct" if is_correct else "wrong"
+        except Exception as e:
+            logger.warning("submit_answer option lookup: %s", e)
+            is_correct = False
+            status_val = "wrong"
 
     ans_payload = {
         "session_id":        body.session_id,

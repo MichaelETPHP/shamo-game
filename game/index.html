@@ -4766,7 +4766,7 @@
     async function loadActiveGame() {
       let games = [];
 
-      // ── Attempt 1: FastAPI backend (most reliable — uses service key) ──
+      // ── API only (config from .env) — backend returns games with companies + join_code ──
       try {
         const r = await fetch(API_BASE + '/shamo/api/public/games/active', { cache: 'no-store' });
         if (r.ok) {
@@ -4777,65 +4777,6 @@
           console.warn('[SHAMO] API /games/active returned', r.status);
         }
       } catch (e) { console.warn('[SHAMO] API unreachable:', e.message); }
-
-      // ── Attempt 2: Direct Supabase — NO filtering, just status=active ──
-      if (!games.length) {
-        try {
-          const h = { apikey: SUPABASE_ANON, Authorization: 'Bearer ' + SUPABASE_ANON, Accept: 'application/json' };
-          // Try with company join first
-          let r = await fetch(SUPABASE_URL + '/rest/v1/games?status=eq.active&select=*,companies(name,logo_url)&limit=10', { headers: h });
-          if (!r.ok) {
-            // If join fails (FK name issue), fall back to bare select
-            r = await fetch(SUPABASE_URL + '/rest/v1/games?status=eq.active&select=*&limit=10', { headers: h });
-          }
-          if (r.ok) {
-            const rows = await r.json().catch(() => []);
-            games = Array.isArray(rows) ? rows : [];
-            console.log('[SHAMO] Supabase fallback games:', games.length);
-          } else {
-            const err = await r.text().catch(() => '');
-            console.warn('[SHAMO] Supabase fallback error:', r.status, err.slice(0, 200));
-          }
-        } catch (fe) { console.warn('[SHAMO] Supabase fallback fetch err:', fe.message); }
-      }
-
-      // ── Enrich with QR tokens + company info ──
-      if (games.length) {
-        const h = { apikey: SUPABASE_ANON, Authorization: 'Bearer ' + SUPABASE_ANON };
-        // QR codes
-        try {
-          const ids = games.map(g => g.id).join(',');
-          const qr = await fetch(
-            SUPABASE_URL + `/rest/v1/qr_codes?game_id=in.(${ids})&status=eq.active&select=game_id,token&limit=50`, { headers: h }
-          );
-          if (qr.ok) {
-            const qrRows = await qr.json().catch(() => []);
-            const qrMap = {};
-            (qrRows || []).forEach(r => { if (!qrMap[r.game_id]) qrMap[r.game_id] = r.token; });
-            games.forEach(g => { if (!g.join_code) g.join_code = qrMap[g.id] || null; });
-          }
-        } catch (e) { console.warn('[SHAMO] QR enrich err:', e.message); }
-
-        // Company info (logo_url, primary_color) — fetch for games missing company data
-        try {
-          const coIds = [...new Set(games.filter(g => g.company_id && (!g.companies || !g.companies.name)).map(g => g.company_id))];
-          if (coIds.length) {
-            const coRes = await fetch(
-              SUPABASE_URL + `/rest/v1/companies?id=in.(${coIds.join(',')})&select=id,name,logo_url,primary_color`, { headers: h }
-            );
-            if (coRes.ok) {
-              const coRows = await coRes.json().catch(() => []);
-              const coMap = {};
-              (coRows || []).forEach(c => { coMap[c.id] = c; });
-              games.forEach(g => {
-                if (g.company_id && coMap[g.company_id]) {
-                  g.companies = { ...coMap[g.company_id], ...(g.companies || {}) };
-                }
-              });
-            }
-          }
-        } catch (e) { console.warn('[SHAMO] Company enrich err:', e.message); }
-      }
 
       console.log('[SHAMO] Final active games:', games.length,
         games.map(g => ({ title: g.title, status: g.status, id: g.id.slice(0, 8) })));
@@ -4852,15 +4793,15 @@
       document.getElementById('tickerTxt').textContent = '🔥 Live games — go to Scan to play';
       buildActiveGamesList();
 
-      // Preload questions for the primary active game
+      // Preload questions for the primary active game (via API so RLS is not required)
       try {
-        const gqs = await sb(`game_questions?game_id=eq.${S.activeGame.id}&select=*,questions(*,answer_options(*))`);
-        S.questions = (gqs || []).map(gq => ({
-          ...gq.questions,
-          options: (gq.questions?.answer_options || []).sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0))
-        })).filter(q => q && q.status === 'approved');
+        S.questions = await loadQuestionsForGame(S.activeGame.id);
+        S.questions = S.questions.map(q => ({
+          ...q,
+          options: (q.options || []).sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0))
+        }));
         S.questions = shuffleArray(S.questions);
-      } catch (qe) { console.warn('[SHAMO] Q preload:', qe); }
+      } catch (qe) { console.warn('[SHAMO] Q preload:', qe); S.questions = []; }
     }
 
     /** Until game live Feb 27 8:59 (no "Meet the END date") */
@@ -5113,49 +5054,76 @@
     function showLoading() { const s = document.getElementById('navSpinner'); if (s) s.classList.add('show'); }
     function hideLoading() { const s = document.getElementById('navSpinner'); if (s) s.classList.remove('show'); }
 
-    async function onQRScanned(raw) {
-      let token = raw;
+    function extractTokenFromQR(raw) {
+      if (!raw || typeof raw !== 'string') return '';
+      const s = raw.trim();
+      if (s.length < 6) return '';
       try {
-        const u = new URL(raw);
-        token = u.searchParams.get('startapp') || u.searchParams.get('qr') || u.searchParams.get('token') || raw;
-      } catch (e) { token = raw; }
-      token = token.trim();
+        const u = new URL(s);
+        const t = u.searchParams.get('startapp') || u.searchParams.get('qr') || u.searchParams.get('token');
+        if (t) return t.trim();
+      } catch (_) {}
+      if (/^SHQ_[A-Z0-9]+$/i.test(s)) return s;
+      return s;
+    }
+
+    async function onQRScanned(raw) {
+      const token = extractTokenFromQR(raw);
       if (!token || token.length < 6) { toast('❌ Unreadable QR code', 'error'); return; }
       document.getElementById('scanStatus').textContent = 'VALIDATING…';
       if (tg) tg.HapticFeedback?.notificationOccurred('success');
       showLoading();
       try {
-        // ── Validate QR ──
-        const qrs = await sb(`qr_codes?token=eq.${encodeURIComponent(token)}&status=eq.active&select=*`);
-        if (!qrs?.length) { hideLoading(); toast('❌ QR code invalid or expired', 'error', 4000); return; }
-        const qrCode = qrs[0];
-        if (qrCode.expires_at && new Date(qrCode.expires_at) < new Date()) { hideLoading(); toast('❌ This QR code has expired', 'error', 4000); return; }
-        if (qrCode.max_scans > 0 && qrCode.scan_count >= qrCode.max_scans) { hideLoading(); toast('❌ This QR code is full', 'error', 4000); return; }
+        // ── Validate via backend API (reads qr_codes table; no Supabase RLS dependency) ──
+        const apiUrl = API_BASE + '/shamo/api/qr/validate';
+        const r = await fetch(apiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            token: token,
+            user_id: dbUser?.id || null,
+            telegram_id: tgUser?.id || null
+          })
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!data.ok) {
+          hideLoading();
+          toast('❌ ' + (data.reason || 'QR code invalid or expired'), 'error', 4000);
+          if (data.already_played) showAlreadyPlayed(data.game_id);
+          return;
+        }
 
-        // ── RULE: One scan per QR code (new QR = new play) ──
+        const qrCode = { id: data.qr_code_id, token: data.token, game_id: data.game_id };
         if (hasScannedQRCode(qrCode.id)) {
-          hideLoading(); showAlreadyPlayed(qrCode.game_id); return;
-        }
-        if (tgUser?.id) {
-          const prevTg = await sb(`qr_scans?qr_code_id=eq.${qrCode.id}&telegram_id=eq.${tgUser.id}&select=id`);
-          if (prevTg?.length) { hideLoading(); markQRCodeScanned(qrCode.id); showAlreadyPlayed(qrCode.game_id); return; }
-        }
-        if (dbUser?.phone_number) {
-          const prevPhone = await sb(`qr_scans?qr_code_id=eq.${qrCode.id}&phone_number=eq.${dbUser.phone_number}&select=id`);
-          if (prevPhone?.length) { hideLoading(); markQRCodeScanned(qrCode.id); showAlreadyPlayed(qrCode.game_id); return; }
-        }
-        if (dbUser?.id && !dbUser.id.startsWith('dev-')) {
-          const prevUid = await sb(`qr_scans?qr_code_id=eq.${qrCode.id}&user_id=eq.${dbUser.id}&select=id`);
-          if (prevUid?.length) { hideLoading(); markQRCodeScanned(qrCode.id); showAlreadyPlayed(qrCode.game_id); return; }
+          hideLoading(); markQRCodeScanned(qrCode.id); showAlreadyPlayed(qrCode.game_id); return;
         }
 
-        // ── Load game ──
-        const games = await sb(`games?id=eq.${qrCode.game_id}&select=*,companies(name,logo_url)&limit=1`);
-        if (!games?.length) { hideLoading(); toast('❌ Game not found', 'error', 4000); return; }
-        S.qrToken = token; S.qrData = { ...qrCode, game: games[0] };
+        // ── Load game for join sheet (API from .env; fallback to validate data) ──
+        let game = null;
+        try {
+          const gr = await fetch(API_BASE + '/shamo/api/public/games/' + encodeURIComponent(data.game_id));
+          if (gr.ok) game = await gr.json().catch(() => null);
+        } catch (_) {}
+        if (!game) {
+          game = {
+            id: data.game_id,
+            title: data.game_title || 'SHAMO Game',
+            game_date: data.game_date,
+            prize_pool_etb: data.prize_pool_etb,
+            prize_pool_remaining: data.prize_pool_remaining,
+            total_players: 0,
+            companies: { name: data.company || 'SHAMO' }
+          };
+        }
+        S.qrToken = token;
+        S.qrData = { ...qrCode, game: game };
         hideLoading();
-        showCountdownThenJoin(games[0], qrCode);
-      } catch (e) { hideLoading(); console.error(e); toast('Validation error', 'error'); }
+        showCountdownThenJoin(game, qrCode);
+      } catch (e) {
+        hideLoading();
+        console.error(e);
+        toast('❌ ' + (e.message || 'Validation failed. Try again.'), 'error', 4000);
+      }
     }
 
     function showCountdownThenJoin(game, qrCode) {
@@ -5275,11 +5243,11 @@
         }
         S.qrData = { game: game };
         S.qrToken = null;
-        const gqs = await sb(`game_questions?game_id=eq.${game.id}&select=*,questions(*,answer_options(id,option_letter,option_text,sort_order))`);
-        S.questions = (gqs || []).map(gq => ({
-          ...gq.questions,
-          options: (gq.questions?.answer_options || []).sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0))
-        })).filter(q => q.status === 'approved');
+        S.questions = await loadQuestionsForGame(game.id, data.session?.id);
+        S.questions = S.questions.map(q => ({
+          ...q,
+          options: (q.options || []).sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0))
+        }));
         S.questions = shuffleArray(S.questions);
         if (!S.questions.length) { toast('No questions for this game', 'error'); return; }
         S.answeredIds = data.answered_question_ids || [];
@@ -5290,6 +5258,14 @@
       }
     }
 
+    async function loadQuestionsForGame(gameId, sessionId) {
+      const url = API_BASE + '/shamo/api/game/' + encodeURIComponent(gameId) + '/questions' + (sessionId ? '?session_id=' + encodeURIComponent(sessionId) : '');
+      const r = await fetch(url);
+      if (!r.ok) return [];
+      const list = await r.json().catch(() => []);
+      return Array.isArray(list) ? list : [];
+    }
+
     async function enterGame() {
       closeJoin();
       if (!S.qrData || !dbUser?.id) { toast('Please log in first', 'error'); return; }
@@ -5297,28 +5273,39 @@
       showLoading();
 
       try {
-        const gqs = await sb(`game_questions?game_id=eq.${game.id}&select=*,questions(*,answer_options(id,option_letter,option_text,sort_order))`);
-        S.questions = (gqs || []).map(gq => ({
-          ...gq.questions,
-          options: (gq.questions?.answer_options || []).sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0))
-        })).filter(q => q.status === 'approved');
+        S.questions = await loadQuestionsForGame(game.id);
+        S.questions = S.questions.map(q => ({
+          ...q,
+          options: (q.options || []).sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0))
+        }));
         S.questions = shuffleArray(S.questions);
-      } catch (e) { console.warn('Q load:', e); }
+      } catch (e) { console.warn('Q load:', e); S.questions = []; }
       if (!S.questions.length) { hideLoading(); toast('No questions found for this game', 'error'); return; }
 
       S.activeGame = game;
 
+      // 1) Record QR scan via API (stores in qr_scans — never scan again with same phone/user)
       try {
-        await sb('qr_scans', {
-          method: 'POST', body: JSON.stringify({
-            qr_code_id: S.qrData.id, qr_token: S.qrToken, game_id: game.id,
-            user_id: dbUser.id, telegram_id: tgUser?.id,
-            phone_number: dbUser.phone_number || null, entry_status: 'entered'
+        const scanRes = await fetch(API_BASE + '/shamo/api/qr/scan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            token: S.qrToken,
+            game_id: game.id,
+            user_id: dbUser.id,
+            telegram_id: tgUser?.id || null,
+            phone_number: dbUser.phone_number || null
           })
         });
+        const scanData = await scanRes.json().catch(() => ({}));
+        if (scanData.entry_status === 'already_scanned') {
+          hideLoading();
+          markQRCodeScanned(S.qrData.id);
+          showAlreadyPlayed(game.id);
+          return;
+        }
       } catch (e) {
-        if (String(e?.code || e?.message || e).toLowerCase().includes('duplicate') ||
-            String(e?.code || e?.message || e).includes('23505')) {
+        if (String(e?.message || e).toLowerCase().includes('already') || String(e?.message || e).includes('23505')) {
           hideLoading(); markQRCodeScanned(S.qrData.id); showAlreadyPlayed(game.id); return;
         }
         console.warn('Scan record:', e);
@@ -5326,7 +5313,33 @@
 
       markGamePlayed(game.id);
       markQRCodeScanned(S.qrData.id);
-      S.session = null; // new QR = new session
+
+      // 2) Create game session via API (so we have S.session for answers/spin)
+      try {
+        const sessRes = await fetch(API_BASE + '/shamo/api/game/session/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            game_id: game.id,
+            user_id: dbUser.id,
+            telegram_id: tgUser?.id || null,
+            qr_token: S.qrToken
+          })
+        });
+        const sessData = await sessRes.json().catch(() => ({}));
+        if (sessData.session) {
+          S.session = sessData.session;
+          S.answeredIds = sessData.answered_question_ids || [];
+          if (sessData.game_config) {
+            S.gameConfig = {
+              seconds_per_question: sessData.game_config.seconds_per_question ?? 4,
+              max_wrong_answers: sessData.game_config.max_wrong_answers ?? 3,
+              questions_per_game: sessData.game_config.questions_per_game ?? 10
+            };
+            applyGameConfigToDOM();
+          }
+        }
+      } catch (e) { console.warn('Session start:', e); }
       await startGame();
       hideLoading();
     }
@@ -5339,15 +5352,25 @@
 
       if (dbUser?.id && !S.session) {
         try {
-          const r = await sb('game_sessions', {
-            method: 'POST', body: JSON.stringify({
-              game_id: S.activeGame.id, user_id: dbUser.id,
-              qr_code_id: S.qrData?.id || null,
-              player_cap_etb: (S.activeGame.prize_pool_etb || 0) * 0.3
+          const r = await fetch(API_BASE + '/shamo/api/game/session/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              game_id: S.activeGame.id,
+              user_id: dbUser.id,
+              telegram_id: tgUser?.id || null,
+              qr_token: S.qrToken || null
             })
           });
-          S.session = Array.isArray(r) ? r[0] : r;
-          S.answeredIds = getAnsweredQuestions(S.session?.id || '');
+          const d = await r.json().catch(() => ({}));
+          if (d.session) {
+            S.session = d.session;
+            S.answeredIds = d.answered_question_ids || [];
+            if (d.game_config) {
+              S.gameConfig = { seconds_per_question: d.game_config.seconds_per_question ?? 4, max_wrong_answers: d.game_config.max_wrong_answers ?? 3, questions_per_game: d.game_config.questions_per_game ?? 10 };
+              applyGameConfigToDOM();
+            }
+          }
         } catch (e) { console.warn('Session:', e); }
       }
 
@@ -5409,13 +5432,16 @@
           // Mark question as answered (timeout = used up, never repeat)
           markQuestionAnswered(S.session?.id || 'local', q.id);
           S.answeredIds.push(q.id);
-          if (dbUser?.id && S.session?.id)
-            sb('round_answers', {
-              method: 'POST', body: JSON.stringify({
+          if (dbUser?.id && S.session?.id) {
+            fetch(API_BASE + '/shamo/api/game/answer', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
                 session_id: S.session.id, user_id: dbUser.id, game_id: S.activeGame.id,
-                question_id: q.id, question_number: cur, status: 'timeout', is_correct: false, time_taken_ms: QUESTION_SEC * 1000
+                question_id: q.id, question_number: cur, time_taken_ms: QUESTION_SEC * 1000
               })
-            }).catch(() => { });
+            }).then(r => r.json()).then(d => { if (d.session) S.session = d.session; if (typeof d.wrong_count === 'number') S.wrongCount = d.wrong_count; }).catch(() => {});
+          }
           playWrongSound();
           setTimeout(() => { qOv.classList.remove('show'); onWrong('timeout'); }, 700);
         }
@@ -5435,42 +5461,40 @@
       markQuestionAnswered(S.session?.id || 'local', q.id);
       S.answeredIds.push(q.id);
 
-      // SERVER-SIDE CORRECTNESS CHECK — client never sees is_correct
+      // SERVER-SIDE CORRECTNESS — POST /api/game/answer returns is_correct (never trust client)
       let isCorrect = false;
-      try {
-        const optRow = await sb(`answer_options?id=eq.${optId}&select=is_correct`);
-        isCorrect = optRow?.[0]?.is_correct === true;
-      } catch (e) {
-        // Fallback: check locally if is_correct happened to be loaded (old question set)
-        isCorrect = q.options?.find(o => o.id === optId)?.is_correct === true;
+      let correctOptionId = null;
+      if (dbUser?.id && S.session?.id) {
+        try {
+          const ansRes = await fetch(API_BASE + '/shamo/api/game/answer', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              session_id: S.session.id,
+              user_id: dbUser.id,
+              game_id: S.activeGame.id,
+              question_id: q.id,
+              selected_option_id: optId,
+              question_number: cur,
+              time_taken_ms: ms
+            })
+          });
+          const ansData = await ansRes.json().catch(() => ({}));
+          isCorrect = ansData.is_correct === true;
+          correctOptionId = ansData.correct_option_id || null;
+          if (ansData.session) S.session = ansData.session;
+          if (typeof ansData.wrong_count === 'number') S.wrongCount = ansData.wrong_count;
+        } catch (e) { console.warn('Answer submit:', e); }
       }
 
       // Visual feedback
       document.getElementById('opt' + chosen).classList.add(isCorrect ? 'correct' : 'wrong');
       if (!isCorrect) playWrongSound();
-      if (!isCorrect) {
-        // Show correct answer highlight
-        const correctIdx = (q.options || []).findIndex(o => o.id !== optId && (q.options.indexOf(o) === q.options.findIndex(x => x.is_correct)));
-        // Try to find correct option visually by querying DB or by checking all options
-        try {
-          const correctOpt = await sb(`answer_options?question_id=eq.${q.id}&is_correct=eq.true&select=id`);
-          if (correctOpt?.[0]) {
-            const ci = (q.options || []).findIndex(o => o.id === correctOpt[0].id);
-            if (ci >= 0) document.getElementById('opt' + ci)?.classList.add('correct');
-          }
-        } catch (e) { /* silent */ }
+      if (!isCorrect && correctOptionId) {
+        const ci = (q.options || []).findIndex(o => o.id === correctOptionId);
+        if (ci >= 0) document.getElementById('opt' + ci)?.classList.add('correct');
       }
       if (tg) tg.HapticFeedback?.notificationOccurred(isCorrect ? 'success' : 'error');
-
-      // Record to DB
-      if (dbUser?.id && S.session?.id)
-        sb('round_answers', {
-          method: 'POST', body: JSON.stringify({
-            session_id: S.session.id, user_id: dbUser.id, game_id: S.activeGame.id,
-            question_id: q.id, selected_option_id: optId, question_number: cur,
-            is_correct: isCorrect, status: isCorrect ? 'correct' : 'wrong', time_taken_ms: ms
-          })
-        }).catch(() => { });
 
       if (isCorrect) {
         setTimeout(() => { qOv.classList.remove('show'); showWheel(); }, 600);
