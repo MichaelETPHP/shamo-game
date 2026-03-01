@@ -720,7 +720,9 @@
       document.getElementById('detailUrl').textContent = qr.qr_url;
 
       const img = document.getElementById('detailImage');
-      img.src = `/api/qr/${qr.id}/image`;
+      const fallbackUrl = `/api/qr/${qr.id}/image`;
+      img.onerror = function () { if (this.src !== fallbackUrl) this.src = fallbackUrl; };
+      img.src = (qr.qr_image_url && qr.qr_image_url.trim()) ? qr.qr_image_url : fallbackUrl;
 
       document.getElementById('revokeBtn').onclick = () => revokeQR(_detailQR?.id);
       document.getElementById('deleteBtn').onclick = () => deleteQR(_detailQR?.id);
