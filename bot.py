@@ -39,6 +39,9 @@ from telegram.ext import (
     filters,
 )
 
+# Auto-delete delays (seconds) — bot can only delete its own messages, within 48 hours (Telegram limit)
+AUTO_DELETE_DELAY = 1 * 60  # 1 minute for all bot messages (clean chat)
+
 # ─── Logging ────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -171,6 +174,58 @@ def _contact_keyboard() -> ReplyKeyboardMarkup:
         one_time_keyboard=True,
     )
 
+def _schedule_delete_message(bot, chat_id: int, message_id: int, delay_seconds: int) -> None:
+    """
+    Schedule deletion of the bot's own message after delay. Force-delete with retries.
+    Telegram allows delete only within 48 hours. Runs in background; does not block.
+    """
+    if delay_seconds <= 0:
+        return
+    chat_id = int(chat_id)
+    message_id = int(message_id)
+
+    async def _do_delete() -> None:
+        try:
+            await asyncio.sleep(delay_seconds)
+        except asyncio.CancelledError:
+            return
+        # Force delete with retries (Telegram can be briefly inconsistent)
+        for attempt in range(3):
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=message_id)
+                logger.info("Auto-delete: removed message %s in chat %s", message_id, chat_id)
+                return
+            except Forbidden:
+                return  # no permission or chat left
+            except BadRequest as e:
+                err = str(e).lower()
+                if "message to delete not found" in err or "message can't be deleted" in err:
+                    return
+                if attempt < 2:
+                    await asyncio.sleep(1.0)
+                    continue
+                logger.warning("Auto-delete failed chat=%s msg=%s: %s", chat_id, message_id, e)
+                return
+            except Exception as e:
+                if attempt < 2:
+                    await asyncio.sleep(1.0)
+                    continue
+                logger.warning("Auto-delete failed chat=%s msg=%s: %s", chat_id, message_id, e)
+                return
+
+    try:
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(_do_delete())
+        # Keep reference so task is not lost (optional but helps in some environments)
+        if not hasattr(_schedule_delete_message, "_tasks"):
+            _schedule_delete_message._tasks = set()
+        _schedule_delete_message._tasks.discard(task)
+        _schedule_delete_message._tasks.add(task)
+        task.add_done_callback(lambda t: _schedule_delete_message._tasks.discard(t))
+    except RuntimeError:
+        logger.warning("Auto-delete: no running event loop, cannot schedule delete")
+
+
 def _webapp_keyboard(payload: str = None) -> InlineKeyboardMarkup:
     # If payload provided, append it to the WebApp URL (deep-linking)
     # Telegram sends /start payload as startapp, which opens the WebApp with tgWebAppStartParam
@@ -196,7 +251,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if payload:
         context.user_data["startapp_payload"] = payload
 
-    await context.bot.send_message(
+    msg = await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=(
             f"👋 Welcome to *SHAMO*, {user.first_name}! ሻሞ 🎯\n\n"
@@ -205,6 +260,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ),
         reply_markup=_contact_keyboard(),
         parse_mode="Markdown",
+    )
+    _schedule_delete_message(
+        context.bot, update.effective_chat.id, msg.message_id, AUTO_DELETE_DELAY
     )
 
 
@@ -270,18 +328,21 @@ async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # Confirm: show shared info (username + phone) — Telegram provides this when user shares
     handle = f"@{user.username}" if user.username else user.first_name or "User"
-    await context.bot.send_message(
+    msg1 = await context.bot.send_message(
         chat_id=chat_id,
         text=f"✅ *Shared & saved*\n\n{handle} · {phone}\n\nYou can continue in the app.",
         reply_markup=ReplyKeyboardRemove(),
         parse_mode="Markdown",
+    )
+    _schedule_delete_message(
+        context.bot, chat_id, msg1.message_id, AUTO_DELETE_DELAY
     )
 
     # Retrieve any deep-linking payload passed in /start
     payload = context.user_data.pop("startapp_payload", None)
 
     # Send Mini App button
-    await context.bot.send_message(
+    msg2 = await context.bot.send_message(
         chat_id=chat_id,
         text=(
             "🏆 *SHAMO Prize Game* ሻሞ\n\n"
@@ -293,33 +354,44 @@ async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         reply_markup=_webapp_keyboard(payload),
         parse_mode="Markdown",
     )
+    _schedule_delete_message(
+        context.bot, chat_id, msg2.message_id, AUTO_DELETE_DELAY
+    )
 
 
 async def play_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/play — quick shortcut to open the Mini App."""
     args = context.args
     payload = args[0] if args else None
-    
-    await update.message.reply_text(
+
+    msg = await update.message.reply_text(
         text="🎮 Open SHAMO now 👇",
         reply_markup=_webapp_keyboard(payload),
+    )
+    _schedule_delete_message(
+        context.bot, update.effective_chat.id, msg.message_id, AUTO_DELETE_DELAY
     )
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/help — list available commands."""
-    await update.message.reply_text(
+    msg = await update.message.reply_text(
         "📋 *SHAMO Commands*\n\n"
         "/start — register with your phone & get game link\n"
         "/play  — open the SHAMO Mini App directly\n"
-        "/help  — show this message\n\n"
-        "🌐 Game URL: " + SHAMO_WEBAPP_URL,
+        "/help  — show this message\n\n",
         parse_mode="Markdown",
+    )
+    _schedule_delete_message(
+        context.bot, update.effective_chat.id, msg.message_id, AUTO_DELETE_DELAY
     )
 
 
 async def unknown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("❓ Unknown command. Try /help")
+    msg = await update.message.reply_text("❓ Unknown command. Try /help")
+    _schedule_delete_message(
+        context.bot, update.effective_chat.id, msg.message_id, AUTO_DELETE_DELAY
+    )
 
 
 # ─── Error handler ───────────────────────────────────────────
@@ -364,6 +436,11 @@ def _format_starts_at(starts_at_raw) -> str:
         return f"{dt.strftime('%b %d')} at {time_str}"
     except Exception:
         return str(starts_at_raw)[:19] if starts_at_raw else "Soon"
+
+
+def _format_expires_at(expires_at_raw) -> str:
+    """Format expiry as 'Today at 9:00 PM' or 'Feb 28 at 9:00 PM'. Same as _format_starts_at."""
+    return _format_starts_at(expires_at_raw)
 
 
 async def broadcast_new_game(game: dict) -> dict:
@@ -478,6 +555,156 @@ async def broadcast_new_game(game: dict) -> dict:
         return {"sent": sent, "failed": failed, "blocked": blocked, "total": total}
     except Exception as e:
         logger.error("Broadcast fetch failed: %s", e)
+        return {"sent": 0, "failed": 0, "blocked": 0, "total": 0}
+
+
+# ─── Broadcast: notify users when a QR code is generated (notification center) ─
+async def broadcast_new_qr(qr: dict, game: dict, company: dict | None = None) -> dict:
+    """
+    Send "New game live + QR image" to all users with telegram_id and notifications_enabled.
+    Message: game details + QR code image in Telegram so users can scan directly.
+    Same rate limit and Forbidden handling as broadcast_new_game.
+    """
+    from datetime import datetime, timezone
+    from supabase import create_client
+
+    sent = 0
+    failed = 0
+    blocked = 0
+    total = 0
+
+    sb_url = os.getenv("SUPABASE_URL", "")
+    sb_key = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_ANON_KEY", "")
+    if not sb_url or not sb_key:
+        logger.error("Broadcast QR: SUPABASE_URL / SUPABASE_SERVICE_KEY not set")
+        return {"sent": 0, "failed": 0, "blocked": 0, "total": 0}
+
+    try:
+        sb = create_client(sb_url, sb_key)
+
+        def _fetch_users():
+            q = sb.table("users").select("id,telegram_id,notifications_enabled")
+            try:
+                return q.not_.is_("telegram_id", "null").eq("notifications_enabled", True).execute()
+            except Exception:
+                res = q.not_.is_("telegram_id", "null").execute()
+                return res
+
+        loop = asyncio.get_event_loop()
+        res = await loop.run_in_executor(None, _fetch_users)
+        users = res.data or []
+        users = [u for u in users if u.get("telegram_id") is not None and u.get("notifications_enabled", True) is not False]
+        total = len(users)
+
+        if total == 0:
+            logger.info("Broadcast QR: no users to notify")
+            return {"sent": 0, "failed": 0, "blocked": 0, "total": 0}
+
+        app = get_bot_app()
+        if not app or not app.bot:
+            logger.warning("Broadcast QR: bot not available")
+            return {"sent": 0, "failed": 0, "blocked": 0, "total": total}
+
+        bot = app.bot
+        game_title = (game or {}).get("title") or "SHAMO Game"
+        company_name = (company or {}).get("name") if company else None
+        prize_pool = (game or {}).get("prize_pool_etb") or 0
+        total_players = (game or {}).get("total_players") or 0
+        # Expires: prefer QR expiry, then game ends_at
+        expires_raw = (qr or {}).get("expires_at") or (game or {}).get("ends_at")
+        expires_str = _format_expires_at(expires_raw) if expires_raw else "—"
+        location = (game or {}).get("location")  # optional; many games don't have it
+        max_players = (game or {}).get("max_players")
+        players_line = f"👥 Players: {total_players}" + (f" / {max_players} spots" if max_players else "")
+
+        caption = (
+            "🎮 *New SHAMO Game is Live\\!*\n\n"
+            f"🏢 Sponsored by: {company_name or 'SHAMO'}\n"
+            f"💰 Prize Pool: {prize_pool:,.0f} ETB\n"
+        )
+        if location:
+            caption += f"📍 Location: {location}\n"
+        caption += f"⏰ Expires: {expires_str}\n\n"
+        caption += "Scan the QR code below to join 👆"
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(text="🎯 Play Now", web_app=WebAppInfo(url=SHAMO_WEBAPP_URL))
+        ]])
+
+        qr_image_url = (qr or {}).get("qr_image_url")
+        use_photo = bool(qr_image_url)
+
+        for i, user in enumerate(users):
+            tg_id = user.get("telegram_id")
+            if tg_id is None:
+                continue
+            try:
+                if use_photo:
+                    msg = await bot.send_photo(
+                        chat_id=tg_id,
+                        photo=qr_image_url,
+                        caption=caption,
+                        reply_markup=keyboard,
+                        parse_mode="Markdown",
+                    )
+                else:
+                    msg = await bot.send_message(
+                        chat_id=tg_id,
+                        text=caption.replace("\\!", "!"),
+                        reply_markup=keyboard,
+                        parse_mode="Markdown",
+                    )
+                sent += 1
+                _schedule_delete_message(
+                    bot, tg_id, msg.message_id, AUTO_DELETE_DELAY
+                )
+            except Forbidden:
+                blocked += 1
+                try:
+                    def _update(tid=tg_id):
+                        sb.table("users").update({"notifications_enabled": False}).eq("telegram_id", tid).execute()
+                    await loop.run_in_executor(None, _update)
+                except Exception as e:
+                    logger.warning("Broadcast QR: could not update notifications_enabled for tg_id=%s: %s", tg_id, e)
+            except BadRequest:
+                failed += 1
+            except RetryAfter as e:
+                await asyncio.sleep(e.retry_after)
+                try:
+                    if use_photo:
+                        msg = await bot.send_photo(
+                            chat_id=tg_id,
+                            photo=qr_image_url,
+                            caption=caption,
+                            reply_markup=keyboard,
+                            parse_mode="Markdown",
+                        )
+                    else:
+                        msg = await bot.send_message(
+                            chat_id=tg_id,
+                            text=caption.replace("\\!", "!"),
+                            reply_markup=keyboard,
+                            parse_mode="Markdown",
+                        )
+                    sent += 1
+                    _schedule_delete_message(
+                        bot, tg_id, msg.message_id, AUTO_DELETE_DELAY
+                    )
+                except Exception:
+                    failed += 1
+            except Exception as e:
+                logger.warning("Broadcast QR: failed for tg_id=%s: %s", tg_id, e)
+                failed += 1
+
+            await asyncio.sleep(0.05)
+
+            if (i + 1) % 50 == 0:
+                logger.info("Broadcast QR progress: %d/%d", i + 1, total)
+
+        logger.info("Broadcast QR done: sent=%d failed=%d blocked=%d", sent, failed, blocked)
+        return {"sent": sent, "failed": failed, "blocked": blocked, "total": total}
+    except Exception as e:
+        logger.error("Broadcast QR failed: %s", e)
         return {"sent": 0, "failed": 0, "blocked": 0, "total": 0}
 
 

@@ -201,7 +201,7 @@ async def _enrich_game_for_broadcast(sb, game: dict) -> dict:
 async def trigger_broadcast(game: dict) -> None:
     """
     Fire-and-forget: notify all users of new game via Telegram bot.
-    Never blocks the API response. Logs success or failure.
+    (Currently unused: notification center is for QR generation only.)
     """
     try:
         from bot import get_bot_app, broadcast_new_game
@@ -213,6 +213,23 @@ async def trigger_broadcast(game: dict) -> None:
             logger.warning("Bot not available for broadcast")
     except Exception as e:
         logger.error("Broadcast trigger failed: %s", e)
+
+
+async def trigger_broadcast_qr(qr: dict, game: dict, company: dict | None = None) -> None:
+    """
+    Fire-and-forget: notify all users when a QR code is generated (notification center).
+    Never blocks the API response. Logs success or failure.
+    """
+    try:
+        from bot import get_bot_app, broadcast_new_qr
+        app = get_bot_app()
+        if app and app.bot:
+            stats = await broadcast_new_qr(qr, game, company)
+            logger.info("Broadcast QR complete: %s", stats)
+        else:
+            logger.warning("Bot not available for QR broadcast")
+    except Exception as e:
+        logger.error("Broadcast QR trigger failed: %s", e)
 
 
 # ─── Lifespan ─────────────────────────────────────────────────────────────────
@@ -1507,10 +1524,7 @@ async def create_game(body: GameCreate, _=Depends(require_admin)):
     payload["prize_pool_remaining"] = payload["prize_pool_etb"]
     res = await run(lambda: sb.table("games").insert(payload).execute())
     game_data = (res.data or [{}])[0]
-    # Fire-and-forget broadcast when game is active or scheduled
-    if game_data.get("status") in ("active", "scheduled"):
-        game_with_company = await _enrich_game_for_broadcast(sb, game_data)
-        asyncio.create_task(trigger_broadcast(game_with_company))
+    # Notification center: we notify users on QR generation only, not on game creation
     return game_data
 
 @app.put("/api/games/{gid}")
@@ -1555,11 +1569,7 @@ async def activate_game(gid: str, _=Depends(require_admin)):
         raise HTTPException(400, f"No active QR codes found for this game. Generate at least one QR code in QR Manager.")
     await run(lambda: sb.table("games").update({"status": "active"}).eq("id", gid).execute())
     logger.info("activate_game: gid=%s questions=%d qr_codes=%d", gid, gq_count, qr_count)
-    # Fire-and-forget broadcast for new active game
-    game_res = await run(lambda: sb.table("games").select("*").eq("id", gid).single().execute())
-    if game_res.data:
-        game_with_company = await _enrich_game_for_broadcast(sb, game_res.data)
-        asyncio.create_task(trigger_broadcast(game_with_company))
+    # Notification center: we notify users on QR generation only, not on game activation
     return {"status": "active", "questions": gq_count, "qr_codes": qr_count}
 
 @app.post("/api/games/{gid}/end")
@@ -2331,7 +2341,26 @@ async def create_qr(body: QRCreateReq, _=Depends(require_admin)):
         "status": "active", "scan_count": 0
     }
     res = await run(lambda: sb.table("qr_codes").insert(payload).execute())
-    return (res.data or [{}])[0]
+    qr_row = (res.data or [{}])[0]
+    # Notification center: notify users when a QR code is generated (fire-and-forget)
+    try:
+        game_id = qr_row.get("game_id")
+        company_id = qr_row.get("company_id")
+        game_data = None
+        company_data = None
+        if game_id:
+            g_res = await run(lambda: sb.table("games").select(
+                "id,title,game_date,status,prize_pool_etb,total_players,ends_at,company_id"
+            ).eq("id", game_id).single().execute())
+            game_data = g_res.data
+        if company_id:
+            c_res = await run(lambda: sb.table("companies").select("id,name").eq("id", company_id).single().execute())
+            company_data = c_res.data
+        if qr_row and game_data:
+            asyncio.create_task(trigger_broadcast_qr(qr_row, game_data, company_data))
+    except Exception as e:
+        logger.warning("QR broadcast trigger skipped: %s", e)
+    return qr_row
 
 @app.post("/api/qr/delete")
 async def delete_qr(body: QRDeleteReq, _=Depends(require_admin)):
@@ -2496,6 +2525,44 @@ async def revoke_qr(qid: str, _=Depends(require_admin)):
     sb = get_sb()
     await run(lambda: sb.table("qr_codes").update({"status": "revoked"}).eq("id", qid).execute())
     return {"ok": True, "status": "revoked", "id": qid}
+
+
+@app.post("/api/admin/broadcast-qr/{qr_id}")
+async def admin_broadcast_qr(qr_id: str, _=Depends(require_admin)):
+    """
+    Manually trigger notification-center broadcast for a QR code.
+    Sends "New QR code ready" to all users with notifications_enabled.
+    """
+    sb = get_sb()
+    qr_res = await run(lambda: sb.table("qr_codes").select("*").eq("id", qr_id).limit(1).execute())
+    if not qr_res.data:
+        raise HTTPException(404, "QR code not found")
+    qr = qr_res.data[0]
+    game_id = qr.get("game_id")
+    company_id = qr.get("company_id")
+    game_data = None
+    company_data = None
+    if game_id:
+        g_res = await run(lambda: sb.table("games").select(
+            "id,title,game_date,status,prize_pool_etb,total_players,ends_at,company_id"
+        ).eq("id", game_id).single().execute())
+        game_data = g_res.data
+    if company_id:
+        c_res = await run(lambda: sb.table("companies").select("id,name").eq("id", company_id).single().execute())
+        company_data = c_res.data
+    if not game_data:
+        raise HTTPException(400, "QR code has no game")
+    try:
+        from bot import get_bot_app, broadcast_new_qr
+        app = get_bot_app()
+        if app and app.bot:
+            stats = await broadcast_new_qr(qr, game_data, company_data)
+            return {"message": "QR broadcast sent", "qr_id": qr_id, "stats": stats}
+        return {"message": "QR broadcast requested", "qr_id": qr_id, "stats": None, "warning": "Bot not available"}
+    except Exception as e:
+        logger.error("Admin broadcast QR failed: %s", e)
+        raise HTTPException(500, str(e))
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GAME SESSIONS & TRIVIA FLOW (public — mini-app)
