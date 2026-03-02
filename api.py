@@ -1796,10 +1796,49 @@ async def reject_question(qid: str, body: RejectReq, _=Depends(require_admin)):
 # ═══════════════════════════════════════════════════════════════════════════════
 # WITHDRAWALS
 # ═══════════════════════════════════════════════════════════════════════════════
+@app.get("/api/withdrawals-summary")
+async def withdrawals_summary(
+    _=Depends(require_admin), status: str = "", search: str = ""
+):
+    """Aggregate totals for report: total_requested, total_fee, total_paid, total_count (same filters as list)."""
+    sb = get_sb()
+    empty = {"total_requested": 0, "total_fee": 0, "total_paid": 0, "total_count": 0}
+
+    def _query():
+        q = sb.table("withdrawals").select("amount_requested,fee_etb,amount_paid,phone_number")
+        if status:
+            q = q.eq("status", status)
+        if search and search.strip():
+            s = search.strip().replace(",", " ").replace("%", "")[:80]
+            q = q.ilike("phone_number", f"%{s}%")
+        return q.limit(10000).execute()
+
+    try:
+        res = await run(_query)
+    except Exception as e:
+        logger.warning("withdrawals_summary query failed: %s", e)
+        return empty
+    rows = res.data or []
+    try:
+        total_requested = sum(float(r.get("amount_requested") or 0) for r in rows)
+        total_fee = sum(float(r.get("fee_etb") or 0) for r in rows)
+        total_paid = sum(float(r.get("amount_paid") or 0) for r in rows)
+        return {
+            "total_requested": round(total_requested, 2),
+            "total_fee": round(total_fee, 2),
+            "total_paid": round(total_paid, 2),
+            "total_count": len(rows),
+        }
+    except (TypeError, ValueError) as e:
+        logger.warning("withdrawals_summary sum failed: %s", e)
+        return empty
+
+
 @app.get("/api/withdrawals")
 async def list_withdrawals(
     request: Request, _=Depends(require_admin),
-    page: int = 1, per_page: int = 20, status: str = "", search: str = ""
+    page: int = 1, per_page: int = 20, status: str = "", search: str = "",
+    include_summary: bool = False
 ):
     sb = get_sb()
     def _query():
@@ -1821,10 +1860,34 @@ async def list_withdrawals(
         w["user_name"]         = f"{user.get('first_name','') or ''} {user.get('last_name','') or ''}".strip() or "—"
         w["user_phone"]        = user.get("phone_number")
         w["telegram_username"] = user.get("telegram_username")
-    return {"data": withdrawals, "total": res.count or 0, "page": page, "per_page": per_page}
+
+    out = {"data": withdrawals, "total": res.count or 0, "page": page, "per_page": per_page}
+    if include_summary:
+        try:
+            def _sum_query():
+                q = sb.table("withdrawals").select("amount_requested,fee_etb,amount_paid")
+                if status: q = q.eq("status", status)
+                if search and search.strip():
+                    s = search.strip().replace(",", " ").replace("%", "")[:80]
+                    q = q.ilike("phone_number", f"%{s}%")
+                return q.limit(10000).execute()
+            sum_res = await run(_sum_query)
+            rows = sum_res.data or []
+            out["summary"] = {
+                "total_requested": round(sum(float(r.get("amount_requested") or 0) for r in rows), 2),
+                "total_fee": round(sum(float(r.get("fee_etb") or 0) for r in rows), 2),
+                "total_paid": round(sum(float(r.get("amount_paid") or 0) for r in rows), 2),
+                "total_count": len(rows),
+            }
+        except Exception as e:
+            logger.warning("withdrawals list include_summary failed: %s", e)
+            out["summary"] = {"total_requested": 0, "total_fee": 0, "total_paid": 0, "total_count": 0}
+    return out
 
 @app.get("/api/withdrawals/{wid}")
 async def get_withdrawal(wid: str, _=Depends(require_admin)):
+    if not _is_valid_uuid(wid):
+        raise HTTPException(404, "Withdrawal not found")
     sb = get_sb()
     res = await run(lambda: sb.table("withdrawals").select(
         "*, user:users!withdrawals_user_id_fkey(first_name,last_name,phone_number,telegram_username)"
@@ -2713,17 +2776,40 @@ async def end_session(sid: str, user_id: str):
 # COMPANY DEPOSITS
 # ═══════════════════════════════════════════════════════════════════════════════
 @app.get("/api/deposits")
-async def list_deposits(_=Depends(require_admin), status: str = "", company_id: str = ""):
+async def list_deposits(_=Depends(require_admin), status: str = "", company_id: str = "", page: int = 1, per_page: int = 20, search: str = ""):
     sb = get_sb()
+
     def _q():
-        q = sb.table("company_deposits").select(
-            "*, companies(name), games(title)"
-        ).order("created_at", desc=True).limit(200)
-        if status:     q = q.eq("status", status)
-        if company_id: q = q.eq("company_id", company_id)
+        q = sb.table("company_deposits").select("*", count="exact").order("created_at", desc=True)
+        if status:
+            q = q.eq("status", status)
+        if company_id:
+            q = q.eq("company_id", company_id)
+        if search and search.strip():
+            s = search.strip().replace("%", "")[:80]
+            q = q.or_(f"ref_number.ilike.%{s}%,notes.ilike.%{s}%")
+        offset = (page - 1) * per_page
+        q = q.range(offset, offset + per_page - 1)
         return q.execute()
+
     res = await run(_q)
-    return res.data or []
+    rows = res.data or []
+    total = getattr(res, "count", len(rows))
+
+    # Resolve company names separately (no embed — avoids FK/schema issues)
+    if rows:
+        cids = list({r.get("company_id") for r in rows if r.get("company_id")})
+        try:
+            co_res = await run(
+                lambda: sb.table("companies").select("id,name").in_("id", cids).execute()
+            )
+            co_map = {c["id"]: c.get("name") or "—" for c in (co_res.data or [])}
+        except Exception:
+            co_map = {}
+        for r in rows:
+            r["company_name"] = co_map.get(r.get("company_id")) or "—"
+
+    return {"data": rows, "total": total, "page": page, "per_page": per_page}
 
 @app.post("/api/deposits/{did}/approve")
 async def approve_deposit(did: str, body: DepositApproveReq, _=Depends(require_admin)):

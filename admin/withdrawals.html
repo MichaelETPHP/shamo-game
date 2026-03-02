@@ -13,6 +13,31 @@
     .release-card { background: linear-gradient(135deg,rgba(34,197,94,.08),rgba(22,163,74,.05)); border:1px solid rgba(34,197,94,.25); border-radius:12px; padding:1rem 1.25rem; margin-bottom:1rem; }
     .release-amount { font-size:1.5rem; font-weight:800; color:var(--gold); }
     .release-phone { font-size:1.1rem; font-weight:600; color:var(--text); letter-spacing:.05em; }
+
+    /* Report section: smart, simple, modern */
+    .report-section { margin-top:2rem; padding-top:1.5rem; border-top:1px solid var(--border); }
+    .report-section .report-title { font-size:.7rem; text-transform:uppercase; letter-spacing:.12em; color:var(--muted); margin-bottom:1rem; font-weight:600; }
+    .report-cards { display:grid; grid-template-columns:repeat(4, 1fr); gap:1rem; }
+    @media (max-width: 900px) { .report-cards { grid-template-columns:repeat(2, 1fr); } }
+    @media (max-width: 480px) { .report-cards { grid-template-columns:1fr; } }
+    .report-card { background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:1.25rem; position:relative; overflow:hidden;
+      transition: transform .25s ease, box-shadow .25s ease, border-color .2s ease; }
+    .report-card:hover { transform:translateY(-2px); box-shadow:0 12px 32px rgba(0,0,0,.2); border-color:rgba(255,255,255,.08); }
+    .report-card .card-label { font-size:.65rem; text-transform:uppercase; letter-spacing:.1em; color:var(--muted); margin-bottom:.5rem; font-weight:600; }
+    .report-card .card-value { font-size:1.5rem; font-weight:800; letter-spacing:-.02em; }
+    .report-card.req .card-value { color:#94A3B8; }
+    .report-card.fee { border-color:rgba(34,197,94,.35); background:linear-gradient(145deg, rgba(34,197,94,.08), rgba(22,163,74,.03)); }
+    .report-card.fee .card-value { color:#22C55E; }
+    .report-card.fee::before { content:''; position:absolute; top:0; right:0; width:80px; height:80px; background:radial-gradient(circle at 100% 0%, rgba(34,197,94,.2), transparent); border-radius:0 14px 0 100%; pointer-events:none; }
+    .report-card.paid .card-value { color:var(--gold); }
+    .report-card.count .card-value { color:#818CF8; }
+    .report-card { animation: reportCardIn .4s ease backwards; }
+    .report-card:nth-child(1) { animation-delay:.05s; }
+    .report-card:nth-child(2) { animation-delay:.1s; }
+    .report-card:nth-child(3) { animation-delay:.15s; }
+    .report-card:nth-child(4) { animation-delay:.2s; }
+    @keyframes reportCardIn { from { opacity:0; transform:translateY(12px); } to { opacity:1; transform:translateY(0); } }
+    .report-card:hover { animation:none; }
   </style>
 </head>
 
@@ -58,6 +83,17 @@
           </tbody>
         </table>
         <div class="pagination" id="wPagination"></div>
+
+        <!-- Report: summary cards at bottom -->
+        <section class="report-section" id="reportSection" aria-label="Withdrawal summary">
+          <div class="report-title">Summary</div>
+          <div class="report-cards" id="reportCards">
+            <div class="report-card req"><div class="card-label">Total requested</div><div class="card-value" id="reportReq">—</div></div>
+            <div class="report-card fee"><div class="card-label">Commission (fee)</div><div class="card-value" id="reportFee">—</div></div>
+            <div class="report-card paid"><div class="card-label">Total paid</div><div class="card-value" id="reportPaid">—</div></div>
+            <div class="report-card count"><div class="card-label">Total requests</div><div class="card-value" id="reportCount">—</div></div>
+          </div>
+        </section>
       </div>
     </div>
   </div>
@@ -91,9 +127,26 @@
   <!-- SHAMO_ENV -->
   <script src="_shared.js"></script>
   <script>
+    const PER_PAGE = 7;
     let wPage = 1;
     let wData = [];
     buildSidebar('withdrawals');
+
+    function renderSummary(summary) {
+      const s = summary || {};
+      const req = typeof s.total_requested === 'number' ? s.total_requested : 0;
+      const fee = typeof s.total_fee === 'number' ? s.total_fee : 0;
+      const paid = typeof s.total_paid === 'number' ? s.total_paid : 0;
+      const count = typeof s.total_count === 'number' ? s.total_count : 0;
+      const reqEl = document.getElementById('reportReq');
+      const feeEl = document.getElementById('reportFee');
+      const paidEl = document.getElementById('reportPaid');
+      const countEl = document.getElementById('reportCount');
+      if (reqEl) reqEl.textContent = fmtN(req) + ' ETB';
+      if (feeEl) feeEl.textContent = fmtN(fee) + ' ETB';
+      if (paidEl) paidEl.textContent = fmtN(paid) + ' ETB';
+      if (countEl) countEl.textContent = fmtN(count);
+    }
 
     async function loadW(page = wPage) {
       wPage = page;
@@ -101,8 +154,9 @@
       try {
         const search = document.getElementById('searchW').value;
         const status = document.getElementById('wStatus').value;
-        const r = await apiGet(`/withdrawals?page=${page}&per_page=15&search=${encodeURIComponent(search)}&status=${status}`);
+        const r = await apiGet(`/withdrawals?page=${page}&per_page=${PER_PAGE}&search=${encodeURIComponent(search)}&status=${status}&include_summary=1`);
         wData = r.data || [];
+        renderSummary(r.summary);
 
         // Pending alert
         if (!status || status === 'pending') {
@@ -115,7 +169,12 @@
            </div>` : '';
         }
 
-        if (!wData.length) { document.getElementById('wBody').innerHTML = `<tr><td colspan="9" style="text-align:center;padding:3rem;color:var(--muted)">No withdrawals found</td></tr>`; return; }
+        if (!wData.length) {
+          document.getElementById('wBody').innerHTML = `<tr><td colspan="9" style="text-align:center;padding:3rem;color:var(--muted)">No withdrawals found</td></tr>`;
+          renderSummary(r.summary);
+          renderPagination('wPagination', r.page, r.total, r.per_page, 'loadW');
+          return;
+        }
         document.getElementById('wBody').innerHTML = wData.map(w => {
           const phone = w.phone_number || w.user_phone || '—';
           return `
@@ -143,6 +202,7 @@
         renderPagination('wPagination', r.page, r.total, r.per_page, 'loadW');
       } catch (e) {
         document.getElementById('wBody').innerHTML = `<tr><td colspan="9" style="text-align:center;padding:2rem;color:var(--muted)">❌ ${e.message}</td></tr>`;
+        renderSummary({});
       }
     }
 

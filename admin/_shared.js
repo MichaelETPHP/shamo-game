@@ -30,20 +30,20 @@ const USER_KEY = 'shamo_admin_user';
     }
     #g-spinner-overlay.show { display: flex; }
     .g-spinner-box {
-      background: #1A1F2E;
-      border: 1px solid rgba(255,255,255,.1);
-      border-radius: 16px;
+      background: rgba(10,10,15,.95);
+      border: 1px solid rgba(0,250,255,.15);
+      border-radius: 18px;
       padding: 1.75rem 2.25rem;
       display: flex;
       align-items: center;
       gap: 1rem;
-      box-shadow: 0 20px 60px rgba(0,0,0,.6);
+      box-shadow: 0 24px 64px rgba(0,0,0,.6), 0 0 0 1px rgba(138,0,255,.1);
     }
     .g-spinner-ring {
       width: 32px;
       height: 32px;
-      border: 3px solid rgba(232,184,75,.2);
-      border-top-color: #E8B84B;
+      border: 3px solid rgba(0,250,255,.2);
+      border-top-color: #00faff;
       border-radius: 50%;
       animation: g-spin .7s linear infinite;
       flex-shrink: 0;
@@ -51,7 +51,7 @@ const USER_KEY = 'shamo_admin_user';
     .g-spinner-text {
       font-size: .9rem;
       font-weight: 600;
-      color: #F1F5F9;
+      color: #e8ecf4;
       letter-spacing: .02em;
     }
     @keyframes g-spin { to { transform: rotate(360deg); } }
@@ -278,6 +278,38 @@ function badge(status) {
   return `<span class="badge ${STATUS_MAP[status] || 'badge-muted'}">${status}</span>`;
 }
 
+// ─── Data table mobile: inject data-label from thead so cards show labels ─────
+function refreshTableLabels() {
+  document.querySelectorAll('.data-table').forEach(function (table) {
+    const thead = table.querySelector('thead');
+    const ths = thead ? Array.from(thead.querySelectorAll('th')) : [];
+    const labels = ths.map(function (th) { return (th.textContent || '').trim() || ' '; });
+    table.querySelectorAll('tbody tr').forEach(function (tr) {
+      Array.from(tr.querySelectorAll('td')).forEach(function (td, i) {
+        if (labels[i] !== undefined) td.setAttribute('data-label', labels[i]);
+      });
+    });
+  });
+}
+window.refreshTableLabels = refreshTableLabels;
+
+(function tableLabelsObserver() {
+  function run() { refreshTableLabels(); }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', run);
+  } else {
+    run();
+  }
+  var content = document.querySelector('.content');
+  if (content && typeof MutationObserver !== 'undefined') {
+    var mo = new MutationObserver(function () {
+      clearTimeout(window._tableLabelsT);
+      window._tableLabelsT = setTimeout(run, 100);
+    });
+    mo.observe(content, { childList: true, subtree: true });
+  }
+})();
+
 // ─── Pagination renderer ─────────────────────────────────────────────────────
 function renderPagination(containerId, page, total, perPage, onPage) {
   const totalPages = Math.ceil(total / perPage);
@@ -321,7 +353,11 @@ async function buildSidebar(activePage) {
   const el = document.getElementById('sidebar');
   if (!el) return;
 
+  const collapsed = localStorage.getItem('shamo_sidebar_collapsed') === '1';
+  if (collapsed) el.classList.add('collapsed');
+
   el.innerHTML = `
+    <button type="button" class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar" title="Collapse/expand sidebar">◀</button>
     <div class="sidebar-logo">
       <div class="icon">🎡</div>
       <div class="brand"><h2>SHAMO</h2><p>Admin Portal</p></div>
@@ -331,7 +367,7 @@ async function buildSidebar(activePage) {
       ${nav.map(n => `
         <a class="nav-item ${n.page === activePage ? 'active' : ''}" href="${n.href}"
            onclick="_navSpinner(event,'${n.href}','${n.page}','${activePage}')">
-          <span class="icon">${n.icon}</span>${n.label}
+          <span class="icon">${n.icon}</span><span class="nav-label">${n.label}</span>
           ${n.badgeKey ? `<span class="nav-badge" id="badge-${n.badgeKey}" style="display:none">0</span>` : ''}
         </a>`).join('')}
     </div>
@@ -342,6 +378,17 @@ async function buildSidebar(activePage) {
       </div>
       <div class="admin-dev-footer">Dev By MICHAEL</div>
     </div>`;
+
+  const toggleBtn = document.getElementById('sidebarToggle');
+  if (toggleBtn) {
+    toggleBtn.addEventListener('click', function (e) {
+      e.preventDefault();
+      el.classList.toggle('collapsed');
+      toggleBtn.textContent = el.classList.contains('collapsed') ? '▶' : '◀';
+      localStorage.setItem('shamo_sidebar_collapsed', el.classList.contains('collapsed') ? '1' : '0');
+    });
+    toggleBtn.textContent = el.classList.contains('collapsed') ? '▶' : '◀';
+  }
 
   // Load badges
   try {
@@ -362,6 +409,82 @@ async function buildSidebar(activePage) {
     footer.textContent = 'Dev By MICHAEL';
     main.appendChild(footer);
   }
+
+  // Mobile: sidebar backdrop + menu button
+  let backdrop = document.getElementById('shamo-sidebar-backdrop');
+  if (!backdrop) {
+    backdrop = document.createElement('div');
+    backdrop.id = 'shamo-sidebar-backdrop';
+    backdrop.className = 'sidebar-backdrop';
+    backdrop.setAttribute('aria-hidden', 'true');
+    document.body.appendChild(backdrop);
+  }
+  const topbarActions = document.querySelector('.topbar-actions');
+  let menuBtn = document.getElementById('shamo-mobile-menu-btn');
+  if (!menuBtn && topbarActions) {
+    menuBtn = document.createElement('button');
+    menuBtn.type = 'button';
+    menuBtn.id = 'shamo-mobile-menu-btn';
+    menuBtn.className = 'mobile-menu-btn';
+    menuBtn.setAttribute('aria-label', 'Open menu');
+    menuBtn.innerHTML = '☰';
+    topbarActions.insertBefore(menuBtn, topbarActions.firstChild);
+  }
+  function closeMobileSidebar() {
+    el.classList.remove('mobile-open');
+    backdrop.classList.remove('visible');
+  }
+  function openMobileSidebar() {
+    el.classList.add('mobile-open');
+    backdrop.classList.add('visible');
+  }
+  if (menuBtn) {
+    menuBtn.onclick = function () {
+      if (el.classList.contains('mobile-open')) closeMobileSidebar();
+      else openMobileSidebar();
+    };
+  }
+  backdrop.onclick = closeMobileSidebar;
+  el.addEventListener('click', function (e) {
+    if (e.target.closest('.nav-item')) closeMobileSidebar();
+  });
+  window.addEventListener('resize', function () {
+    if (window.innerWidth > 768) closeMobileSidebar();
+  });
+
+  // Mobile bottom tab bar (Dashboard, Games, Users, Withdrawals, More)
+  var tabBar = document.getElementById('shamo-bottom-tab-bar');
+  if (!tabBar) {
+    var bar = document.createElement('nav');
+    bar.id = 'shamo-bottom-tab-bar';
+    bar.className = 'bottom-tab-bar';
+    bar.setAttribute('aria-label', 'Main navigation');
+    var tabs = [
+      { page: 'dashboard', label: 'Dashboard', href: 'index.html', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="16" width="7" height="5"/></svg>' },
+      { page: 'games', label: 'Games', href: 'games.html', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 12h4v4H6zM14 6h4v4h-4zM14 14h4v4h-4z"/><circle cx="9" cy="9" r="1.5"/></svg>' },
+      { page: 'users', label: 'Users', href: 'users.html', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="7" r="4"/><path d="M3 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"/><path d="M16 11h6m-3-3v6"/></svg>' },
+      { page: 'withdrawals', label: 'Withdrawals', href: 'withdrawals.html', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>' },
+      { page: 'more', label: 'More', href: '#', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>' }
+    ];
+    tabs.forEach(function (t) {
+      var a = document.createElement('a');
+      a.href = t.href;
+      a.setAttribute('data-tab-page', t.page);
+      if (t.page === activePage && t.page !== 'more') a.classList.add('active');
+      a.innerHTML = t.icon + '<span>' + t.label + '</span>';
+      if (t.page === 'more') {
+        a.addEventListener('click', function (e) { e.preventDefault(); openMobileSidebar(); });
+      }
+      bar.appendChild(a);
+    });
+    document.body.appendChild(bar);
+    document.body.classList.add('has-bottom-tab');
+  } else {
+    tabBar.querySelectorAll('a').forEach(function (a) {
+      a.classList.remove('active');
+      if (a.getAttribute('data-tab-page') === activePage) a.classList.add('active');
+    });
+  }
 }
 
 // Show a full-page spinner when navigating between pages
@@ -376,9 +499,9 @@ function _navSpinner(e, href, targetPage, currentPage) {
     background:rgba(11,13,18,.92);display:flex;flex-direction:column;
     align-items:center;justify-content:center;gap:1rem;`;
   ov.innerHTML = `
-    <div style="width:44px;height:44px;border:3px solid rgba(232,184,75,.2);
-      border-top-color:#E8B84B;border-radius:50%;animation:g-spin .7s linear infinite"></div>
-    <div style="font-size:.85rem;font-weight:600;color:#7A839A;letter-spacing:.05em">Loading…</div>`;
+    <div style="width:44px;height:44px;border:3px solid rgba(0,250,255,.2);
+      border-top-color:#00faff;border-radius:50%;animation:g-spin .7s linear infinite"></div>
+    <div style="font-size:.85rem;font-weight:600;color:var(--muted);letter-spacing:.05em">Loading…</div>`;
   document.body.appendChild(ov);
   setTimeout(() => { window.location.href = href; }, 30); // tiny delay so overlay renders
 }
