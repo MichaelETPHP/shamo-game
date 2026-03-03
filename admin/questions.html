@@ -110,6 +110,28 @@
       font-size: .85rem;
     }
     .bulk-bar select { padding: 6px 10px; border-radius: 8px; }
+
+    /* AI Generate button — blue, prominent */
+    .btn-ai {
+      background: linear-gradient(135deg, #2563eb, #1d4ed8);
+      color: #fff;
+      border: 1px solid rgba(37, 99, 235, 0.5);
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .btn-ai:hover {
+      background: linear-gradient(135deg, #3b82f6, #2563eb);
+      box-shadow: 0 0 20px rgba(37, 99, 235, 0.4);
+    }
+    .btn-ai:disabled { opacity: 0.6; cursor: not-allowed; }
+
+    /* AI modal multi-select */
+    #aiCategories { min-height: 100px; padding: 8px 10px; border-radius: 8px; }
+    .ai-modal-msg { padding: 10px 14px; border-radius: 8px; font-size: .9rem; margin-top: 10px; display: none; }
+    .ai-modal-msg.success { background: rgba(0, 255, 136, .12); border: 1px solid rgba(0, 255, 136, .25); color: var(--green); display: block; }
+    .ai-modal-msg.error { background: rgba(255, 51, 102, .12); border: 1px solid rgba(255, 51, 102, .25); color: var(--red); display: block; }
   </style>
 </head>
 
@@ -132,6 +154,7 @@
             <option value="rejected">Rejected</option>
           </select>
           <button class="btn btn-primary" onclick="openAddQ()">＋ Add Question</button>
+          <button class="btn btn-ai" onclick="openAIGenerateModal()" title="Generate questions with AI">⚡ AI Generate Questions</button>
           <button class="btn btn-ghost" onclick="openImportModal()">📥 Import JSON</button>
           <button class="btn btn-ghost" onclick="openCategoriesModal()" title="Manage categories">📂 Categories</button>
         </div>
@@ -144,6 +167,7 @@
           <div class="stat-chip"><strong id="sPending">—</strong>Pending</div>
           <div class="stat-chip"><strong id="sRejected">—</strong>Rejected</div>
         </div>
+        <div id="aiLastGen" style="font-size:.75rem;color:var(--muted);margin-bottom:8px;min-height:20px"></div>
 
         <div id="bulkBar" class="bulk-bar" style="display:none">
           <span id="bulkCount">0</span> selected
@@ -343,6 +367,69 @@
     </div>
   </div>
 
+  <!-- ── Generate with AI Modal ─────────────────────────────── -->
+  <div class="modal-overlay" id="modalAIGenerate">
+    <div class="modal" style="max-width:520px;width:100%">
+      <div class="modal-header">
+        <h2>Generate New Questions with AI</h2>
+        <button type="button" class="btn btn-ghost btn-icon" onclick="closeModal('modalAIGenerate')">✕</button>
+      </div>
+      <div class="modal-body" style="padding-top:10px">
+        <p style="font-size:.85rem;color:var(--muted);margin-bottom:1rem;line-height:1.5">
+          Create fresh, up-to-date Ethiopian trivia questions instantly using the latest 2026 data.
+        </p>
+
+        <div class="form-group" style="margin-bottom:12px">
+          <label style="font-size:.78rem;letter-spacing:1px;color:var(--gold)">Categories (select one or more)</label>
+          <select id="aiCategories" name="categories" multiple class="form-control">
+            <option value="Ethiopian History">Ethiopian History</option>
+            <option value="Culture & Traditions">Culture & Traditions</option>
+            <option value="Sports">Sports</option>
+            <option value="Politics">Politics</option>
+            <option value="Current News">Current News</option>
+            <option value="Technology">Technology</option>
+            <option value="Geography">Geography</option>
+            <option value="Famous Personalities">Famous Personalities</option>
+          </select>
+          <span style="font-size:.7rem;color:var(--muted)">Ctrl/Cmd + click to select multiple</span>
+        </div>
+
+        <div class="form-group" style="margin-bottom:12px">
+          <label>Difficulty</label>
+          <select id="aiDifficulty" name="difficulty">
+            <option value="Easy">🟢 Easy (Basic knowledge, everyone knows)</option>
+            <option value="Medium" selected>🟡 Medium (Requires some study)</option>
+            <option value="Hard">🔴 Hard (Expert level, deep knowledge)</option>
+          </select>
+        </div>
+
+        <div class="form-group" style="margin-bottom:12px">
+          <label>Number of questions</label>
+          <select id="aiCount" name="count">
+            <option value="5">5 questions</option>
+            <option value="10" selected>10 questions</option>
+            <option value="20">20 questions</option>
+          </select>
+        </div>
+
+        <div class="form-group" style="margin-bottom:14px">
+          <label>Language</label>
+          <select id="aiLanguage" name="language">
+            <option value="English" selected>English</option>
+            <option value="Amharic">Amharic</option>
+            <option value="Both">Both (English + Amharic versions)</option>
+          </select>
+        </div>
+
+        <div id="aiModalMsg" class="ai-modal-msg" role="alert"></div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-ghost" onclick="closeModal('modalAIGenerate')">Cancel</button>
+        <button type="button" class="btn btn-ai" id="aiGenerateBtn" onclick="submitAIGenerate()">Generate Now</button>
+      </div>
+    </div>
+  </div>
+
   <!-- SHAMO_ENV -->
   <script src="_shared.js"></script>
   <script>
@@ -354,6 +441,74 @@
 
     buildSidebar('questions');
     requireAuth();
+
+    const AI_LASTGEN_KEY = 'shamo_ai_last_generation';
+    function renderAILastGen() {
+      const el = document.getElementById('aiLastGen');
+      if (!el) return;
+      try {
+        const s = localStorage.getItem(AI_LASTGEN_KEY);
+        if (s) {
+          const { count, at } = JSON.parse(s);
+          el.textContent = `Last generation: ${count} questions added at ${fmtTime(at)}`;
+        } else {
+          el.textContent = '';
+        }
+      } catch (e) { el.textContent = ''; }
+    }
+
+    function openAIGenerateModal() {
+      document.getElementById('aiCategories').selectedIndex = -1;
+      document.getElementById('aiDifficulty').value = 'Medium';
+      document.getElementById('aiCount').value = '10';
+      document.getElementById('aiLanguage').value = 'English';
+      const msg = document.getElementById('aiModalMsg');
+      msg.className = 'ai-modal-msg';
+      msg.textContent = '';
+      msg.style.display = 'none';
+      document.getElementById('aiGenerateBtn').disabled = false;
+      document.getElementById('aiGenerateBtn').textContent = 'Generate Now';
+      openModal('modalAIGenerate');
+    }
+
+    async function submitAIGenerate() {
+      const categoriesEl = document.getElementById('aiCategories');
+      const categories = Array.from(categoriesEl.selectedOptions).map(o => o.value);
+      const difficulty = document.getElementById('aiDifficulty').value;
+      const count = parseInt(document.getElementById('aiCount').value, 10) || 10;
+      const language = document.getElementById('aiLanguage').value;
+
+      const btn = document.getElementById('aiGenerateBtn');
+      const msgEl = document.getElementById('aiModalMsg');
+      btn.disabled = true;
+      btn.textContent = 'Generating…';
+      msgEl.className = 'ai-modal-msg';
+      msgEl.textContent = '';
+      msgEl.style.display = 'none';
+
+      try {
+        const r = await apiFetch('/admin/generate-questions', {
+          method: 'POST',
+          body: { categories, difficulty, count, language },
+        });
+        const countSaved = r.count ?? 0;
+        msgEl.classList.add('success');
+        msgEl.textContent = `✅ ${countSaved} questions generated and saved to database!`;
+        msgEl.style.display = 'block';
+        if (countSaved > 0) {
+          localStorage.setItem(AI_LASTGEN_KEY, JSON.stringify({ count: countSaved, at: new Date().toISOString() }));
+          renderAILastGen();
+          loadQ(1);
+        }
+        setTimeout(() => closeModal('modalAIGenerate'), 3000);
+      } catch (e) {
+        msgEl.classList.add('error');
+        msgEl.textContent = e.message || 'Failed to generate questions.';
+        msgEl.style.display = 'block';
+        btn.disabled = false;
+        btn.textContent = 'Generate Now';
+      }
+    }
 
     function buildOptGrid(values = {}, letters = null) {
       const L = letters ? letters.slice() : optionLetters.slice();
@@ -937,6 +1092,7 @@
     loadGameOptions();
     loadCategories().then(() => populateCatDropdown(''));
     loadQ(1);
+    renderAILastGen();
   </script>
 </body>
 

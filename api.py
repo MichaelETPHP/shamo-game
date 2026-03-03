@@ -28,6 +28,11 @@ from pydantic import BaseModel
 
 from supabase import create_client, Client
 
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
+
 # ─── Config ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("shamo.api")
@@ -47,6 +52,10 @@ ADMIN_USER    = (os.getenv("ADMIN_USERNAME") or "").strip()
 ADMIN_PASS    = (os.getenv("ADMIN_PASSWORD") or "").strip()
 if not BOT_TOKEN:
     logger.warning("TELEGRAM_BOT_TOKEN not set in .env — /api/player/avatar-url will return 503")
+
+ANTHROPIC_API_KEY = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
+# Claude model id (only if using Anthropic). Override in .env if you get 404.
+ANTHROPIC_MODEL = (os.getenv("ANTHROPIC_MODEL") or "claude-3-5-sonnet-20240620").strip()
 
 
 def _shamo_env_script() -> str:
@@ -365,6 +374,15 @@ class BulkDeleteQuestionsReq(BaseModel):
 class BulkAssignGameReq(BaseModel):
     question_ids: list
     game_id: str
+
+
+class GenerateQuestionsReq(BaseModel):
+    """Request for AI-generated questions (Claude)."""
+    categories: List[str] = []
+    difficulty: str = "Medium"
+    count: int = 10
+    language: str = "English"
+
 
 class CompanyCreate(BaseModel):
     name: str; slug: str; category: Optional[str] = None
@@ -1713,6 +1731,295 @@ async def create_question(body: QuestionCreate, _=Depends(require_admin)):
             }).execute())
         qrow["game_id"] = body.game_id
     return qrow
+
+
+# ─── AI question generation (Anthropic Claude) ─────────────────────────────────
+def _generate_questions_via_claude(
+    categories: List[str],
+    difficulty: str,
+    count: int,
+    language: str,
+) -> List[Dict[str, Any]]:
+    """Call Claude to generate Ethiopian trivia questions. Returns list of question dicts."""
+    if not ANTHROPIC_API_KEY or not anthropic:
+        raise HTTPException(503, "ANTHROPIC_API_KEY not set or anthropic package not installed")
+    count = max(1, min(20, count))
+    cat_list = ", ".join(categories) if categories else "Ethiopian History, Culture, Sports, Geography"
+    diff_guide = {
+        "Easy": "Basic knowledge that most Ethiopians would know (e.g. capital city, famous landmarks).",
+        "Medium": "Requires some study or general awareness (recent events, notable figures, culture).",
+        "Hard": "Expert level: deep knowledge, obscure facts, precise dates or statistics.",
+    }
+    diff_instruction = diff_guide.get(difficulty, diff_guide["Medium"])
+    lang_instruction = "Output question_text and all option text in English only."
+    if language == "Amharic":
+        lang_instruction = "Output question_text and all option text in Amharic only (use Amharic script)."
+    elif language == "Both":
+        lang_instruction = (
+            "Output each question with two fields: question_text (English) and question_text_amharic (Amharic). "
+            "Options: use option_text for English and option_text_amharic for Amharic. "
+            "Generate both versions for every question."
+        )
+
+    system = (
+        "You are an expert Ethiopian trivia writer. Today's date is March 2, 2026. "
+        "Focus on accurate, up-to-date information including: Adwa 130th anniversary (March 2 2026), "
+        "Ethiopian sea access discussions, Tigray politics (e.g. Simret party), Ethiopian Premier League standings, "
+        "Ethio Telecom (teleStream, Next Horizon 2028), and other recent 2025–2026 events where relevant. "
+        "Return ONLY a valid JSON array. No markdown, no code fences, no explanation outside the JSON. "
+        "Each object in the array must have: "
+        '"question_text" (string), '
+        '"options" (array of exactly 4 objects, each with "letter" (A/B/C/D), "text" (string), "is_correct" (boolean, exactly one true)), '
+        '"explanation" (string, optional), "category" (string, optional). '
+        "If language is Both, also include question_text_amharic and per-option option_text_amharic."
+    )
+    user = (
+        f"Generate exactly {count} multiple-choice quiz questions. "
+        f"Categories to cover: {cat_list}. "
+        f"Difficulty: {difficulty}. {diff_instruction} "
+        f"Language: {lang_instruction} "
+        "Return a JSON array only."
+    )
+
+    # Long timeout: generation can take 60–120s; proxies often drop shorter connections
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=180.0)
+    try:
+        msg = client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=8192,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+    except (_httpx.RemoteProtocolError, _httpx.ConnectError) as e:
+        raise HTTPException(
+            502,
+            "Connection to Claude failed (network or proxy dropped). Try again, use fewer questions (e.g. 5), or disable proxy for this app."
+        ) from e
+    except _httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise HTTPException(
+                502,
+                "Claude model not found (404). Set ANTHROPIC_MODEL in .env to a valid model id (e.g. claude-opus-4-6)."
+            ) from e
+        raise HTTPException(502, f"Claude API error: {e.response.status_code}") from e
+    except Exception as e:
+        if type(e).__name__ == "APIConnectionError" or "connection" in str(e).lower() or "disconnected" in str(e).lower():
+            raise HTTPException(
+                502,
+                "Connection to Claude failed (network or proxy dropped). Try again, use fewer questions (e.g. 5), or disable proxy for this app."
+            ) from e
+        if getattr(e, "response", None) and getattr(e.response, "status_code", None) == 404:
+            raise HTTPException(502, "Claude model not found (404). Set ANTHROPIC_MODEL in .env to a valid model id (e.g. claude-opus-4-6).") from e
+        if "404" in str(e) or "not_found" in str(e).lower():
+            raise HTTPException(502, "Claude model not found (404). Set ANTHROPIC_MODEL in .env to a valid model id (e.g. claude-opus-4-6).") from e
+        raise
+    text = ""
+    for block in (msg.content or []):
+        if getattr(block, "text", None):
+            text += block.text
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines)
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise HTTPException(502, f"Claude returned invalid JSON: {e}")
+    if not isinstance(raw, list):
+        raw = [raw] if isinstance(raw, dict) else []
+
+    result = []
+    for item in raw[:count]:
+        qtext = (item.get("question_text") or item.get("question") or "").strip()
+        if not qtext:
+            continue
+        opts_raw = item.get("options") or []
+        opts = []
+        for i, o in enumerate(opts_raw[:4]):
+            if isinstance(o, str):
+                opts.append({"letter": "ABCD"[i], "text": o.strip(), "is_correct": i == 0})
+            else:
+                letter = str(o.get("letter", "ABCD"[i]))[0].upper()
+                if letter not in "ABCD":
+                    letter = "ABCD"[i]
+                opts.append({
+                    "letter": letter,
+                    "text": (str(o.get("text") or o.get("option_text") or "").strip()) or f"Option {letter}",
+                    "is_correct": bool(o.get("is_correct")),
+                })
+        if len(opts) < 2:
+            continue
+        if not any(x["is_correct"] for x in opts):
+            opts[0]["is_correct"] = True
+        result.append({
+            "question_text": qtext,
+            "options": opts,
+            "category": (item.get("category") or "").strip() or None,
+            "explanation": (item.get("explanation") or "").strip() or None,
+        })
+    return result
+
+
+def _build_ai_prompts(
+    categories: List[str],
+    difficulty: str,
+    count: int,
+    language: str,
+) -> tuple:
+    """Build system and user prompt text for question generation (shared by OpenAI and Claude)."""
+    count = max(1, min(20, count))
+    cat_list = ", ".join(categories) if categories else "Ethiopian History, Culture, Sports, Geography"
+    diff_guide = {
+        "Easy": "Basic knowledge that most Ethiopians would know (e.g. capital city, famous landmarks).",
+        "Medium": "Requires some study or general awareness (recent events, notable figures, culture).",
+        "Hard": "Expert level: deep knowledge, obscure facts, precise dates or statistics.",
+    }
+    diff_instruction = diff_guide.get(difficulty, diff_guide["Medium"])
+    lang_instruction = "Output question_text and all option text in English only."
+    if language == "Amharic":
+        lang_instruction = "Output question_text and all option text in Amharic only (use Amharic script)."
+    elif language == "Both":
+        lang_instruction = (
+            "Output each question with two fields: question_text (English) and question_text_amharic (Amharic). "
+            "Options: use option_text for English and option_text_amharic for Amharic. Generate both versions."
+        )
+    system = (
+        "You are an expert Ethiopian trivia writer. Today's date is March 2, 2026. "
+        "Focus on accurate, up-to-date information including: Adwa 130th anniversary (March 2 2026), "
+        "Ethiopian sea access discussions, Tigray politics (e.g. Simret party), Ethiopian Premier League standings, "
+        "Ethio Telecom (teleStream, Next Horizon 2028), and other recent 2025–2026 events where relevant. "
+        "Return ONLY a valid JSON array. No markdown, no code fences, no explanation outside the JSON. "
+        "Each object in the array must have: "
+        '"question_text" (string), '
+        '"options" (array of exactly 4 objects, each with "letter" (A/B/C/D), "text" (string), "is_correct" (boolean, exactly one true)), '
+        '"explanation" (string, optional), "category" (string, optional).'
+    )
+    user = (
+        f"Generate exactly {count} multiple-choice quiz questions. "
+        f"Categories to cover: {cat_list}. "
+        f"Difficulty: {difficulty}. {diff_instruction} "
+        f"Language: {lang_instruction} "
+        "Return a JSON array only."
+    )
+    return system, user, count
+
+
+def _parse_ai_questions_json(text: str, count: int) -> List[Dict[str, Any]]:
+    """Parse LLM JSON response into list of question dicts (shared by OpenAI and Claude)."""
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines)
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise HTTPException(502, f"AI returned invalid JSON: {e}")
+    if not isinstance(raw, list):
+        raw = [raw] if isinstance(raw, dict) else []
+    result = []
+    for item in raw[:count]:
+        qtext = (item.get("question_text") or item.get("question") or "").strip()
+        if not qtext:
+            continue
+        opts_raw = item.get("options") or []
+        opts = []
+        for i, o in enumerate(opts_raw[:4]):
+            if isinstance(o, str):
+                opts.append({"letter": "ABCD"[i], "text": o.strip(), "is_correct": i == 0})
+            else:
+                letter = str(o.get("letter", "ABCD"[i]))[0].upper()
+                if letter not in "ABCD":
+                    letter = "ABCD"[i]
+                opts.append({
+                    "letter": letter,
+                    "text": (str(o.get("text") or o.get("option_text") or "").strip()) or f"Option {letter}",
+                    "is_correct": bool(o.get("is_correct")),
+                })
+        if len(opts) < 2:
+            continue
+        if not any(x["is_correct"] for x in opts):
+            opts[0]["is_correct"] = True
+        result.append({
+            "question_text": qtext,
+            "options": opts,
+            "category": (item.get("category") or "").strip() or None,
+            "explanation": (item.get("explanation") or "").strip() or None,
+        })
+    return result
+
+
+@app.post("/api/admin/generate-questions")
+async def generate_questions_admin(body: GenerateQuestionsReq, _=Depends(require_admin)):
+    """
+    Generate quiz questions using AI (Anthropic Claude). Requires ANTHROPIC_API_KEY and ANTHROPIC_MODEL in .env.
+    Saves to Supabase (questions + answer_options) with status=approved, created_by=admin.
+    """
+    sb = get_sb()
+    admin = await run(lambda: sb.table("users").select("id").eq("role", "admin").limit(1).execute())
+    created_by = (admin.data or [{}])[0].get("id")
+    if not created_by:
+        raise HTTPException(500, "No admin user found for created_by")
+
+    loop = asyncio.get_event_loop()
+    questions = await loop.run_in_executor(
+        None,
+        lambda: _generate_questions_via_claude(
+            body.categories or [],
+            body.difficulty,
+            body.count,
+            body.language or "English",
+        ),
+    )
+
+    saved = 0
+    ai_prompt_summary = f"Categories: {', '.join(body.categories) or 'General'}. Difficulty: {body.difficulty}. Language: {body.language or 'English'}."
+    for q in questions:
+        try:
+            payload = {
+                "question_text": q["question_text"],
+                "category": ", ".join(body.categories) if body.categories else (q.get("category") or "AI Generated"),
+                "explanation": q.get("explanation"),
+                "icon": "🤖",
+                "created_by": created_by,
+                "status": "approved",
+                "source": "AI Generated",
+                "language": body.language or "English",
+                "ai_prompt": ai_prompt_summary,
+            }
+            qrow_res = await run(lambda: sb.table("questions").insert(payload).execute())
+            qrow = (qrow_res.data or [{}])[0]
+            qid = qrow.get("id")
+            if not qid:
+                continue
+            opts = [
+                {
+                    "question_id": qid,
+                    "option_letter": opt["letter"],
+                    "option_text": opt["text"],
+                    "is_correct": opt.get("is_correct", False),
+                    "sort_order": ord(opt["letter"]) - ord("A"),
+                }
+                for opt in q["options"]
+            ]
+            if opts:
+                await run(lambda: sb.table("answer_options").insert(opts).execute())
+            saved += 1
+        except Exception as e:
+            logger.warning("Failed to save AI question: %s", e)
+            continue
+
+    return {
+        "message": f"{saved} questions generated and saved to database!",
+        "count": saved,
+    }
 
 
 @app.post("/api/questions/bulk-delete")
