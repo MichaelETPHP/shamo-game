@@ -10,8 +10,10 @@
   <meta name="mobile-web-app-capable" content="yes">
   <title>SHAMO — ሻሞ</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link
-    href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,700;0,900;1,700&family=Noto+Serif+Ethiopic:wght@400;700&family=DM+Mono:wght@400;500;700&display=swap"
+    href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,700;0,900;1,700&family=Noto+Sans+Ethiopic:wght@400;700&family=Noto+Serif+Ethiopic:wght@400;700&family=DM+Mono:wght@400;500;700&display=swap"
     rel="stylesheet">
   <style>
     :root {
@@ -845,6 +847,67 @@
       filter: drop-shadow(0 1px 2px rgba(0,0,0,.3));
     }
 
+    /* ═══ MAINTENANCE SCREEN (above loader/login/shell when ON) — Amharic/Ethiopic readable ═══ */
+    .maintenance-screen {
+      position: fixed;
+      inset: 0;
+      z-index: 10002;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: #08070A;
+      padding: max(20px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-left)) max(20px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-right));
+      font-family: 'Noto Sans Ethiopic', 'Noto Serif Ethiopic', serif;
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+    }
+    .maintenance-screen.visible {
+      display: flex;
+      animation: fadeIn .4s ease;
+    }
+    .maintenance-inner {
+      text-align: center;
+      max-width: 320px;
+      font-family: 'Noto Sans Ethiopic', 'Noto Serif Ethiopic', serif;
+    }
+    .maintenance-eth {
+      font-size: 2.5rem;
+      color: var(--gold, #E8B84B);
+      margin-bottom: .5rem;
+      font-family: 'Noto Sans Ethiopic', 'Noto Serif Ethiopic', serif;
+    }
+    .maintenance-title {
+      font-size: 1.25rem;
+      font-weight: 700;
+      color: #fff;
+      margin: 0 0 .75rem;
+      font-family: 'Noto Sans Ethiopic', 'Noto Serif Ethiopic', serif;
+    }
+    .maintenance-message {
+      font-size: 1rem;
+      line-height: 1.6;
+      margin: 0 0 1.5rem;
+      color: rgba(255, 255, 255, 0.85);
+      font-family: 'Noto Sans Ethiopic', 'Noto Serif Ethiopic', serif;
+    }
+    .maintenance-social {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 1.25rem;
+    }
+    .maintenance-social a {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 44px;
+      height: 44px;
+      color: var(--gold, #E8B84B);
+      transition: transform .2s, color .2s;
+    }
+    .maintenance-social a:hover { color: #fff; transform: scale(1.1); }
+    .maintenance-social svg { width: 24px; height: 24px; }
+
     /* ═══ SHELL ═══ */
     #shell {
       position: fixed;
@@ -1138,6 +1201,42 @@
     .home-live-sec {
       margin-top: 4px;
       margin-bottom: 10px;
+    }
+    .home-games-loading {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 32px 20px;
+      text-align: center;
+      background: var(--p2);
+      border: 1px solid var(--b2);
+      border-radius: 16px;
+      margin-bottom: 14px;
+    }
+    .home-games-loading.hidden { display: none !important; }
+    .home-games-spinner {
+      width: 40px;
+      height: 40px;
+      border: 3px solid var(--b2);
+      border-top-color: var(--gold);
+      border-radius: 50%;
+      animation: spin .8s linear infinite;
+      margin-bottom: 10px;
+      flex-shrink: 0;
+    }
+    .home-games-countdown {
+      font-family: 'Playfair Display', serif;
+      font-size: 48px;
+      font-weight: 900;
+      line-height: 1;
+      min-height: 52px;
+      margin-bottom: 8px;
+      text-shadow: 0 0 16px rgba(0, 0, 0, .4);
+    }
+    .home-games-loading-txt {
+      font-size: 12px;
+      color: var(--muted);
     }
     .home-no-games {
       display: flex;
@@ -1504,16 +1603,16 @@
     .feed-marquee-wrap {
       position: relative;
       overflow: hidden;
-      height: 156px;
+      height: 280px;
       margin-bottom: 14px;
-      mask-image: linear-gradient(to bottom, transparent 0%, #000 5%, #000 95%, transparent 100%);
-      -webkit-mask-image: linear-gradient(to bottom, transparent 0%, #000 5%, #000 95%, transparent 100%);
+      mask-image: linear-gradient(to bottom, transparent 0%, #000 4%, #000 96%, transparent 100%);
+      -webkit-mask-image: linear-gradient(to bottom, transparent 0%, #000 4%, #000 96%, transparent 100%);
     }
     .feed-marquee-inner {
       display: flex;
       flex-direction: column;
-      gap: 6px;
-      animation: feedScroll 25s linear infinite;
+      gap: 12px;
+      animation: feedScroll 35s linear infinite;
     }
     @keyframes feedScroll {
       0% { transform: translateY(0); }
@@ -1534,8 +1633,9 @@
       display: flex;
       align-items: center;
       gap: 8px;
-      padding: 7px 10px;
+      padding: 8px 12px;
       min-height: 44px;
+      flex-shrink: 0;
     }
 
     .feed-av {
@@ -2409,6 +2509,36 @@
       pointer-events: none
     }
 
+    .wh-countdown {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 120px;
+      height: 120px;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      pointer-events: none;
+      z-index: 2;
+    }
+    .wh-countdown.show {
+      display: flex;
+    }
+    .wh-countdown .wh-count-num {
+      font-family: 'Playfair Display', serif;
+      font-size: 72px;
+      font-weight: 900;
+      line-height: 1;
+      text-shadow: 0 0 20px rgba(0, 0, 0, .5);
+      animation: whCountPop .45s ease-out;
+    }
+    @keyframes whCountPop {
+      0% { transform: scale(0.3); opacity: 0; }
+      60% { transform: scale(1.15); opacity: 1; }
+      100% { transform: scale(1); opacity: 1; }
+    }
+
     .spin-btn {
       padding: 14px 40px;
       border: none;
@@ -3270,6 +3400,23 @@
     <div class="ld-txt">SHAMO · LOADING</div>
   </div>
 
+  <!-- MAINTENANCE (shown when admin turns Maintenance Mode ON) -->
+  <div id="maintenanceScreen" class="maintenance-screen" aria-hidden="true">
+    <div class="maintenance-inner">
+      <div class="maintenance-eth">ሻሞ</div>
+      <h1 class="maintenance-title">Under maintenance</h1>
+      <p class="maintenance-message" id="maintenanceMessage" lang="am" style="font-family: 'Noto Sans Ethiopic', 'Noto Serif Ethiopic', serif;">Michael is updating some features. Just give us some time!</p>
+      <div class="maintenance-social">
+        <a href="#" id="maintenanceLinkedIn" target="_blank" rel="noopener" aria-label="LinkedIn" onclick="typeof vibrate==='function'&&vibrate()">
+          <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433c-1.144 0-2.063-.926-2.063-2.065 0-1.138.92-2.063 2.063-2.063 1.14 0 2.064.925 2.064 2.063 0 1.139-.925 2.065-2.064 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z"/></svg>
+        </a>
+        <a href="#" id="maintenanceInstagram" target="_blank" rel="noopener" aria-label="Instagram" onclick="typeof vibrate==='function'&&vibrate()">
+          <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zm0-2.163c-3.259 0-3.667.014-4.947.072-4.358.2-6.78 2.618-6.98 6.98-.059 1.281-.073 1.689-.073 4.948 0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98 1.281.058 1.689.072 4.948.072 3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98-1.281-.059-1.69-.073-4.949-.073zm0 5.838c-3.403 0-6.162 2.759-6.162 6.162s2.759 6.163 6.162 6.163 6.162-2.759 6.162-6.163c0-3.403-2.759-6.162-6.162-6.162zm0 10.162c-2.209 0-4-1.79-4-4 0-2.209 1.791-4 4-4s4 1.791 4 4c0 2.21-1.791 4-4 4zm6.406-11.845c-.796 0-1.441.645-1.441 1.44s.645 1.44 1.441 1.44c.795 0 1.439-.645 1.439-1.44s-.644-1.44-1.439-1.44z"/></svg>
+        </a>
+      </div>
+    </div>
+  </div>
+
   <!-- LOGIN -->
   <div id="scLogin">
     <div class="login-gold-shimmer"></div>
@@ -3363,7 +3510,12 @@
 
         <!-- Live active games (prize pool + live time) -->
         <div class="sec home-live-sec" id="homeLiveSec">Live games</div>
-        <div class="home-no-games" id="homeNoGames">
+        <div class="home-games-loading hidden" id="homeGamesLoading">
+          <div class="home-games-spinner" aria-hidden="true"></div>
+          <div class="home-games-countdown" id="homeGamesCountdown"></div>
+          <div class="home-games-loading-txt">Loading games…</div>
+        </div>
+        <div class="home-no-games" id="homeNoGames" style="display:none">
           <div class="home-no-games-ic">📲</div>
           <div class="home-no-games-t">No live games</div>
           <div class="home-no-games-s">Check back later or go to Scan to join with a QR code.</div>
@@ -3729,6 +3881,7 @@
     <div class="wh-wrap">
       <canvas id="wheelCanvas" width="280" height="280"></canvas>
       <div class="wh-ptr">🔺</div>
+      <div class="wh-countdown" id="wheelCountdown" aria-hidden="true"></div>
     </div>
     <button class="spin-btn" id="spinBtn" onclick="doSpin()">SPIN !</button>
   </div>
@@ -3880,6 +4033,9 @@
         const user = await r.json();
         dbUser = user;
         localStorage.setItem('shamo_player', JSON.stringify(dbUser));
+        if (user.games_played != null) { S.gamesPlayed = parseInt(user.games_played, 10) || 0; localStorage.setItem('shamo_gp', S.gamesPlayed); }
+        if (user.games_won != null) { S.gamesWon = parseInt(user.games_won, 10) || 0; localStorage.setItem('shamo_gw', S.gamesWon); }
+        if (user.current_streak != null) { S.streak = parseInt(user.current_streak, 10) || 0; localStorage.setItem('shamo_sk', S.streak); }
         updateUI();
         return !!dbUser?.phone_number;
       } catch (e) { console.warn('refetchMe:', e); return false; }
@@ -3982,6 +4138,7 @@
       document.getElementById(fnId)?.classList.add('active');
       document.querySelector('.sb')?.scrollTo(0, 0);
       if (pgId === 'pgProfile') { refetchMe(); loadWithdrawalHistory(); loadSpins(); loadGameSessions(); loadBalanceSummary(); }
+      if (pgId === 'pgHome') loadActiveGame();
       setTimeout(function() {
         if (spinner) spinner.classList.remove('show');
       }, NAV_SPINNER_MS);
@@ -4059,6 +4216,44 @@
         tgUser = tg?.initDataUnsafe?.user || { id: 999999999, first_name: 'Test', last_name: 'Player', username: 'testplayer', language_code: 'en', photo_url: null };
         shamoLog('tgUser', tgUser?.id, tgUser?.first_name);
 
+        // Fetch public game-config first (includes maintenance_mode)
+        let gameConfigResp = {};
+        try {
+          const r = await fetch(API_BASE + '/shamo/api/public/game-config', { cache: 'no-store' });
+          if (r.ok) gameConfigResp = await r.json();
+        } catch (e) { shamoWarn('game-config fetch', e); }
+        S.gameConfig = {
+          seconds_per_question: gameConfigResp.seconds_per_question ?? 4,
+          max_wrong_answers: gameConfigResp.max_wrong_answers ?? 3,
+          questions_per_game: gameConfigResp.questions_per_game ?? 10
+        };
+        var isMaintenance = gameConfigResp.maintenance_mode === true || gameConfigResp.maintenance_mode === 'true';
+        if (isMaintenance) {
+          var loaderEl = document.getElementById('loader');
+          if (loaderEl) { loaderEl.classList.add('out'); setTimeout(function() { loaderEl.remove(); }, 400); }
+          var scLoginEl = document.getElementById('scLogin');
+          if (scLoginEl) scLoginEl.classList.add('hidden');
+          var shellEl = document.getElementById('shell');
+          if (shellEl) shellEl.classList.remove('visible');
+          var scr = document.getElementById('maintenanceScreen');
+          if (scr) {
+            scr.style.display = 'flex';
+            scr.classList.add('visible');
+            scr.setAttribute('aria-hidden', 'false');
+            var msgEl = document.getElementById('maintenanceMessage');
+            if (msgEl) {
+              msgEl.textContent = (gameConfigResp.maintenance_message && String(gameConfigResp.maintenance_message).trim()) || 'Michael is updating some features. Just give us some time!';
+              msgEl.style.fontFamily = "'Noto Sans Ethiopic', 'Noto Serif Ethiopic', serif";
+            }
+            var lnEl = document.getElementById('maintenanceLinkedIn');
+            if (lnEl) lnEl.href = (gameConfigResp.maintenance_linkedin_url && String(gameConfigResp.maintenance_linkedin_url).trim()) || '#';
+            var igEl = document.getElementById('maintenanceInstagram');
+            if (igEl) igEl.href = (gameConfigResp.maintenance_instagram_url && String(gameConfigResp.maintenance_instagram_url).trim()) || '#';
+          }
+          shamoLog('Maintenance mode ON — showing maintenance screen');
+          return;
+        }
+
         const saved = localStorage.getItem('shamo_player');
         if (saved) { try { dbUser = JSON.parse(saved); shamoLog('dbUser from storage', dbUser?.id); } catch (e) { localStorage.removeItem('shamo_player'); shamoWarn('parse shamo_player failed', e); } }
 
@@ -4127,7 +4322,6 @@
         if (returning && dbUser) {
           shamoLog('User session restored', { user_id: dbUser.id, telegram_id: tgUser?.id, first_name: dbUser.first_name || tgUser?.first_name });
           showShell();
-          loadActiveGame().catch(e => shamoErr('loadActiveGame', e));
           const p = new URLSearchParams(window.location.search);
           const qr = p.get('startapp') || p.get('qr') || tg?.initDataUnsafe?.start_param;
           if (qr) { setTimeout(() => { onQRScanned(qr); window.history.replaceState({}, '', '?'); }, 600); }
@@ -4374,6 +4568,7 @@
     function showShell() {
       shamoLog('showShell');
       try {
+        loadActiveGame();
         loadGameConfig();
         const scLogin = document.getElementById('scLogin');
         if (scLogin) scLogin.classList.add('hidden');
@@ -4545,11 +4740,17 @@
         const url = API_BASE + '/shamo/api/player/' + encodeURIComponent(dbUser.id) + '/balance-summary';
         shamoLog('loadBalanceSummary fetch', url);
         const r = await fetch(url);
-        S.balanceSummary = r.ok ? (await r.json().catch(() => null)) : null;
+        const data = r.ok ? (await r.json().catch(() => null)) : null;
+        S.balanceSummary = data;
         if (!r.ok) shamoLog('loadBalanceSummary fail', r.status, await r.text().catch(() => ''));
+        else if (data) {
+          if (data.games_played != null) { S.gamesPlayed = parseInt(data.games_played, 10) || 0; localStorage.setItem('shamo_gp', S.gamesPlayed); }
+          if (data.games_won != null) { S.gamesWon = parseInt(data.games_won, 10) || 0; localStorage.setItem('shamo_gw', S.gamesWon); }
+          if (data.current_streak != null) { S.streak = parseInt(data.current_streak, 10) || 0; localStorage.setItem('shamo_sk', S.streak); }
+        }
         shamoLog('loadBalanceSummary ok', S.balanceSummary);
       } catch (e) { shamoErr('loadBalanceSummary', e); S.balanceSummary = null; }
-      try { updateBalanceDisplay(); updateWithdrawButtonState(); } catch (e) { shamoErr('updateBalanceDisplay', e); }
+      try { updateBalanceDisplay(); updateWithdrawButtonState(); updateUI(); } catch (e) { shamoErr('updateBalanceDisplay', e); }
     }
     async function loadWithdrawalHistory() {
       const el = document.getElementById('profWithdrawals');
@@ -4761,47 +4962,89 @@
       }
     }
 
-    // ═══ LOAD ACTIVE GAMES ═══
+    // ═══ LOAD ACTIVE GAMES (spinner + countdown 5→1; no games → "No live games") ═══
     S.activeGames = [];
-    async function loadActiveGame() {
-      let games = [];
-
-      // ── API only (config from .env) — backend returns games with companies + join_code ──
-      try {
-        const r = await fetch(API_BASE + '/shamo/api/public/games/active', { cache: 'no-store' });
-        if (r.ok) {
-          const d = await r.json().catch(() => ({}));
-          games = Array.isArray(d.games) ? d.games : [];
-          console.log('[SHAMO] API games:', games.length);
-        } else {
-          console.warn('[SHAMO] API /games/active returned', r.status);
+    var LIVE_GAMES_COUNTDOWN_COLORS = ['#E8B84B', '#22C55E', '#3B82F6', '#A855F7', '#EF4444'];
+    var _homeGamesCountdownInterval = null;
+    function showHomeGamesLoading() {
+      var loading = document.getElementById('homeGamesLoading');
+      var noEl = document.getElementById('homeNoGames');
+      var list = document.getElementById('activeGamesList');
+      var countEl = document.getElementById('homeGamesCountdown');
+      if (loading) loading.classList.remove('hidden');
+      if (noEl) noEl.style.display = 'none';
+      if (list) list.innerHTML = '';
+      if (_homeGamesCountdownInterval) clearInterval(_homeGamesCountdownInterval);
+      var n = 5;
+      if (countEl) {
+        countEl.textContent = n;
+        countEl.style.color = LIVE_GAMES_COUNTDOWN_COLORS[0];
+      }
+      _homeGamesCountdownInterval = setInterval(function() {
+        n--;
+        if (countEl && n >= 1) {
+          countEl.textContent = n;
+          countEl.style.color = LIVE_GAMES_COUNTDOWN_COLORS[5 - n];
         }
-      } catch (e) { console.warn('[SHAMO] API unreachable:', e.message); }
+        if (n <= 0 && _homeGamesCountdownInterval) {
+          clearInterval(_homeGamesCountdownInterval);
+          _homeGamesCountdownInterval = null;
+        }
+      }, 1000);
+    }
+    function hideHomeGamesLoading() {
+      if (_homeGamesCountdownInterval) {
+        clearInterval(_homeGamesCountdownInterval);
+        _homeGamesCountdownInterval = null;
+      }
+      var loading = document.getElementById('homeGamesLoading');
+      var countEl = document.getElementById('homeGamesCountdown');
+      if (countEl) countEl.textContent = '';
+      if (loading) loading.classList.add('hidden');
+    }
+    async function loadActiveGame() {
+      showHomeGamesLoading();
+      var timeoutId = setTimeout(function() {
+        timeoutId = null;
+        S.activeGames = [];
+        S.activeGame = null;
+        hideHomeGamesLoading();
+        updateHomeNoGame();
+      }, 5000);
 
-      console.log('[SHAMO] Final active games:', games.length,
-        games.map(g => ({ title: g.title, status: g.status, id: g.id.slice(0, 8) })));
+      var games = [];
+      try {
+        var r = await fetch(API_BASE + '/shamo/api/public/games/active', { cache: 'no-store' });
+        if (r.ok) {
+          var d = await r.json().catch(function() { return {}; });
+          games = Array.isArray(d.games) ? d.games : [];
+        }
+      } catch (e) { shamoWarn('loadActiveGame', e.message); }
+
+      if (timeoutId) { clearTimeout(timeoutId); timeoutId = null; }
+      hideHomeGamesLoading();
 
       S.activeGames = games;
       S.activeGame = games[0] || null;
 
       if (!S.activeGame) {
-        console.warn('[SHAMO] No active games found — showing "No live games".');
         updateHomeNoGame();
         return;
       }
 
-      document.getElementById('tickerTxt').textContent = '🔥 Live games — go to Scan to play';
+      var ticker = document.getElementById('tickerTxt');
+      if (ticker) ticker.textContent = '🔥 Live games — go to Scan to play';
       buildActiveGamesList();
 
-      // Preload questions for the primary active game (via API so RLS is not required)
-      try {
-        S.questions = await loadQuestionsForGame(S.activeGame.id);
-        S.questions = S.questions.map(q => ({
-          ...q,
-          options: (q.options || []).sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0))
-        }));
+      var primaryId = S.activeGame.id;
+      loadQuestionsForGame(primaryId).then(function(qs) {
+        if (primaryId !== (S.activeGame && S.activeGame.id)) return;
+        S.questions = (qs || []).map(function(q) {
+          var opts = (q.options || []).sort(function(a, b) { return (a.sort_order || 0) - (b.sort_order || 0); });
+          return Object.assign({}, q, { options: opts });
+        });
         S.questions = shuffleArray(S.questions);
-      } catch (qe) { console.warn('[SHAMO] Q preload:', qe); S.questions = []; }
+      }).catch(function(qe) { shamoWarn('Q preload', qe); S.questions = S.questions || []; });
     }
 
     /** Until game live Feb 27 8:59 (no "Meet the END date") */
@@ -5560,11 +5803,32 @@
       document.getElementById('spinBtn').disabled = false;
       document.getElementById('wheelOv').classList.add('show');
     }
+    var WHEEL_COUNTDOWN_COLORS = ['#E8B84B', '#22C55E', '#3B82F6', '#A855F7', '#EF4444'];
+    function runWheelCountdown() {
+      var el = document.getElementById('wheelCountdown');
+      if (!el) return;
+      el.classList.add('show');
+      el.setAttribute('aria-hidden', 'false');
+      var nums = [5, 4, 3, 2, 1];
+      var interval = 560;
+      nums.forEach(function(n, i) {
+        setTimeout(function() {
+          if (!el.parentNode) return;
+          el.innerHTML = '<span class="wh-count-num" style="color:' + WHEEL_COUNTDOWN_COLORS[i] + '">' + n + '</span>';
+        }, i * interval);
+      });
+      setTimeout(function() {
+        el.classList.remove('show');
+        el.setAttribute('aria-hidden', 'true');
+        el.innerHTML = '';
+      }, nums.length * interval);
+    }
     function doSpin() {
       if (S.spinning) return; S.spinning = true;
       document.getElementById('spinBtn').disabled = true;
       playSpinSound();
       if (tg) tg.HapticFeedback?.impactOccurred('heavy');
+      runWheelCountdown();
       const segs = S.wheelSegs || _shuffleSegs(_buildBaseSegs());
       S.wheelSegs = segs;
       const N = segs.length;
@@ -5848,8 +6112,8 @@
           <div class="feed-amt" style="color:var(--green)">+${amt} ETB</div>
         </div>`;
       }
-      const batch = Array.from({ length: 3 }, makeItem).join('');
-      // Duplicate the batch so scrolling loops seamlessly (animation moves -50%)
+      // 7 users in the feed; duplicate so marquee loops seamlessly (animation moves -50%)
+      const batch = Array.from({ length: 7 }, makeItem).join('');
       el.innerHTML = batch + batch;
     }
     function buildLeaderboard() {

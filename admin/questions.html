@@ -111,6 +111,14 @@
     }
     .bulk-bar select { padding: 6px 10px; border-radius: 8px; }
 
+    /* Blur questions column (toggle) */
+    .data-table.blur-questions .q-cell-question {
+      filter: blur(6px);
+      user-select: none;
+      pointer-events: none;
+    }
+    #btnBlurQuestions.active { background: var(--surface); border-color: var(--gold); color: var(--gold); }
+
     /* AI Generate button — blue, prominent */
     .btn-ai {
       background: linear-gradient(135deg, #2563eb, #1d4ed8);
@@ -157,6 +165,7 @@
           <button class="btn btn-ai" onclick="openAIGenerateModal()" title="Generate questions with AI">⚡ AI Generate Questions</button>
           <button class="btn btn-ghost" onclick="openImportModal()">📥 Import JSON</button>
           <button class="btn btn-ghost" onclick="openCategoriesModal()" title="Manage categories">📂 Categories</button>
+          <button class="btn btn-ghost" id="btnBlurQuestions" type="button" onclick="toggleBlurQuestions()" title="Blur question text and answers in the list">👁 Blur</button>
         </div>
       </div>
 
@@ -179,7 +188,7 @@
           <button type="button" class="btn btn-ghost btn-sm" onclick="clearSelection()">Clear</button>
         </div>
 
-        <table class="data-table">
+        <table class="data-table" id="qTable">
           <thead>
             <tr>
               <th style="width:32px">
@@ -442,6 +451,16 @@
     buildSidebar('questions');
     requireAuth();
 
+    function toggleBlurQuestions() {
+      const table = document.getElementById('qTable');
+      const btn = document.getElementById('btnBlurQuestions');
+      if (!table || !btn) return;
+      table.classList.toggle('blur-questions');
+      btn.classList.toggle('active', table.classList.contains('blur-questions'));
+      btn.title = table.classList.contains('blur-questions') ? 'Unblur question text' : 'Blur question text and answers in the list';
+      btn.textContent = table.classList.contains('blur-questions') ? '👁 Unblur' : '👁 Blur';
+    }
+
     const AI_LASTGEN_KEY = 'shamo_ai_last_generation';
     function renderAILastGen() {
       const el = document.getElementById('aiLastGen');
@@ -602,7 +621,7 @@
           const checked = selectedQuestionIds.has(q.id) ? 'checked' : '';
           return `<tr>
           <td style="vertical-align:middle"><input type="checkbox" class="q-cb" data-qid="${q.id}" ${checked} onchange="onQuestionCheck()" /></td>
-          <td style="max-width:300px">
+          <td class="q-cell-question" style="max-width:300px">
             <div style="font-weight:600;font-size:.87rem;line-height:1.4">${q.icon || ''} ${q.question_text}</div>
             ${(q.options || []).find(o => o.is_correct) ? `<div style="font-size:.68rem;color:var(--green);margin-top:2px">✅ ${(q.options || []).find(o => o.is_correct)?.option_text || ''}</div>` : ''}
           </td>

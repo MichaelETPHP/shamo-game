@@ -897,7 +897,9 @@ async def player_balance_summary(uid: str, telegram_id: Optional[int] = None):
     No withdrawal subtraction — display raw total from active spins.
     """
     sb = get_sb()
-    user_res = await run(lambda: sb.table("users").select("id,telegram_id,phone_number,first_name,last_name").eq("id", uid).limit(1).execute())
+    user_res = await run(lambda: sb.table("users").select(
+        "id,telegram_id,phone_number,first_name,last_name,games_played,games_won,current_streak"
+    ).eq("id", uid).limit(1).execute())
     if not user_res.data:
         raise HTTPException(404, "User not found")
     user = user_res.data[0]
@@ -937,41 +939,75 @@ async def player_balance_summary(uid: str, telegram_id: Optional[int] = None):
             "question_number": r.get("question_number"),
         })
     return {
-        "user": {"id": user["id"], "phone_number": user.get("phone_number"), "telegram_id": user.get("telegram_id")},
+        "user": {
+            "id": user["id"],
+            "phone_number": user.get("phone_number"),
+            "telegram_id": user.get("telegram_id"),
+            "games_played": int(user.get("games_played") or 0),
+            "games_won": int(user.get("games_won") or 0),
+            "current_streak": int(user.get("current_streak") or 0),
+        },
         "total_earned_from_spins": round(total_earned, 2),
         "total_withdrawn": round(total_withdrawn, 2),
         "available_balance": round(available_balance, 2),
         "active_spins": active_spins,
+        "games_played": int(user.get("games_played") or 0),
+        "games_won": int(user.get("games_won") or 0),
+        "current_streak": int(user.get("current_streak") or 0),
     }
 
-# ─── Game config from platform_config (for mini-app timer & rules) ─────────────
+# ─── Game config from platform_config (for mini-app timer & rules + maintenance) ─
 async def _get_game_config(sb: Client) -> dict:
-    """Read game settings from platform_config. All rules/timer in mini-app come from here."""
+    """Read game settings from platform_config. Includes maintenance mode for mini-app."""
     try:
-        rows = await run(lambda: sb.table("platform_config")
-            .select("key,value")
-            .in_("key", ["seconds_per_question", "max_wrong_answers", "questions_per_game"])
-            .execute())
+        keys = [
+            "seconds_per_question", "max_wrong_answers", "questions_per_game",
+            "maintenance_mode", "maintenance_message", "maintenance_linkedin_url", "maintenance_instagram_url",
+        ]
+        rows = await run(lambda: sb.table("platform_config").select("key,value").in_("key", keys).execute())
         cfg = {}
-        defaults = {"seconds_per_question": 4, "max_wrong_answers": 3, "questions_per_game": 10}
         for r in (rows.data or []):
             v = r.get("value")
             if v is None:
                 continue
+            k = r["key"]
             if isinstance(v, str):
-                try:
-                    v = json.loads(v) if v.strip().startswith(("{", "[")) else int(float(v))
-                except (ValueError, TypeError):
-                    v = defaults.get(r["key"], 4)
-            cfg[r["key"]] = int(v) if isinstance(v, (int, float)) else v
-        return {
+                v_strip = v.strip()
+                if v_strip.lower() in ("true", "false"):
+                    cfg[k] = v_strip.lower() == "true"
+                elif v_strip.startswith(("{", "[")):
+                    try:
+                        cfg[k] = json.loads(v)
+                    except (ValueError, TypeError):
+                        cfg[k] = v
+                elif k in ("seconds_per_question", "max_wrong_answers", "questions_per_game"):
+                    try:
+                        cfg[k] = int(float(v))
+                    except (ValueError, TypeError):
+                        pass
+                else:
+                    cfg[k] = v
+            else:
+                cfg[k] = v
+        out = {
             "seconds_per_question": max(3, min(30, cfg.get("seconds_per_question") or 4)),
             "max_wrong_answers": max(1, min(10, cfg.get("max_wrong_answers") or 3)),
             "questions_per_game": max(1, min(50, cfg.get("questions_per_game") or 10)),
+            "maintenance_mode": bool(cfg.get("maintenance_mode")),
+            "maintenance_message": (cfg.get("maintenance_message") or "Michael is updating some features. Just give us some time!").strip(),
+            "maintenance_linkedin_url": (cfg.get("maintenance_linkedin_url") or "").strip() or "#",
+            "maintenance_instagram_url": (cfg.get("maintenance_instagram_url") or "").strip() or "#",
         }
+        return out
     except Exception as e:
         logger.warning("_get_game_config: %s", e)
-        return {"seconds_per_question": 4, "max_wrong_answers": 3, "questions_per_game": 10}
+        return {
+            "seconds_per_question": 4, "max_wrong_answers": 3, "questions_per_game": 10,
+            "maintenance_mode": False,
+            "maintenance_message": "Michael is updating some features. Just give us some time!",
+            "maintenance_linkedin_url": "#",
+            "maintenance_instagram_url": "#",
+        }
 
 @app.get("/api/public/game-config")
 async def public_game_config():

@@ -165,11 +165,8 @@
                     </div>
                 </div>
 
+                <input type="hidden" id="gDate" />
                 <div class="form-row">
-                    <div class="form-group">
-                        <label>Game Date *</label>
-                        <input id="gDate" type="date" />
-                    </div>
                     <div class="form-group">
                         <label>Starts At * <span style="font-size:.7rem;color:#E8B84B;font-weight:400">Ethiopian time (GMT+3)</span></label>
                         <input id="gStarts" type="datetime-local" />
@@ -193,14 +190,6 @@
 
                 <div class="form-row">
                     <div class="form-group">
-                        <label>Platform Fee (%)</label>
-                        <input id="gFee" type="number" step="0.5" min="0" max="100" value="15" />
-                    </div>
-                    <div class="form-group">
-                        <label>Player Cap (%)</label>
-                        <input id="gCap" type="number" step="5" min="0" max="100" value="30" />
-                    </div>
-                    <div class="form-group">
                         <label>Company (optional)</label>
                         <select id="gCompany">
                             <option value="">— Platform Game —</option>
@@ -208,9 +197,14 @@
                     </div>
                 </div>
 
-                <div class="form-group">
+                <div class="form-group" style="margin-top:1rem">
                     <label>Description</label>
-                    <textarea id="gDesc" rows="2" placeholder="Optional game description…"></textarea>
+                    <div class="readonly-desc" id="gameDescReadonly" style="padding:.75rem 1rem;background:var(--surface);border:1px solid var(--border);border-radius:8px;font-size:.85rem;line-height:1.6;color:var(--muted);white-space:pre-line">SHAMO is a fast trivia game where you answer short questions and win real cash.
+Each correct answer gives you a spin on the prize wheel. Every spin adds money to your balance.
+
+Answer quickly. Avoid wrong answers. Reach the minimum and withdraw your winnings.
+
+Join SHAMO now. Test your knowledge. Spin. Win. Enjoy the game.</div>
                 </div>
             </div>
             <div class="modal-footer">
@@ -240,6 +234,15 @@
     <script>
         let gPage = 1;
         let allCompanies = [];
+
+        // Read-only description for all games (never edited)
+        const SHAMO_GAME_DESCRIPTION = `SHAMO is a fast trivia game where you answer short questions and win real cash.
+
+Each correct answer gives you a spin on the prize wheel. Every spin adds money to your balance.
+
+Answer quickly. Avoid wrong answers. Reach the minimum and withdraw your winnings.
+
+Join SHAMO now. Test your knowledge. Spin. Win. Enjoy the game.`;
 
         buildSidebar('games');
         requireAuth();
@@ -425,7 +428,7 @@
             <div><strong>Total Paid Out</strong><br>${fmtN(g.total_paid_out)} ETB</div>
             <div><strong>Max Prize</strong><br>${fmtN(g.max_prize_etb)} ETB</div>
           </div>
-          ${g.description ? `<div style="margin-top:12px;font-size:.82rem;color:var(--muted)">${g.description}</div>` : ''}
+          <div style="margin-top:12px;font-size:.82rem;color:var(--muted);white-space:pre-line">${SHAMO_GAME_DESCRIPTION}</div>
         `;
                 document.getElementById('viewEditBtn').onclick = () => { closeModal('modalGameView'); editGame(id); };
                 openModal('modalGameView');
@@ -437,11 +440,8 @@
             document.getElementById('gameModalTitle').textContent = '＋ New Game';
             document.getElementById('gId').value = '';
             document.getElementById('gTitle').value = '';
-            document.getElementById('gDesc').value = '';
             document.getElementById('gPool').value = '500';
             document.getElementById('gMaxPay').value = '1000';
-            document.getElementById('gFee').value = '15';
-            document.getElementById('gCap').value = '30';
             document.getElementById('gStatus').value = 'draft';
             document.getElementById('gCompany').value = '';
 
@@ -470,10 +470,7 @@
                 document.getElementById('gEnds').value   = utcToEtInput(g.ends_at);
                 document.getElementById('gPool').value = g.prize_pool_etb ?? 500;
                 document.getElementById('gMaxPay').value = g.max_prize_etb ?? 1000;
-                document.getElementById('gFee').value = g.platform_fee_pct ?? 15;
-                document.getElementById('gCap').value = g.player_cap_pct ?? 30;
                 document.getElementById('gCompany').value = g.company_id || '';
-                document.getElementById('gDesc').value = g.description || '';
                 openModal('modalGame');
             } catch (e) { showToast(e.message, 'error'); }
         }
@@ -503,9 +500,9 @@
                 ends_at: endsAt,
                 prize_pool_etb: parseFloat(document.getElementById('gPool').value) || 500,
                 max_prize_etb: parseFloat(document.getElementById('gMaxPay').value) || 1000,
-                platform_fee_pct: parseFloat(document.getElementById('gFee').value) || 15,
-                player_cap_pct: parseFloat(document.getElementById('gCap').value) || 30,
-                description: document.getElementById('gDesc').value || null,
+                platform_fee_pct: 15,
+                player_cap_pct: 30,
+                description: SHAMO_GAME_DESCRIPTION,
                 company_id: document.getElementById('gCompany').value || null,
             };
 

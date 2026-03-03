@@ -114,6 +114,13 @@
       border-color: var(--gold)
     }
 
+    .s-input-wide {
+      min-width: 200px;
+      width: 100%;
+      max-width: 280px;
+      text-align: left
+    }
+
     .caution-tag {
       display: inline-block;
       background: rgba(239, 68, 68, .12);
@@ -152,6 +159,27 @@
             </div>
             <label class="toggle"><input type="checkbox" id="tog_maintenance_mode" /><span
                 class="toggle-slider"></span></label>
+          </div>
+          <div class="s-row">
+            <div class="s-info">
+              <div class="name">Maintenance message</div>
+              <div class="desc">Text shown on the mini-app maintenance screen (e.g. “Michael is updating some features. Just give us some time!”).</div>
+            </div>
+            <input class="s-input s-input-wide" type="text" id="set_maintenance_message" placeholder="Michael is updating some features. Just give us some time!" />
+          </div>
+          <div class="s-row">
+            <div class="s-info">
+              <div class="name">Maintenance LinkedIn URL</div>
+              <div class="desc">Link for the LinkedIn icon on the maintenance screen.</div>
+            </div>
+            <input class="s-input s-input-wide" type="url" id="set_maintenance_linkedin_url" placeholder="https://www.linkedin.com/company/..." />
+          </div>
+          <div class="s-row">
+            <div class="s-info">
+              <div class="name">Maintenance Instagram URL</div>
+              <div class="desc">Link for the Instagram icon on the maintenance screen.</div>
+            </div>
+            <input class="s-input s-input-wide" type="url" id="set_maintenance_instagram_url" placeholder="https://www.instagram.com/..." />
           </div>
           <div class="s-row">
             <div class="s-info">
@@ -367,7 +395,7 @@
 
     const TOGGLES = ['maintenance_mode', 'one_game_per_day', 'allow_registrations', 'company_games'];
     const NUM_SETS = ['commission_pct', 'withdrawal_fee_pct', 'min_withdrawal_etb', 'max_daily_withdrawal_etb', 'default_prize_pool_etb', 'questions_per_game', 'player_cap_pct', 'max_wrong_answers', 'seconds_per_question', 'cooldown_hours', 'daily_reset_hour'];
-    const STR_SETS = ['admin_username', 'admin_password'];
+    const STR_SETS = ['admin_username', 'admin_password', 'maintenance_message', 'maintenance_linkedin_url', 'maintenance_instagram_url'];
 
     async function loadSettings() {
       document.getElementById('settingsStatus').textContent = 'Loading…';
