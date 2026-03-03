@@ -357,7 +357,6 @@ async function buildSidebar(activePage) {
   if (collapsed) el.classList.add('collapsed');
 
   el.innerHTML = `
-    <button type="button" class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar" title="Collapse/expand sidebar">◀</button>
     <div class="sidebar-logo">
       <div class="icon">🎡</div>
       <div class="brand"><h2>SHAMO</h2><p>Admin Portal</p></div>
@@ -379,16 +378,36 @@ async function buildSidebar(activePage) {
       <div class="admin-dev-footer">Dev By MICHAEL</div>
     </div>`;
 
-  const toggleBtn = document.getElementById('sidebarToggle');
-  if (toggleBtn) {
-    toggleBtn.addEventListener('click', function (e) {
-      e.preventDefault();
-      el.classList.toggle('collapsed');
-      toggleBtn.textContent = el.classList.contains('collapsed') ? '▶' : '◀';
-      localStorage.setItem('shamo_sidebar_collapsed', el.classList.contains('collapsed') ? '1' : '0');
-    });
-    toggleBtn.textContent = el.classList.contains('collapsed') ? '▶' : '◀';
+  // Header collapse button (in topbar) — desktop only; mobile uses hamburger
+  function toggleSidebar() {
+    el.classList.toggle('collapsed');
+    localStorage.setItem('shamo_sidebar_collapsed', el.classList.contains('collapsed') ? '1' : '0');
+    updateHeaderToggleIcon();
   }
+  function updateHeaderToggleIcon() {
+    const btn = document.getElementById('shamo-header-sidebar-toggle');
+    if (btn) {
+      btn.setAttribute('aria-label', el.classList.contains('collapsed') ? 'Expand sidebar' : 'Collapse sidebar');
+      btn.title = el.classList.contains('collapsed') ? 'Expand sidebar' : 'Collapse sidebar';
+      btn.querySelector('.header-toggle-icon').textContent = el.classList.contains('collapsed') ? '▶' : '◀';
+    }
+  }
+  window.toggleSidebar = toggleSidebar;
+
+  const topbar = document.querySelector('.topbar');
+  let headerToggle = document.getElementById('shamo-header-sidebar-toggle');
+  if (!headerToggle && topbar) {
+    headerToggle = document.createElement('button');
+    headerToggle.type = 'button';
+    headerToggle.id = 'shamo-header-sidebar-toggle';
+    headerToggle.className = 'header-sidebar-toggle';
+    headerToggle.setAttribute('aria-label', 'Collapse sidebar');
+    headerToggle.title = 'Collapse sidebar';
+    headerToggle.innerHTML = '<span class="header-toggle-icon">◀</span>';
+    headerToggle.onclick = toggleSidebar;
+    topbar.insertBefore(headerToggle, topbar.firstChild);
+  }
+  updateHeaderToggleIcon();
 
   // Load badges
   try {
