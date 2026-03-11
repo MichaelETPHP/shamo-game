@@ -1110,21 +1110,48 @@ async def debug_active_games():
 @app.get("/api/public/games/active")
 async def public_active_games_list():
     """
-    Returns all active games with their active QR codes.
-    Game status='active' already means admin verified questions+QR before going live.
+    Returns games that are visible in the mini-app "Live" section:
+    - Games with status='active' (admin clicked Go Live), or
+    - Games that have at least one active QR code (so they show after QR is generated).
     No auth required — uses service key (bypasses RLS).
     """
     sb = get_sb()
+    game_ids_from_active: list = []
+    game_ids_from_qr: list = []
     try:
         games_res = await run(lambda: sb.table("games").select(
             "id,title,status,game_date,prize_pool_etb,prize_pool_remaining,"
-            "total_players,total_winners,total_paid_out,starts_at,ends_at,company_id"
-        ).eq("status", "active").order("updated_at", desc=True).limit(10).execute())
-        games = games_res.data or []
-        logger.info("public_active_games_list: found %d active games", len(games))
+            "total_players,total_winners,total_paid_out,starts_at,ends_at,company_id,updated_at"
+        ).eq("status", "active").order("updated_at", desc=True).limit(20).execute())
+        active_games = games_res.data or []
+        game_ids_from_active = [g["id"] for g in active_games]
+        logger.info("public_active_games_list: found %d status=active games", len(active_games))
     except Exception as e:
         logger.error("public_active_games_list games query FAILED: %s", e)
-        return {"games": []}
+        active_games = []
+
+    try:
+        qr_res = await run(lambda: sb.table("qr_codes").select("game_id").eq("status", "active").execute())
+        qr_rows = qr_res.data or []
+        game_ids_from_qr = list({r["game_id"] for r in qr_rows if r.get("game_id")} - set(game_ids_from_active or []))
+    except Exception as e:
+        logger.warning("public_active_games_list qr game_ids query: %s", e)
+        game_ids_from_qr = []
+
+    games = list(active_games)
+    if game_ids_from_qr:
+        try:
+            extra_res = await run(lambda: sb.table("games").select(
+                "id,title,status,game_date,prize_pool_etb,prize_pool_remaining,"
+                "total_players,total_winners,total_paid_out,starts_at,ends_at,company_id,updated_at"
+            ).in_("id", game_ids_from_qr).order("updated_at", desc=True).execute())
+            extra = extra_res.data or []
+            games = games + extra
+            logger.info("public_active_games_list: added %d games with active QR (draft/scheduled)", len(extra))
+        except Exception as e:
+            logger.warning("public_active_games_list extra games query: %s", e)
+
+    games = games[:20]
 
     # Enrich with company info separately (avoids FK hint issues)
     if games:

@@ -356,6 +356,7 @@ Join SHAMO now. Test your knowledge. Spin. Win. Enjoy the game.`;
                 const ready = qCount > 0 && qrCount > 0;
                 const readyHtml = `<div style="margin-bottom:14px;padding:10px 14px;border-radius:8px;background:${ready ? 'rgba(34,197,94,.1)' : 'rgba(249,115,22,.1)'};border:1px solid ${ready ? 'var(--green)' : 'var(--orange)'};font-size:.82rem;">
                   ${ready ? '✓ Ready to go live' : '⚠ To go live'}: ${qCount} question(s), ${qrCount} active QR code(s). ${ready ? 'You can click "▶ Go Live" in the row above.' : 'Add at least one question and generate at least one QR code (QR Manager or create below).'}
+                  ${qrCount > 0 ? '<br><small style="color:var(--muted)">📲 This game already appears in the mini-app Live section (games with an active QR show there).</small>' : ''}
                 </div>`;
                 if (!qs || !qs.length) {
                     qContent.innerHTML = readyHtml + `<div style="text-align:center; padding: 20px; color: var(--muted);">📭 No questions added to this game yet.</div>`;
