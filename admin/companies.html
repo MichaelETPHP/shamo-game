@@ -104,7 +104,7 @@
         <input type="hidden" id="cId" />
         <div class="form-row">
           <div class="form-group" style="flex:2"><label>Company Name *</label><input id="cName" type="text" placeholder="Tomoca Coffee" oninput="autoSlug()" /></div>
-          <div class="form-group"><label>Slug</label><input id="cSlug" type="text" placeholder="auto-generated" style="color:var(--muted)" /></div>
+          <div class="form-group"><label>Slug <span style="font-size:.65rem;color:var(--muted);font-weight:400">(auto)</span></label><input id="cSlug" type="text" placeholder="auto-generated" readonly style="color:var(--muted);cursor:default;background:var(--surface)" title="Auto-generated from company name" /></div>
         </div>
         <div class="form-row">
           <div class="form-group"><label>Category</label>
@@ -168,8 +168,9 @@
       </div>
       <div class="modal-body">
         <input type="hidden" id="tuId" />
-        <div class="form-group"><label>Amount (ETB)</label><input id="tuAmt" type="number" step="50" min="0" placeholder="500" /></div>
-        <div class="form-group"><label>Note (optional)</label><textarea id="tuNote" rows="2" placeholder="Payment reference…"></textarea></div>
+        <div class="form-group"><label>Amount (ETB) *</label><input id="tuAmt" type="number" step="50" min="0" placeholder="500" /></div>
+        <div class="form-group"><label>Ref Number *</label><input id="tuRef" type="text" placeholder="e.g. TXN-20240301-001" /></div>
+        <div class="form-group"><label>Note (optional)</label><textarea id="tuNote" rows="2" placeholder="Additional notes…"></textarea></div>
       </div>
       <div class="modal-footer">
         <button class="btn btn-ghost" onclick="closeModal('modalTopUp')">Cancel</button>
@@ -311,7 +312,7 @@
 
     function autoSlug() {
       const id = document.getElementById('cId').value;
-      if (id) return;
+      if (id) return; // don't overwrite slug when editing
       const name = document.getElementById('cName').value;
       document.getElementById('cSlug').value = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
     }
@@ -325,6 +326,10 @@
       document.getElementById('cCat').value = 'Other';
       document.getElementById('cColor1').value = '#E8B84B';
       document.getElementById('logoPreviewWrap').innerHTML = '<span style="font-size:.75rem;color:var(--muted)">Paste a URL to preview</span>';
+      // slug is auto-generated for new companies
+      const slugEl = document.getElementById('cSlug');
+      slugEl.readOnly = true;
+      slugEl.style.cursor = 'default';
       openModal('modalComp');
     }
 
@@ -334,7 +339,12 @@
         document.getElementById('compModalTitle').textContent = '✏️ Edit — ' + c.name;
         document.getElementById('cId').value = c.id;
         document.getElementById('cName').value = c.name || '';
-        document.getElementById('cSlug').value = c.slug || '';
+        // slug is editable when editing an existing company
+        const slugEl = document.getElementById('cSlug');
+        slugEl.readOnly = false;
+        slugEl.style.cursor = 'text';
+        slugEl.style.color = '';
+        slugEl.value = c.slug || '';
         document.getElementById('cEmail').value = c.contact_email || '';
         document.getElementById('cPhone').value = c.contact_phone || '';
         document.getElementById('cWeb').value = c.website || '';
@@ -404,6 +414,7 @@
       document.getElementById('tuId').value = id;
       document.getElementById('topUpTitle').textContent = '💰 Top Up — ' + name;
       document.getElementById('tuAmt').value = '';
+      document.getElementById('tuRef').value = '';
       document.getElementById('tuNote').value = '';
       openModal('modalTopUp');
     }
@@ -411,13 +422,16 @@
     async function applyTopUp() {
       const id = document.getElementById('tuId').value;
       const amt = parseFloat(document.getElementById('tuAmt').value);
-      const note = document.getElementById('tuNote').value;
+      const ref = document.getElementById('tuRef').value.trim();
+      const note = document.getElementById('tuNote').value.trim();
       if (!amt || amt <= 0) { showToast('Enter a valid amount', 'error'); return; }
+      if (!ref) { showToast('Ref Number is required', 'error'); return; }
       const btn = document.getElementById('tuBtn');
       btn.disabled = true; btn.textContent = 'Adding…';
       try {
-        await apiPost(`/companies/${id}/topup`, { amount: amt, note });
-        showToast(`+${fmtN(amt)} ETB credits added ✅`, 'success');
+        const res = await apiPost(`/companies/${id}/topup`, { amount: amt, ref_number: ref, note });
+        if (!res || !res.deposit_id) throw new Error('Deposit was not saved — check Supabase RLS on company_deposits table.');
+        showToast(`Deposit of ${fmtN(amt)} ETB submitted — pending approval ✅`, 'success');
         closeModal('modalTopUp'); loadC();
       } catch (e) { showToast(e.message, 'error'); }
       finally { btn.disabled = false; btn.textContent = '💰 Add Credits'; }

@@ -268,7 +268,7 @@ function fmtN(n) { return Number(n || 0).toLocaleString(); }
 
 // ─── Badge ────────────────────────────────────────────────────────────────────
 const STATUS_MAP = {
-  active: 'badge-green', approved: 'badge-green', completed: 'badge-green', won: 'badge-green', correct: 'badge-green',
+  active: 'badge-green', approved: 'badge-green', confirmed: 'badge-green', completed: 'badge-green', won: 'badge-green', correct: 'badge-green',
   pending: 'badge-gold', scheduled: 'badge-gold', draft: 'badge-muted', processing: 'badge-blue', ended: 'badge-blue',
   suspended: 'badge-orange', rejected: 'badge-red', failed: 'badge-red', cancelled: 'badge-red', banned: 'badge-red',
   easy: 'badge-green', medium: 'badge-gold', hard: 'badge-red',
@@ -375,7 +375,6 @@ async function buildSidebar(activePage) {
         <div class="user-avatar">${initials}</div>
         <div class="info"><p>${user.username || 'Admin'}</p><span>Sign out</span></div>
       </div>
-      <div class="admin-dev-footer">Dev By MICHAEL</div>
     </div>`;
 
   // Header collapse button (in topbar) — desktop only; mobile uses hamburger

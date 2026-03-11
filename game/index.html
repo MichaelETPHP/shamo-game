@@ -1202,6 +1202,7 @@
       margin-top: 4px;
       margin-bottom: 10px;
     }
+    .home-live-sec .home-live-label { color: var(--green); font-weight: 700; }
     .home-games-loading {
       display: flex;
       flex-direction: column;
@@ -1369,7 +1370,7 @@
     .accordion-body {
       max-height: 0; overflow: hidden; transition: max-height .3s ease;
     }
-    .accordion-body.open { max-height: 200px; }
+    .accordion-body.open { max-height: 320px; }
     .game-rules-list { display: flex; flex-direction: column; padding: 6px 0 10px; }
     .game-rule-item {
       display: flex; align-items: center; gap: 8px;
@@ -2312,24 +2313,24 @@
       align-items: center;
       gap: 6px;
       padding: 4px 10px;
-      background: rgba(239, 68, 68, .15);
-      border: 1px solid rgba(239, 68, 68, .4);
+      background: rgba(34, 197, 94, .15);
+      border: 1px solid rgba(34, 197, 94, .4);
       border-radius: 100px;
       font-size: 9px;
       font-weight: 700;
       letter-spacing: 2px;
-      color: #f87171;
+      color: #22C55E;
     }
     .live-dot {
       width: 6px;
       height: 6px;
       border-radius: 50%;
-      background: #ef4444;
+      background: #22C55E;
       animation: live-pulse 1.2s ease-in-out infinite;
     }
     @keyframes live-pulse {
-      0%, 100% { opacity: 1; transform: scale(1); box-shadow: 0 0 0 0 rgba(239, 68, 68, .6); }
-      50% { opacity: .85; transform: scale(1.1); box-shadow: 0 0 0 4px rgba(239, 68, 68, 0); }
+      0%, 100% { opacity: 1; transform: scale(1); box-shadow: 0 0 0 0 rgba(34, 197, 94, .6); }
+      50% { opacity: .85; transform: scale(1.1); box-shadow: 0 0 0 4px rgba(34, 197, 94, 0); }
     }
     .live-badge.join-live { flex-shrink: 0; }
     .live-badge-sm { padding: 2px 6px; font-size: 8px; }
@@ -3509,7 +3510,7 @@
         <div style="height:4px"></div>
 
         <!-- Live active games (prize pool + live time) -->
-        <div class="sec home-live-sec" id="homeLiveSec">Live games</div>
+        <div class="sec home-live-sec" id="homeLiveSec"><span class="home-live-label">Live</span> games</div>
         <div class="home-games-loading hidden" id="homeGamesLoading">
           <div class="home-games-spinner" aria-hidden="true"></div>
           <div class="home-games-countdown" id="homeGamesCountdown"></div>
@@ -3835,7 +3836,7 @@
         </div>
         <div class="join-rule">
           <div class="join-rule-ic">⏱</div>
-          <div class="join-rule-txt" id="joinRuleSec"><b><span id="joinSecVal">4</span> seconds</b> per question (from Admin Settings)</div>
+          <div class="join-rule-txt" id="joinRuleSec"><b><span id="joinSecVal">4</span> seconds</b> per question (from Admin)</div>
         </div>
         <div class="join-rule">
           <div class="join-rule-ic">🎡</div>
@@ -4090,7 +4091,7 @@
       qrToken: null, qrData: null, scanStream: null, scanning: false,
       wrongCount: 0,
       answeredIds: [],   // question IDs answered this session (no-repeat rule)
-      gameConfig: { seconds_per_question: 4, max_wrong_answers: 3, questions_per_game: 10 }  // all from Admin → Settings
+      gameConfig: { seconds_per_question: 4, max_wrong_answers: 3, questions_per_game: 10 }
     };
 
     // ═══ PARTICLES ═══
@@ -4551,7 +4552,7 @@
     function applyGameConfigToDOM() {
       if (!S.gameConfig) S.gameConfig = { seconds_per_question: 4, max_wrong_answers: 3, questions_per_game: 10 };
       const c = S.gameConfig;
-      const sec = c.seconds_per_question ?? 4;
+      const sec = Math.max(3, Math.min(30, c.seconds_per_question ?? 4));
       const wrong = c.max_wrong_answers ?? 3;
       const qs = c.questions_per_game ?? 10;
       const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
@@ -5131,7 +5132,7 @@
             <div class="accordion-body" id="${accId}">
               <div class="game-rules-list">
                 <div class="game-rule-item"><span style="font-size:16px">📲</span> <span>1 scan per QR code — New QR = New Play</span></div>
-                <div class="game-rule-item"><span style="font-size:16px">⏱</span> <span>${(S.gameConfig && S.gameConfig.seconds_per_question) || 4} seconds per question (from Admin Settings)</span></div>
+                <div class="game-rule-item"><span style="font-size:16px">⏱</span> <span>${(S.gameConfig && S.gameConfig.seconds_per_question) || 4} seconds per question (from Admin)</span></div>
                 <div class="game-rule-item"><span style="font-size:16px">💀</span> <span>${(S.gameConfig && S.gameConfig.max_wrong_answers) || 3} wrong answers = Game Over — Keep your earnings</span></div>
                 <div class="game-rule-item"><span style="font-size:16px">🎡</span> <span>Correct answer → Spin the wheel → earn real ETB (ብር)</span></div>
                 <div class="game-rule-item"><span style="font-size:16px">💳</span> <span>Withdraw via Telebirr — your rewards</span></div>

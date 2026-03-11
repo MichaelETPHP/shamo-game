@@ -22,7 +22,7 @@
                     <select id="dStatus" onchange="loadD(1)">
                         <option value="">All Status</option>
                         <option value="pending">Pending</option>
-                        <option value="approved">Approved</option>
+                        <option value="confirmed">Confirmed</option>
                         <option value="rejected">Rejected</option>
                     </select>
                     <button class="btn btn-ghost btn-sm" onclick="exportCSV()">⬇ CSV</button>
@@ -30,6 +30,25 @@
             </div>
             <div class="content">
                 <div id="pendingAlert"></div>
+                <!-- Stats strip -->
+                <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px">
+                    <div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 16px">
+                        <div id="stTotal" style="font-size:1.4rem;font-weight:800;color:var(--gold)">—</div>
+                        <div style="font-size:.65rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-top:2px">Total</div>
+                    </div>
+                    <div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 16px">
+                        <div id="stPending" style="font-size:1.4rem;font-weight:800;color:#F97316">—</div>
+                        <div style="font-size:.65rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-top:2px">Pending</div>
+                    </div>
+                    <div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 16px">
+                        <div id="stConfirmed" style="font-size:1.4rem;font-weight:800;color:var(--green)">—</div>
+                        <div style="font-size:.65rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-top:2px">Confirmed</div>
+                    </div>
+                    <div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 16px">
+                        <div id="stAmount" style="font-size:1.4rem;font-weight:800;color:var(--gold)">—</div>
+                        <div style="font-size:.65rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-top:2px">Total ETB</div>
+                    </div>
+                </div>
                 <table class="data-table">
                     <thead>
                         <tr>
@@ -67,6 +86,7 @@
     <!-- SHAMO_ENV -->
   <script src="_shared.js"></script>
     <script>
+        requireAuth();
         let dPage = 1;
         let dData = [];
         buildSidebar('deposits');
@@ -80,23 +100,37 @@
                 const r = await apiGet(`/deposits?page=${page}&per_page=15&search=${encodeURIComponent(search)}&status=${status}`);
                 dData = r.data || [];
 
+                // Stats strip
+                const pending = dData.filter(d => d.status === 'pending').length;
+                const confirmed = dData.filter(d => d.status === 'confirmed').length;
+                const totalEtb = dData.reduce((s, d) => s + parseFloat(d.amount_etb || 0), 0);
+                document.getElementById('stTotal').textContent = r.total ?? dData.length;
+                document.getElementById('stPending').textContent = pending;
+                document.getElementById('stConfirmed').textContent = confirmed;
+                document.getElementById('stAmount').textContent = fmtN(totalEtb) + ' ETB';
+
                 // Pending alert
-                if (!status || status === 'pending') {
-                    const pr = await apiGet('/deposits?status=pending&per_page=1');
-                    const el = document.getElementById('pendingAlert');
-                    el.innerHTML = pr.total > 0
-                        ? `<div style="background:rgba(249,115,22,.1);border:1px solid rgba(249,115,22,.3);border-radius:12px;padding:.9rem 1.25rem;margin-bottom:1rem;display:flex;align-items:center;gap:1rem">
-             <span style="font-size:1.3rem">🏢</span>
-             <span style="flex:1"><b>${pr.total} pending deposit${pr.total > 1 ? 's' : ''}</b> need approval</span>
-           </div>` : '';
+                if (pending > 0 && (!status || status === 'pending')) {
+                    document.getElementById('pendingAlert').innerHTML =
+                        `<div style="background:rgba(249,115,22,.1);border:1px solid rgba(249,115,22,.3);border-radius:12px;padding:.9rem 1.25rem;margin-bottom:1rem;display:flex;align-items:center;gap:1rem">
+                            <span style="font-size:1.3rem">🏢</span>
+                            <span style="flex:1"><b>${pending} pending deposit${pending > 1 ? 's' : ''}</b> need approval</span>
+                         </div>`;
+                } else {
+                    document.getElementById('pendingAlert').innerHTML = '';
                 }
 
-                if (!dData.length) { document.getElementById('dBody').innerHTML = `<tr><td colspan="6" style="text-align:center;padding:3rem;color:var(--muted)">No deposits found</td></tr>`; return; }
-                document.getElementById('dBody').innerHTML = dData.map(d => `
+                // Client-side filter by company name or ref number
+                const q = document.getElementById('searchD').value.toLowerCase();
+                const visible = q ? dData.filter(d =>
+                    (d.company_name || '').toLowerCase().includes(q) ||
+                    (d.ref_number || '').toLowerCase().includes(q)
+                ) : dData;
+
+                if (!visible.length) { document.getElementById('dBody').innerHTML = `<tr><td colspan="6" style="text-align:center;padding:3rem;color:var(--muted)">No deposits found</td></tr>`; return; }
+                document.getElementById('dBody').innerHTML = visible.map(d => `
       <tr>
-        <td>
-          <div style="font-weight:600">${d.company_name || '—'}</div>
-        </td>
+        <td><div style="font-weight:600">${d.company_name || '—'}</div></td>
         <td style="font-size:.8rem;color:var(--muted)">${d.ref_number || '—'}</td>
         <td style="font-weight:700;color:var(--gold)">${fmtN(d.amount_etb)} ETB</td>
         <td>${badge(d.status)}</td>
@@ -104,7 +138,9 @@
         <td>
           <div style="display:flex;gap:.3rem;flex-wrap:wrap">
             <button class="btn btn-ghost btn-sm" onclick="viewD('${d.id}')">👁</button>
-            ${d.status === 'pending' ? `<button class="btn btn-green btn-sm" onclick="approveD('${d.id}')">✅</button><button class="btn btn-red btn-sm" onclick="rejectD('${d.id}')">✕</button>` : ''}
+            ${d.status === 'pending' ? `
+              <button class="btn btn-green btn-sm" onclick="approveD('${d.id}')">✅ Approve</button>
+              <button class="btn btn-red btn-sm" onclick="rejectD('${d.id}')">✕ Reject</button>` : ''}
           </div>
         </td>
       </tr>`).join('');
@@ -144,7 +180,7 @@
         }
 
         async function approveD(id) {
-            try { await apiPost(`/deposits/${id}/approve`); showToast('Deposit approved ✅', 'success'); loadD(); }
+            try { await apiPost(`/deposits/${id}/approve`, {}); showToast('Deposit approved ✅', 'success'); loadD(); }
             catch (e) { showToast(e.message, 'error'); }
         }
 

@@ -296,6 +296,14 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
+# Redirect wrong admin login path before mounting /game (so /game/admin/login.html → /admin/login.html)
+@app.get("/game/admin/login.html", include_in_schema=False)
+@app.get("/shamo/game/admin/login.html", include_in_schema=False)
+def game_admin_login_redirect():
+    if IS_VPS:
+        return RedirectResponse(url="/shamo/admin/login.html")
+    return RedirectResponse(url="/admin/login.html")
+
 # Static files: /game and /admin (and /shamo/game, /shamo/admin for proxy)
 _admin_dir = os.path.join(os.path.dirname(__file__), "admin")
 _game_dir  = os.path.join(os.path.dirname(__file__), "game")
@@ -399,7 +407,7 @@ class CompanyUpdate(BaseModel):
     status: Optional[str] = None; primary_color: Optional[str] = None
 
 class TopUpReq(BaseModel):
-    amount: float; note: Optional[str] = ""
+    amount: float; ref_number: Optional[str] = ""; note: Optional[str] = ""
 
 class WithdrawalUpdate(BaseModel):
     notes: Optional[str] = None
@@ -1576,9 +1584,45 @@ async def create_game(body: GameCreate, _=Depends(require_admin)):
     payload["created_by"] = created_by
     payload["company_id"] = payload["company_id"] or None
     payload["prize_pool_remaining"] = payload["prize_pool_etb"]
-    res = await run(lambda: sb.table("games").insert(payload).execute())
+
+    # Auto-create a confirmed deposit when a company game is created with a prize pool
+    deposit_id = payload.get("deposit_id") or None
+    if payload["company_id"] and payload["prize_pool_etb"] and not deposit_id:
+        prize = float(payload["prize_pool_etb"])
+        commission_pct = float(payload.get("platform_fee_pct") or 15.0)
+        commission_etb = round(prize * commission_pct / 100, 2)
+        dep_payload = {
+            "company_id": payload["company_id"],
+            "amount_etb": prize,
+            "commission_pct": commission_pct,
+            "commission_etb": commission_etb,
+            "prize_pool_etb": round(prize - commission_etb, 2),
+            "status": "confirmed",
+        }
+        try:
+            await run(lambda: sb.table("company_deposits").insert(dep_payload).execute())
+            dep_res = await run(lambda: sb.table("company_deposits")
+                .select("id")
+                .eq("company_id", payload["company_id"])
+                .eq("status", "confirmed")
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute())
+            if dep_res.data:
+                deposit_id = dep_res.data[0].get("id")
+                # Deduct from company credit_balance
+                co_res = await run(lambda: sb.table("companies").select("credit_balance").eq("id", payload["company_id"]).single().execute())
+                current = float((co_res.data or {}).get("credit_balance") or 0)
+                new_bal = max(0.0, current - prize)
+                await run(lambda: sb.table("companies").update({"credit_balance": new_bal}).eq("id", payload["company_id"]).execute())
+        except Exception:
+            pass  # deposit creation is non-blocking — game still gets created
+
+    payload["deposit_id"] = deposit_id
+
+    await run(lambda: sb.table("games").insert(payload).execute())
+    res = await run(lambda: sb.table("games").select("*").eq("created_by", created_by).order("created_at", desc=True).limit(1).execute())
     game_data = (res.data or [{}])[0]
-    # Notification center: we notify users on QR generation only, not on game creation
     return game_data
 
 @app.put("/api/games/{gid}")
@@ -2515,12 +2559,53 @@ async def suspend_company(cid: str, _=Depends(require_admin)):
 
 @app.post("/api/companies/{cid}/topup")
 async def topup_company(cid: str, body: TopUpReq, _=Depends(require_admin)):
+    # Copy request body into plain values so lambdas run in thread pool never touch body
+    amount = float(body.amount)
+    ref_number = (body.ref_number or "").strip()
+    note = (body.note or "").strip()
+    notes_text = (f"Ref: {ref_number} | {note}".strip(" |") or "")
+
     sb = get_sb()
-    res = await run(lambda: sb.table("companies").select("credit_balance").eq("id", cid).single().execute())
-    if not res.data: raise HTTPException(404, "Company not found")
-    new_bal = float(res.data["credit_balance"] or 0) + body.amount
-    await run(lambda: sb.table("companies").update({"credit_balance": new_bal}).eq("id", cid).execute())
-    return {"credit_balance": new_bal}
+    co = await run(lambda: sb.table("companies").select("id").eq("id", cid).single().execute())
+    if not co.data: raise HTTPException(404, "Company not found")
+
+    # Build insert payloads (plain dicts only — no body reference)
+    payloads_to_try: list[dict] = [
+        {"company_id": cid, "amount_etb": amount, "commission_pct": 15.0, "status": "pending"},
+        {"company_id": cid, "amount_etb": amount, "status": "pending"},
+    ]
+    if ref_number:
+        payloads_to_try[0]["ref_number"] = ref_number
+    if notes_text:
+        payloads_to_try[0]["notes"] = notes_text
+        payloads_to_try[1]["notes"] = notes_text
+
+    last_err: Exception | None = None
+    for payload in payloads_to_try:
+        try:
+            p = dict(payload)  # snapshot for lambda
+            await run(lambda _p=p: sb.table("company_deposits").insert(_p).execute())
+            break
+        except Exception as e:
+            last_err = e
+            continue
+    else:
+        msg = str(last_err) if last_err else "Insert failed"
+        raise HTTPException(503, f"Failed to create deposit. Run migration 016 in Supabase. Detail: {msg}")
+
+    # Fetch the row we just inserted (most recent pending deposit for this company)
+    fetched = await run(lambda: sb.table("company_deposits")
+        .select("id, status, amount_etb")
+        .eq("company_id", cid)
+        .eq("status", "pending")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute())
+    rows = fetched.data if (fetched and fetched.data) else []
+    if not rows:
+        raise HTTPException(500, "Deposit was not saved — check RLS policies on company_deposits in Supabase.")
+
+    return {"deposit_id": str(rows[0]["id"]), "status": "pending", "amount_etb": amount}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SETTINGS
@@ -3190,21 +3275,21 @@ async def list_deposits(_=Depends(require_admin), status: str = "", company_id: 
     sb = get_sb()
 
     def _q():
-        q = sb.table("company_deposits").select("*", count="exact").order("created_at", desc=True)
+        q = sb.table("company_deposits").select("*").order("created_at", desc=True)
         if status:
             q = q.eq("status", status)
         if company_id:
             q = q.eq("company_id", company_id)
         if search and search.strip():
             s = search.strip().replace("%", "")[:80]
-            q = q.or_(f"ref_number.ilike.%{s}%,notes.ilike.%{s}%")
+            q = q.ilike("amount_etb", f"%{s}%")  # safe fallback; ref_number search via JS filter
         offset = (page - 1) * per_page
         q = q.range(offset, offset + per_page - 1)
         return q.execute()
 
     res = await run(_q)
     rows = res.data or []
-    total = getattr(res, "count", len(rows))
+    total = res.count if (res.count is not None) else len(rows)
 
     # Resolve company names separately (no embed — avoids FK/schema issues)
     if rows:
@@ -3226,11 +3311,33 @@ async def approve_deposit(did: str, body: DepositApproveReq, _=Depends(require_a
     sb = get_sb()
     admin = await run(lambda: sb.table("users").select("id").eq("role","admin").limit(1).execute())
     confirmed_by = (admin.data or [{}])[0].get("id")
-    # Trigger on_deposit_confirmed handles commission_etb and prize_pool_etb calculation
-    await run(lambda: sb.table("company_deposits").update({
-        "status": "confirmed", "notes": body.notes, "confirmed_by": confirmed_by
-    }).eq("id", did).eq("status", "pending").execute())
-    return {"status": "confirmed"}
+    # Fetch the deposit to calculate commission and prize pool
+    dep_res = await run(lambda: sb.table("company_deposits").select("*").eq("id", did).eq("status", "pending").single().execute())
+    if not dep_res.data: raise HTTPException(404, "Deposit not found or already processed")
+    dep = dep_res.data
+    amount = float(dep.get("amount_etb") or 0)
+    commission_pct = float(dep.get("commission_pct") or 15.0)
+    commission_etb = round(amount * commission_pct / 100, 2)
+    prize_pool_etb = round(amount - commission_etb, 2)
+    # Confirm the deposit with calculated values
+    update_data = {
+        "status": "confirmed",
+        "notes": body.notes,
+        "confirmed_by": confirmed_by,
+        "commission_etb": commission_etb,
+        "prize_pool_etb": prize_pool_etb,
+    }
+    try:
+        update_data["processed_at"] = datetime.now(timezone.utc).isoformat()
+        await run(lambda: sb.table("company_deposits").update(update_data).eq("id", did).execute())
+    except Exception:
+        update_data.pop("processed_at", None)
+        await run(lambda: sb.table("company_deposits").update(update_data).eq("id", did).execute())
+    # Add prize_pool_etb to company credit_balance
+    co_res = await run(lambda: sb.table("companies").select("credit_balance").eq("id", dep["company_id"]).single().execute())
+    current_bal = float((co_res.data or {}).get("credit_balance") or 0)
+    await run(lambda: sb.table("companies").update({"credit_balance": current_bal + prize_pool_etb}).eq("id", dep["company_id"]).execute())
+    return {"status": "confirmed", "prize_pool_etb": prize_pool_etb, "commission_etb": commission_etb}
 
 @app.post("/api/deposits/{did}/reject")
 async def reject_deposit(did: str, body: DepositRejectReq, _=Depends(require_admin)):
