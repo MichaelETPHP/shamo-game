@@ -3317,7 +3317,7 @@ async def start_session(body: SessionStartReq):
             return {"session": None, "already_played": True, "reason": "Scan the game QR once first to join", "game_config": game_config}
 
     # Get game config
-    game_r = await run(lambda: sb.table(\"games\")\
+    game_r = await run(lambda: sb.table("games")
         .select("id,prize_pool_usd,platform_fee_pct").eq("id", body.game_id).single().execute())
     game = game_r.data or {}
     sess_payload = {
