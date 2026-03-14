@@ -1831,12 +1831,12 @@ async def create_game(body: GameCreate, _=Depends(require_admin)):
     payload = body.dict()
     payload["created_by"] = created_by
     payload["company_id"] = payload["company_id"] or None
-    payload["prize_pool_remaining"] = payload["prize_pool_etb"]
+    # No longer needed: payload["prize_pool_remaining"] = payload["prize_pool_usd"]
 
     # Auto-create a confirmed deposit when a company game is created with a prize pool
-    deposit_id = payload.get("deposit_id") or None
-    if payload["company_id"] and payload["prize_pool_etb"] and not deposit_id:
-        prize = float(payload["prize_pool_etb"])
+    deposit_id = payload.pop("deposit_id", None)
+    if payload["company_id"] and payload["prize_pool_usd"] and not deposit_id:
+        prize = float(payload["prize_pool_usd"])
         commission_pct = float(payload.get("platform_fee_pct") or 15.0)
         commission_etb = round(prize * commission_pct / 100, 2)
         dep_payload = {
@@ -1844,7 +1844,7 @@ async def create_game(body: GameCreate, _=Depends(require_admin)):
             "amount_etb": prize,
             "commission_pct": commission_pct,
             "commission_etb": commission_etb,
-            "prize_pool_etb": round(prize - commission_etb, 2),
+            "prize_pool_usd": round(prize - commission_etb, 2),
             "status": "confirmed",
         }
         try:
@@ -1866,8 +1866,7 @@ async def create_game(body: GameCreate, _=Depends(require_admin)):
         except Exception:
             pass  # deposit creation is non-blocking — game still gets created
 
-    payload["deposit_id"] = deposit_id
-
+    # Deposit ID is tracked purely within `company_deposits`, no need to append it into `games` payload!
     await run(lambda: sb.table("games").insert(payload).execute())
     res = await run(lambda: sb.table("games").select("*").eq("created_by", created_by).order("created_at", desc=True).limit(1).execute())
     game_data = (res.data or [{}])[0]
@@ -2055,7 +2054,8 @@ async def create_question(body: QuestionCreate, _=Depends(require_admin)):
                 .eq("game_id", body.game_id).order("sort_order", desc=True).limit(1).execute())
             next_ord = ((max_ord.data or [{}])[0].get("sort_order") or 0) + 1
             await run(lambda: sb.table("game_questions").insert({
-                "game_id": body.game_id, "question_id": qid, "sort_order": next_ord
+                "game_id": body.game_id, "question_id": qid, "sort_order": next_ord,
+                "level": "medium"
             }).execute())
         qrow["game_id"] = body.game_id
     return qrow
@@ -2385,7 +2385,8 @@ async def bulk_assign_questions_to_game(body: BulkAssignGameReq, _=Depends(requi
         if qid in linked:
             continue
         await run(lambda qid=qid, no=next_ord: sb.table("game_questions").insert({
-            "game_id": body.game_id, "question_id": qid, "sort_order": no
+            "game_id": body.game_id, "question_id": qid, "sort_order": no,
+            "level": "medium"
         }).execute())
         next_ord += 1
         added += 1
