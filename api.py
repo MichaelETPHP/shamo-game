@@ -1949,19 +1949,55 @@ async def admin_broadcast_game(game_id: str, _=Depends(require_admin)):
 @app.get("/api/games/{gid}/questions")
 async def get_game_questions_admin(gid: str, _=Depends(require_admin)):
     """Admin: returns questions with is_correct visible."""
-    sb = get_sb()
-    gq_res = await run(lambda: sb.table("game_questions").select(
-        "sort_order, questions(id, icon, question_text, category, status, explanation,"
-        "answer_options(id, option_letter, option_text, is_correct, sort_order))"
-    ).eq("game_id", gid).order("sort_order").execute())
-    rows = gq_res.data or []
-    result = []
-    for row in rows:
-        q = row.get("questions") or {}
-        q["sort_order"] = row.get("sort_order", 0)
-        q["options"] = sorted(q.pop("answer_options", []) or [], key=lambda x: x.get("sort_order", 0))
-        result.append(q)
-    return result
+    # The supabase relationship shorthand (questions(...)) isn't supported by the
+    # direct-psycopg2 query shim. Fetch game_questions, questions, and answer_options
+    # via explicit SQL and assemble the nested result here.
+    try:
+        # 1) load mapping of game_questions (preserve sort order)
+        gq_rows = await run(lambda: _db.execute(
+            "SELECT sort_order, question_id FROM shamo.game_questions WHERE game_id = %s ORDER BY sort_order",
+            (gid,), fetch="all", commit=False
+        ))
+        if not gq_rows:
+            return []
+        qids = [r["question_id"] for r in gq_rows]
+
+        # 2) fetch questions
+        placeholders = ",".join(["%s"] * len(qids))
+        qs_sql = f"SELECT id, icon, question_text, category, status, explanation FROM shamo.questions WHERE id IN ({placeholders})"
+        q_rows = await run(lambda: _db.execute(qs_sql, tuple(qids), fetch="all", commit=False))
+        q_map = {q["id"]: q for q in (q_rows or [])}
+
+        # 3) fetch answer options for these questions
+        ao_sql = f"SELECT id, question_id, option_letter, option_text, is_correct, sort_order FROM shamo.answer_options WHERE question_id IN ({placeholders})"
+        ao_rows = await run(lambda: _db.execute(ao_sql, tuple(qids), fetch="all", commit=False))
+        opts_map = {}
+        for o in (ao_rows or []):
+            opts_map.setdefault(o["question_id"], []).append({
+                "id": o["id"], "option_letter": o["option_letter"], "option_text": o["option_text"],
+                "is_correct": o["is_correct"], "sort_order": o.get("sort_order", 0)
+            })
+
+        # 4) assemble result preserving game_questions ordering
+        result = []
+        for r in gq_rows:
+            qid = r.get("question_id")
+            q = q_map.get(qid, {})
+            q_out = {
+                "id": q.get("id"),
+                "icon": q.get("icon") or '🇪🇹',
+                "question_text": q.get("question_text"),
+                "category": q.get("category"),
+                "status": q.get("status"),
+                "explanation": q.get("explanation"),
+                "sort_order": r.get("sort_order", 0),
+                "options": sorted(opts_map.get(qid, []), key=lambda x: x.get("sort_order", 0))
+            }
+            result.append(q_out)
+        return result
+    except Exception as e:
+        logger.error("get_game_questions_admin failed: %s", e)
+        raise HTTPException(500, str(e))
 
 @app.delete("/api/games/{gid}/questions/{qid}")
 async def remove_question_from_game(gid: str, qid: str, _=Depends(require_admin)):
