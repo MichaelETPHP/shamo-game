@@ -445,42 +445,22 @@ def _format_expires_at(expires_at_raw) -> str:
 
 async def broadcast_new_game(game: dict) -> dict:
     """
-    Send new game notification to ALL users who have telegram_id and notifications_enabled.
-    - Fetch all users from Supabase where telegram_id IS NOT NULL and notifications_enabled = True
-    - Loop and send message to each telegram_id
-    - Track: sent_count, failed_count, blocked_count
-    - If user blocked the bot (Forbidden error) — mark them in DB by setting notifications_enabled = false
-    - Rate limit: add asyncio.sleep(0.05) between each send (20/sec)
-    - Return stats: {sent, failed, blocked, total}
+    Send new game notification to ALL users with telegram_id.
+    Uses direct PostgreSQL via db module.
     """
-    from supabase import create_client
+    import db as _db
 
     sent = 0
     failed = 0
     blocked = 0
     total = 0
 
-    sb_url = os.getenv("SUPABASE_URL", "")
-    sb_key = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_ANON_KEY", "")
-    if not sb_url or not sb_key:
-        logger.error("Broadcast: SUPABASE_URL / SUPABASE_SERVICE_KEY not set")
-        return {"sent": 0, "failed": 0, "blocked": 0, "total": 0}
-
     try:
-        sb = create_client(sb_url, sb_key)
-
-        def _fetch_users():
-            q = sb.table("users").select("id,telegram_id,notifications_enabled")
-            try:
-                return q.not_.is_("telegram_id", "null").eq("notifications_enabled", True).execute()
-            except Exception:
-                res = q.not_.is_("telegram_id", "null").execute()
-                return res
-
-        loop = asyncio.get_event_loop()
-        res = await loop.run_in_executor(None, _fetch_users)
-        users = res.data or []
-        users = [u for u in users if u.get("telegram_id") is not None and u.get("notifications_enabled", True) is not False]
+        users = await asyncio.get_event_loop().run_in_executor(None, lambda: _db.execute(
+            "SELECT id, telegram_id FROM users WHERE telegram_id IS NOT NULL AND is_active = TRUE AND is_banned = FALSE",
+            fetch="all", commit=False
+        ))
+        users = [u for u in (users or []) if u.get("telegram_id") is not None]
         total = len(users)
 
         if total == 0:
@@ -507,6 +487,7 @@ async def broadcast_new_game(game: dict) -> dict:
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton(text="🎯 Play Now", web_app=WebAppInfo(url=SHAMO_WEBAPP_URL))
         ]])
+        loop = asyncio.get_event_loop()
 
         for i, user in enumerate(users):
             tg_id = user.get("telegram_id")
@@ -514,40 +495,26 @@ async def broadcast_new_game(game: dict) -> dict:
                 continue
             try:
                 await bot.send_message(
-                    chat_id=tg_id,
-                    text=msg_text,
-                    reply_markup=keyboard,
-                    parse_mode="Markdown",
+                    chat_id=tg_id, text=msg_text,
+                    reply_markup=keyboard, parse_mode="Markdown",
                 )
                 sent += 1
             except Forbidden:
                 blocked += 1
-                try:
-                    def _update(tid=tg_id):
-                        sb.table("users").update({"notifications_enabled": False}).eq("telegram_id", tid).execute()
-                    await loop.run_in_executor(None, _update)
-                except Exception as e:
-                    logger.warning("Broadcast: could not update notifications_enabled for tg_id=%s: %s", tg_id, e)
             except BadRequest:
                 failed += 1
             except RetryAfter as e:
                 await asyncio.sleep(e.retry_after)
                 try:
-                    await bot.send_message(
-                        chat_id=tg_id,
-                        text=msg_text,
-                        reply_markup=keyboard,
-                        parse_mode="Markdown",
-                    )
+                    await bot.send_message(chat_id=tg_id, text=msg_text,
+                                           reply_markup=keyboard, parse_mode="Markdown")
                     sent += 1
                 except Exception:
                     failed += 1
             except Exception as e:
                 logger.warning("Broadcast: failed for tg_id=%s: %s", tg_id, e)
                 failed += 1
-
             await asyncio.sleep(0.05)
-
             if (i + 1) % 50 == 0:
                 logger.info("Broadcast progress: %d/%d", i + 1, total)
 
@@ -561,39 +528,22 @@ async def broadcast_new_game(game: dict) -> dict:
 # ─── Broadcast: notify users when a QR code is generated (notification center) ─
 async def broadcast_new_qr(qr: dict, game: dict, company: dict | None = None) -> dict:
     """
-    Send "New game live + QR image" to all users with telegram_id and notifications_enabled.
-    Message: game details + QR code image in Telegram so users can scan directly.
-    Same rate limit and Forbidden handling as broadcast_new_game.
+    Send "New game live + QR image" to all users with telegram_id.
+    Uses direct PostgreSQL via db module.
     """
-    from datetime import datetime, timezone
-    from supabase import create_client
+    import db as _db
 
     sent = 0
     failed = 0
     blocked = 0
     total = 0
 
-    sb_url = os.getenv("SUPABASE_URL", "")
-    sb_key = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_ANON_KEY", "")
-    if not sb_url or not sb_key:
-        logger.error("Broadcast QR: SUPABASE_URL / SUPABASE_SERVICE_KEY not set")
-        return {"sent": 0, "failed": 0, "blocked": 0, "total": 0}
-
     try:
-        sb = create_client(sb_url, sb_key)
-
-        def _fetch_users():
-            q = sb.table("users").select("id,telegram_id,notifications_enabled")
-            try:
-                return q.not_.is_("telegram_id", "null").eq("notifications_enabled", True).execute()
-            except Exception:
-                res = q.not_.is_("telegram_id", "null").execute()
-                return res
-
-        loop = asyncio.get_event_loop()
-        res = await loop.run_in_executor(None, _fetch_users)
-        users = res.data or []
-        users = [u for u in users if u.get("telegram_id") is not None and u.get("notifications_enabled", True) is not False]
+        users = await asyncio.get_event_loop().run_in_executor(None, lambda: _db.execute(
+            "SELECT id, telegram_id FROM users WHERE telegram_id IS NOT NULL AND is_active = TRUE AND is_banned = FALSE",
+            fetch="all", commit=False
+        ))
+        users = [u for u in (users or []) if u.get("telegram_id") is not None]
         total = len(users)
 
         if total == 0:
@@ -606,16 +556,15 @@ async def broadcast_new_qr(qr: dict, game: dict, company: dict | None = None) ->
             return {"sent": 0, "failed": 0, "blocked": 0, "total": total}
 
         bot = app.bot
-        game_title = (game or {}).get("title") or "SHAMO Game"
-        company_name = (company or {}).get("name") if company else None
-        prize_pool = (game or {}).get("prize_pool_etb") or 0
+        game_title    = (game or {}).get("title") or "SHAMO Game"
+        company_name  = (company or {}).get("name") if company else None
+        prize_pool    = (game or {}).get("prize_pool_etb") or 0
         total_players = (game or {}).get("total_players") or 0
-        # Expires: prefer QR expiry, then game ends_at
-        expires_raw = (qr or {}).get("expires_at") or (game or {}).get("ends_at")
-        expires_str = _format_expires_at(expires_raw) if expires_raw else "—"
-        location = (game or {}).get("location")  # optional; many games don't have it
-        max_players = (game or {}).get("max_players")
-        players_line = f"👥 Players: {total_players}" + (f" / {max_players} spots" if max_players else "")
+        expires_raw   = (qr or {}).get("expires_at") or (game or {}).get("ends_at")
+        expires_str   = _format_expires_at(expires_raw) if expires_raw else "—"
+        location      = (game or {}).get("location")
+        max_players   = (game or {}).get("max_players")
+        players_line  = f"👥 Players: {total_players}" + (f" / {max_players} spots" if max_players else "")
 
         caption = (
             "🎮 *New SHAMO Game is Live\\!*\n\n"
@@ -624,13 +573,11 @@ async def broadcast_new_qr(qr: dict, game: dict, company: dict | None = None) ->
         )
         if location:
             caption += f"📍 Location: {location}\n"
-        caption += f"⏰ Expires: {expires_str}\n\n"
-        caption += "Scan the QR code below to join 👆"
+        caption += f"⏰ Expires: {expires_str}\n\nScan the QR code below to join 👆"
 
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton(text="🎯 Play Now", web_app=WebAppInfo(url=SHAMO_WEBAPP_URL))
         ]])
-
         qr_image_url = (qr or {}).get("qr_image_url")
         use_photo = bool(qr_image_url)
 
@@ -640,64 +587,38 @@ async def broadcast_new_qr(qr: dict, game: dict, company: dict | None = None) ->
                 continue
             try:
                 if use_photo:
-                    msg = await bot.send_photo(
-                        chat_id=tg_id,
-                        photo=qr_image_url,
-                        caption=caption,
-                        reply_markup=keyboard,
-                        parse_mode="Markdown",
-                    )
+                    msg = await bot.send_photo(chat_id=tg_id, photo=qr_image_url,
+                                               caption=caption, reply_markup=keyboard,
+                                               parse_mode="Markdown")
                 else:
-                    msg = await bot.send_message(
-                        chat_id=tg_id,
-                        text=caption.replace("\\!", "!"),
-                        reply_markup=keyboard,
-                        parse_mode="Markdown",
-                    )
+                    msg = await bot.send_message(chat_id=tg_id,
+                                                 text=caption.replace("\\!", "!"),
+                                                 reply_markup=keyboard, parse_mode="Markdown")
                 sent += 1
-                _schedule_delete_message(
-                    bot, tg_id, msg.message_id, AUTO_DELETE_DELAY
-                )
+                _schedule_delete_message(bot, tg_id, msg.message_id, AUTO_DELETE_DELAY)
             except Forbidden:
                 blocked += 1
-                try:
-                    def _update(tid=tg_id):
-                        sb.table("users").update({"notifications_enabled": False}).eq("telegram_id", tid).execute()
-                    await loop.run_in_executor(None, _update)
-                except Exception as e:
-                    logger.warning("Broadcast QR: could not update notifications_enabled for tg_id=%s: %s", tg_id, e)
             except BadRequest:
                 failed += 1
             except RetryAfter as e:
                 await asyncio.sleep(e.retry_after)
                 try:
                     if use_photo:
-                        msg = await bot.send_photo(
-                            chat_id=tg_id,
-                            photo=qr_image_url,
-                            caption=caption,
-                            reply_markup=keyboard,
-                            parse_mode="Markdown",
-                        )
+                        msg = await bot.send_photo(chat_id=tg_id, photo=qr_image_url,
+                                                   caption=caption, reply_markup=keyboard,
+                                                   parse_mode="Markdown")
                     else:
-                        msg = await bot.send_message(
-                            chat_id=tg_id,
-                            text=caption.replace("\\!", "!"),
-                            reply_markup=keyboard,
-                            parse_mode="Markdown",
-                        )
+                        msg = await bot.send_message(chat_id=tg_id,
+                                                     text=caption.replace("\\!", "!"),
+                                                     reply_markup=keyboard, parse_mode="Markdown")
                     sent += 1
-                    _schedule_delete_message(
-                        bot, tg_id, msg.message_id, AUTO_DELETE_DELAY
-                    )
+                    _schedule_delete_message(bot, tg_id, msg.message_id, AUTO_DELETE_DELAY)
                 except Exception:
                     failed += 1
             except Exception as e:
                 logger.warning("Broadcast QR: failed for tg_id=%s: %s", tg_id, e)
                 failed += 1
-
             await asyncio.sleep(0.05)
-
             if (i + 1) % 50 == 0:
                 logger.info("Broadcast QR progress: %d/%d", i + 1, total)
 

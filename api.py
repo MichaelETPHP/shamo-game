@@ -26,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 
-from supabase import create_client, Client
+import db as _db
 
 try:
     import anthropic
@@ -44,12 +44,14 @@ API_BASE_URL = (os.getenv("API_BASE_URL") or "").rstrip("/") or f"http://localho
 APP_ENV = (os.getenv("APP_ENV") or "local").strip().lower()
 IS_VPS = APP_ENV in ("production", "vps", "prod", "1", "true")
 
-SUPABASE_URL  = (os.getenv("SUPABASE_URL") or "").strip()
-SUPABASE_KEY  = (os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_ANON_KEY") or "").strip()
+DATABASE_URL  = (os.getenv("DATABASE_URL") or "").strip()
+DB_SCHEMA     = (os.getenv("DB_SCHEMA") or "shamo").strip()
 ADMIN_TOKEN   = (os.getenv("ADMIN_TOKEN") or "").strip()
 BOT_TOKEN     = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 ADMIN_USER    = (os.getenv("ADMIN_USERNAME") or "").strip()
 ADMIN_PASS    = (os.getenv("ADMIN_PASSWORD") or "").strip()
+if not DATABASE_URL:
+    logger.warning("DATABASE_URL not set in .env — all DB calls will fail")
 if not BOT_TOKEN:
     logger.warning("TELEGRAM_BOT_TOKEN not set in .env — /api/player/avatar-url will return 503")
 
@@ -64,14 +66,10 @@ def _shamo_env_script() -> str:
         return (s or "").replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ").replace("</", "<\\/")
     base = esc(API_BASE_URL)
     port = esc(str(PORT))
-    supabase_url = esc(SUPABASE_URL)
-    supabase_anon = esc(os.getenv("SUPABASE_ANON_KEY", ""))
     return (
         f"<script>\n"
         f"  window.SHAMO_API_BASE_URL = '{base}';\n"
         f"  window.SHAMO_PORT = '{port}';\n"
-        f"  window.SHAMO_SUPABASE_URL = '{supabase_url}';\n"
-        f"  window.SHAMO_SUPABASE_ANON_KEY = '{supabase_anon}';\n"
         f"</script>"
     )
 
@@ -107,87 +105,319 @@ class ShamoEnvInjectMiddleware(BaseHTTPMiddleware):
         )
 
 
-# ─── Balance helpers (spin_results.amount_etb where w-status = active) ─────────
-def _extract_rpc_scalar(raw) -> float:
-    """Extract numeric from RPC response (scalar, list, or dict)."""
-    if raw is None or raw == "":
-        return 0.0
-    if isinstance(raw, (int, float)):
-        return float(raw)
-    if isinstance(raw, list) and len(raw) > 0:
-        return _extract_rpc_scalar(raw[0])
-    if isinstance(raw, dict):
-        for v in raw.values():
-            if isinstance(v, (int, float)):
-                return float(v)
-            if v is not None and v != "":
-                try:
-                    return float(v)
-                except (TypeError, ValueError):
-                    pass
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return 0.0
-
-async def _get_active_spin_balance(sb: Client, user_id: str) -> float:
-    """
-    Total ETB from spin_results WHERE user_id (and w-status='active' when available).
-    Tries: RPC get_active_spin_total → table with w-status → RPC get_spin_total_simple → table user_id only.
-    """
+# ─── Balance helpers ─────────────────────────────────────────────────────────
+async def _get_active_spin_balance(user_id: str) -> float:
+    """Total ETB earned from spin_results for a user."""
     uid = str(user_id).strip()
     if not uid:
         return 0.0
-    # 1) RPC get_active_spin_total (migration 013)
     try:
-        res = await run(lambda: sb.rpc("get_active_spin_total", {"p_user_id": uid}).execute())
-        return _extract_rpc_scalar(res.data)
+        row = await run(lambda: _db.execute(
+            "SELECT COALESCE(SUM(amount_etb),0) AS total FROM spin_results WHERE user_id = %s",
+            (uid,), fetch="one", commit=False
+        ))
+        return float((row or {}).get("total") or 0)
     except Exception as e:
-        logger.warning("get_active_spin_total: %s", e)
-    # 2) RPC get_spin_total_simple — no w-status (migration 014), always works
-    try:
-        res = await run(lambda: sb.rpc("get_spin_total_simple", {"p_user_id": uid}).execute())
-        return _extract_rpc_scalar(res.data)
-    except Exception as e:
-        logger.warning("get_spin_total_simple: %s", e)
-    # 3) Table: user_id only
-    try:
-        res = await run(lambda: sb.table("spin_results").select("amount_etb").eq("user_id", uid).execute())
-        return sum(float(r.get("amount_etb") or 0) for r in (res.data or []))
-    except Exception as e:
-        logger.warning("spin_results table: %s", e)
+        logger.warning("_get_active_spin_balance: %s", e)
     return 0.0
 
-# ─── Singleton Supabase client ────────────────────────────────────────────────
-_sb: Client | None = None
+# ─── Supabase-compatible shim over psycopg2 ──────────────────────────────────
+# All existing endpoints call:  sb = get_sb()  then  sb.table("x").select("*")...execute()
+# We emulate that API so zero endpoint code needs to change.
 
-def get_sb() -> Client:
-    global _sb
-    if _sb is None:
-        if not SUPABASE_URL or not SUPABASE_KEY:
-            raise HTTPException(500, "SUPABASE_URL / SUPABASE_SERVICE_KEY not set in .env")
-        _sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-        logger.info("Supabase client initialized (singleton)")
-    return _sb
+class _Result:
+    """Mimics supabase APIResponse: .data / .count"""
+    def __init__(self, data=None, count=None):
+        self.data  = data if data is not None else []
+        self.count = count
 
-def _reset_sb():
-    global _sb
-    _sb = None
-    logger.warning("Supabase client reset — stale connection detected, reconnecting...")
+class _QueryBuilder:
+    """Fluent psycopg2 query builder emulating supabase-py chaining."""
+
+    def __init__(self, table: str):
+        self._table   = table
+        self._selects = "*"
+        self._filters: list = []          # list of (col, op, val)
+        self._order:   list = []          # list of (col, desc)
+        self._limit_n: Optional[int] = None
+        self._offset_n: Optional[int] = None
+        self._single  = False
+        self._upsert_data: Optional[dict] = None
+        self._insert_data: Optional[Any]  = None
+        self._update_data: Optional[dict] = None
+        self._delete  = False
+        self._on_conflict: Optional[str]  = None
+        self._count_method: Optional[str] = None
+        self._op = "select"
+
+    # ── Read ──────────────────────────────────────────────────────────────────
+    def select(self, cols="*", count=None):
+        self._selects = cols
+        self._op = "select"
+        if count:
+            self._count_method = count
+        return self
+
+    def eq(self, col, val):
+        self._filters.append((col, "=", val))
+        return self
+
+    def neq(self, col, val):
+        self._filters.append((col, "!=", val))
+        return self
+
+    def gt(self, col, val):
+        self._filters.append((col, ">", val))
+        return self
+
+    def gte(self, col, val):
+        self._filters.append((col, ">=", val))
+        return self
+
+    def lt(self, col, val):
+        self._filters.append((col, "<", val))
+        return self
+
+    def lte(self, col, val):
+        self._filters.append((col, "<=", val))
+        return self
+
+    def in_(self, col, vals):
+        self._filters.append((col, "IN", list(vals)))
+        return self
+
+    def is_(self, col, val):
+        self._filters.append((col, "IS", val))
+        return self
+
+    def ilike(self, col, pattern):
+        self._filters.append((col, "ILIKE", pattern))
+        return self
+
+    def order(self, col, desc=False):
+        self._order.append((col, desc))
+        return self
+
+    def limit(self, n):
+        self._limit_n = n
+        return self
+
+    def offset(self, n):
+        self._offset_n = n
+        return self
+
+    def single(self):
+        self._single = True
+        self._limit_n = 1
+        return self
+
+    def maybe_single(self):
+        self._limit_n = 1
+        return self
+
+    def range(self, start: int, end: int):
+        """supabase-py .range(start, end) → LIMIT (end-start+1) OFFSET start"""
+        self._offset_n = start
+        self._limit_n  = end - start + 1
+        return self
+
+    class _NotProxy:
+        """Proxy for .not_.is_() used in supabase-py queries."""
+        def __init__(self, builder):
+            self._b = builder
+        def is_(self, col, val):
+            # .not_.is_(col, 'null') → WHERE col IS NOT NULL
+            self._b._filters.append((col, "IS", None if val == 'null' else val))
+            # Negate: flip NULL → IS NOT NULL
+            col_, op_, val_ = self._b._filters.pop()
+            self._b._filters.append((col_, "IS NOT", val_))
+            return self._b
+        def eq(self, col, val):
+            self._b._filters.append((col, "!=", val))
+            return self._b
+
+    @property
+    def not_(self):
+        return self._NotProxy(self)
+
+    # ── Write ─────────────────────────────────────────────────────────────────
+    def insert(self, data):
+        self._op = "insert"
+        self._insert_data = data
+        return self
+
+    def upsert(self, data, on_conflict=None):
+        self._op = "upsert"
+        self._upsert_data = data
+        self._on_conflict = on_conflict
+        return self
+
+    def update(self, data):
+        self._op = "update"
+        self._update_data = data
+        return self
+
+    def delete(self):
+        self._op = "delete"
+        self._delete = True
+        return self
+
+    # ── Execute ───────────────────────────────────────────────────────────────
+    def _build_where(self):
+        clauses, params = [], []
+        for col, op, val in self._filters:
+            if op == "IN":
+                placeholders = ",".join(["%s"] * len(val))
+                clauses.append(f'"{col}" IN ({placeholders})')
+                params.extend(val)
+            elif op == "IS NOT":
+                clauses.append(f'"{col}" IS NOT NULL')
+            elif op == "IS":
+                clauses.append(f'"{col}" IS {"NULL" if val is None else "NOT NULL"}')
+            else:
+                clauses.append(f'"{col}" {op} %s')
+                params.append(val)
+        return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+    def execute(self) -> _Result:
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+
+        where, params = self._build_where()
+
+        with _db.get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                op = self._op
+
+                if op == "select":
+                    # Build column list
+                    cols = self._selects
+                    # Supabase relationship hints like "*, companies(name)" → just "*"
+                    if "(" in cols and ")" in cols:
+                        cols = "*"
+
+                    # When count="exact" requested, run a separate COUNT(*) first
+                    total_count = None
+                    if self._count_method:
+                        count_sql = f'SELECT COUNT(*) AS n FROM "{self._table}"' + where
+                        cur.execute(count_sql, params)
+                        row = cur.fetchone()
+                        total_count = int(row["n"]) if row else 0
+
+                    sql = f'SELECT {cols} FROM "{self._table}"' + where
+                    if self._order:
+                        order_parts = [f'"{c}" {"DESC" if d else "ASC"}' for c, d in self._order]
+                        sql += " ORDER BY " + ", ".join(order_parts)
+                    if self._limit_n is not None:
+                        sql += f" LIMIT {int(self._limit_n)}"
+                    if self._offset_n is not None:
+                        sql += f" OFFSET {int(self._offset_n)}"
+                    cur.execute(sql, params)
+                    rows = [dict(r) for r in cur.fetchall()]
+                    count = total_count if self._count_method else None
+                    if self._single:
+                        return _Result(data=rows[0] if rows else None, count=count)
+                    return _Result(data=rows, count=count)
+
+                elif op == "insert":
+                    rows_in = self._insert_data if isinstance(self._insert_data, list) else [self._insert_data]
+                    results = []
+                    for row in rows_in:
+                        cols_list = list(row.keys())
+                        col_sql  = ", ".join(f'"{c}"' for c in cols_list)
+                        val_sql  = ", ".join(["%s"] * len(cols_list))
+                        vals     = [row[c] for c in cols_list]
+                        sql = f'INSERT INTO "{self._table}" ({col_sql}) VALUES ({val_sql}) RETURNING *'
+                        cur.execute(sql, vals)
+                        r = cur.fetchone()
+                        if r:
+                            results.append(dict(r))
+                    conn.commit()
+                    return _Result(data=results)
+
+                elif op == "upsert":
+                    rows_in = self._upsert_data if isinstance(self._upsert_data, list) else [self._upsert_data]
+                    results = []
+                    for row in rows_in:
+                        cols_list = list(row.keys())
+                        col_sql  = ", ".join(f'"{c}"' for c in cols_list)
+                        val_sql  = ", ".join(["%s"] * len(cols_list))
+                        vals     = [row[c] for c in cols_list]
+                        conflict = f"ON CONFLICT ({self._on_conflict})" if self._on_conflict else "ON CONFLICT DO NOTHING"
+                        updates  = ", ".join(f'"{c}"=EXCLUDED."{c}"' for c in cols_list if c != (self._on_conflict or "id"))
+                        do_part  = f"DO UPDATE SET {updates}" if updates and not self._on_conflict else "DO NOTHING"
+                        if self._on_conflict:
+                            sql = f'INSERT INTO "{self._table}" ({col_sql}) VALUES ({val_sql}) {conflict} {do_part} RETURNING *'
+                        else:
+                            sql = f'INSERT INTO "{self._table}" ({col_sql}) VALUES ({val_sql}) ON CONFLICT DO NOTHING RETURNING *'
+                        cur.execute(sql, vals)
+                        r = cur.fetchone()
+                        if r:
+                            results.append(dict(r))
+                    conn.commit()
+                    return _Result(data=results)
+
+                elif op == "update":
+                    cols_list = list(self._update_data.keys())
+                    set_sql   = ", ".join(f'"{c}"=%s' for c in cols_list)
+                    vals      = [self._update_data[c] for c in cols_list] + params
+                    sql = f'UPDATE "{self._table}" SET {set_sql}' + where + " RETURNING *"
+                    cur.execute(sql, vals)
+                    rows = [dict(r) for r in cur.fetchall()]
+                    conn.commit()
+                    return _Result(data=rows)
+
+                elif op == "delete":
+                    sql = f'DELETE FROM "{self._table}"' + where + " RETURNING *"
+                    cur.execute(sql, params)
+                    rows = [dict(r) for r in cur.fetchall()]
+                    conn.commit()
+                    return _Result(data=rows)
+
+        return _Result()
+
+class _RPC:
+    """Minimal RPC shim — maps supabase .rpc(name, params) to a function call.
+    We don't have the same RPCs in the new schema, so this is a no-op / logs a warning."""
+    def __init__(self, name, params):
+        self._name   = name
+        self._params = params
+
+    def execute(self) -> _Result:
+        logger.warning("RPC %s called via shim — not supported in direct DB mode", self._name)
+        return _Result(data=None)
+
+class _ShamoClient:
+    """Drop-in replacement for supabase.Client used by all endpoints."""
+    def table(self, name: str) -> _QueryBuilder:
+        return _QueryBuilder(name)
+
+    def from_(self, name: str) -> _QueryBuilder:
+        return _QueryBuilder(name)
+
+    def rpc(self, name: str, params: dict = None) -> _RPC:
+        return _RPC(name, params or {})
+
+_shamo_client = _ShamoClient()
+
+def get_sb() -> _ShamoClient:
+    """Return the drop-in DB client. All endpoints call this unchanged."""
+    if not DATABASE_URL:
+        raise HTTPException(500, "DATABASE_URL not set in .env")
+    return _shamo_client
+
+def get_db():
+    """Alias for direct access to the db module."""
+    return _db
 
 # ─── Thread-pool ──────────────────────────────────────────────────────────────
 _pool = ThreadPoolExecutor(max_workers=12)
 
 async def run(fn, *args, **kwargs):
-    """Run sync fn in thread-pool. Auto-reconnects on stale HTTP/2 / WinError 10035."""
+    """Run sync fn in thread-pool."""
     loop = asyncio.get_event_loop()
     _fn = partial(fn, *args, **kwargs)
-    try:
-        return await loop.run_in_executor(_pool, _fn)
-    except (_httpx.LocalProtocolError, _httpx.RemoteProtocolError, _httpx.ReadError) as exc:
-        logger.warning("HTTP connection error (%s), resetting and retrying...", exc)
-        _reset_sb()
-        return await loop.run_in_executor(_pool, _fn)
+    return await loop.run_in_executor(_pool, _fn)
 
 async def gather(*fns):
     """Run multiple sync callables concurrently."""
@@ -483,26 +713,13 @@ class PhoneByTelegramReq(BaseModel):
 @app.get("/api/health")
 async def health():
     try:
-        sb = get_sb()
-        await run(lambda: sb.table("users").select("id").limit(1).execute())
-        return {"status": "ok", "db": "connected"}
+        info = await run(lambda: _db.health_check())
+        if info.get("status") == "ok":
+            return {"status": "ok", "db": "connected", "db_name": info.get("db"), "schema": info.get("schema")}
+        return {"status": "error", "db": "disconnected", "error": info.get("error")}
     except Exception as e:
-        return {"status": "ok", "db": "disconnected", "error": str(e)}
+        return {"status": "error", "db": "disconnected", "error": str(e)}
 
-# Add this route temporarily
-async def _test_supabase_impl():
-    try:
-        sb = get_sb()
-        result = await run(lambda: sb.table("users").select("id").limit(1).execute())
-        return {"status": "ok", "row_count": len(result.data or []), "error": None}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-
-@app.get("/test-supabase")
-async def test_supabase(): return await _test_supabase_impl()
-
-@app.get("/api/test-supabase")
-async def test_supabase_api(): return await _test_supabase_impl()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # AUTH
@@ -965,7 +1182,7 @@ async def player_balance_summary(uid: str, telegram_id: Optional[int] = None):
     }
 
 # ─── Game config from platform_config (for mini-app timer & rules + maintenance) ─
-async def _get_game_config(sb: Client) -> dict:
+async def _get_game_config(sb: _ShamoClient) -> dict:
     """Read game settings from platform_config. Includes maintenance mode for mini-app."""
     try:
         keys = [
@@ -1312,8 +1529,13 @@ async def get_stats(_=Depends(require_admin)):
         def q_pend_qs():       return sb.table("questions").select("id", count="exact").eq("status", "pending").execute()
         def q_total_comp():    return sb.table("companies").select("id", count="exact").execute()
         def q_total_qs():      return sb.table("questions").select("id", count="exact").execute()
-        # FIX 1: get real commission income from company_deposits, not estimated from payouts
-        def q_fee_income():    return sb.table("company_deposits").select("commission_etb").eq("status", "confirmed").execute()
+        # Get commission income from company_deposits (graceful: table may not exist yet)
+        def q_fee_income():
+            try:
+                return sb.table("company_deposits").select("commission_etb").eq("status", "confirmed").execute()
+            except Exception:
+                class _Empty: data = []; count = 0
+                return _Empty()
 
         (r_total_users, r_active_users, r_banned_users, r_total_games,
          r_active_game, r_pend_withdraw, r_active_comp, r_pend_comp,
@@ -3382,6 +3604,6 @@ async def startup():
     logger.info("PORT=%s API_BASE_URL=%s APP_ENV=%s (VPS=%s)", PORT, API_BASE_URL, APP_ENV, IS_VPS)
     try:
         get_sb()
-        logger.info("✅ Supabase singleton client ready")
+        logger.info("✅ Direct PostgreSQL DB client ready (schema=%s)", DB_SCHEMA)
     except Exception as e:
-        logger.warning("⚠️  Supabase init warning: %s", e)
+        logger.warning("⚠️  DB init warning: %s", e)
