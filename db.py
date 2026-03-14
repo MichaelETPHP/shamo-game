@@ -1,9 +1,8 @@
 """
-db.py — PostgreSQL connection pool for SHAMO (shamo schema).
+db.py — PostgreSQL connection pool for SHAMO.
 
-Uses DATABASE_URL from .env.
-All connections automatically set search_path = shamo so every
-unqualified table name resolves to the shamo schema.
+Uses DATABASE_URL and DB_SCHEMA from .env.
+All connections automatically set search_path = {DB_SCHEMA} (default: public).
 
 Public API
 ----------
@@ -32,7 +31,7 @@ except ImportError:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DATABASE_URL: str = (os.getenv("DATABASE_URL") or "").strip()
-DB_SCHEMA:    str = (os.getenv("DB_SCHEMA") or "shamo").strip()
+DB_SCHEMA:    str = (os.getenv("DB_SCHEMA") or "public").strip()
 
 # ── Connection pool (lazy-initialised) ───────────────────────────────────────
 _pool: Optional[Any] = None   # psycopg2.pool.ThreadedConnectionPool

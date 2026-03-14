@@ -113,7 +113,7 @@ async def _get_active_spin_balance(user_id: str) -> float:
         return 0.0
     try:
         row = await run(lambda: _db.execute(
-            "SELECT COALESCE(SUM(amount_etb),0) AS total FROM spin_results WHERE user_id = %s",
+            "SELECT COALESCE(SUM(amount_won),0) AS total FROM spin_results WHERE user_id = %s",
             (uid,), fetch="one", commit=False
         ))
         return float((row or {}).get("total") or 0)
@@ -576,17 +576,17 @@ class BalanceAdjust(BaseModel):
 class GameCreate(BaseModel):
     title: str = "Tonight's SHAMO"; description: Optional[str] = None
     status: str = "draft"; starts_at: str; ends_at: str; game_date: str
-    prize_pool_etb: float = 0.0; max_prize_etb: float = 5700.0
-    platform_fee_pct: float = 15.0; player_cap_pct: float = 30.0
-    company_id: Optional[str] = None; deposit_id: Optional[str] = None
+    prize_pool_usd: float = 0.0; max_payout_usd: float = 5700.0
+    platform_fee_pct: float = 15.0
+    company_id: Optional[str] = None
 
 class GameUpdate(BaseModel):
     title: Optional[str] = None; description: Optional[str] = None
     status: Optional[str] = None; starts_at: Optional[str] = None
     ends_at: Optional[str] = None; game_date: Optional[str] = None
-    prize_pool_etb: Optional[float] = None; max_prize_etb: Optional[float] = None
-    platform_fee_pct: Optional[float] = None; player_cap_pct: Optional[float] = None
-    company_id: Optional[str] = None; deposit_id: Optional[str] = None
+    prize_pool_usd: Optional[float] = None; max_payout_usd: Optional[float] = None
+    platform_fee_pct: Optional[float] = None
+    company_id: Optional[str] = None
 
 class QuestionCreate(BaseModel):
     question_text: str; category: Optional[str] = None
@@ -669,7 +669,7 @@ class AnswerReq(BaseModel):
 
 class SpinReq(BaseModel):
     session_id: str; user_id: str; game_id: str
-    question_number: int; segment_label: str; amount_etb: float
+    question_number: int; segment_label: str; amount_won: float
 
 class DepositApproveReq(BaseModel):
     notes: Optional[str] = None
@@ -1091,7 +1091,7 @@ async def player_withdrawals(uid: str):
 
 @app.get("/api/player/{uid}/balance")
 async def player_balance(uid: str):
-    """Balance for withdraw check: SUM(amount_etb) from spin_results WHERE user_id AND w-status='active'."""
+    """Balance for withdraw check: SUM(amount_won) from spin_results WHERE user_id."""
     sb = get_sb()
     bal = await _get_active_spin_balance(sb, uid)
     return {"available_balance": round(bal, 2)}
@@ -1251,10 +1251,9 @@ async def public_active_game():
     """
     sb = get_sb()
     game_res = await run(lambda: sb.table("games").select(
-        "id,title,status,game_date,prize_pool_etb,prize_pool_remaining,"
-        "platform_fee_pct,player_cap_pct,total_players,total_winners,total_paid_out,"
-        "starts_at,ends_at,company_id,"
-        "companies!games_company_id_fkey(id,name,logo_url,primary_color)"
+        "id,title,status,game_date,prize_pool_usd,max_payout_usd,"
+        "platform_fee_pct,total_players,total_winners,total_paid_out,"
+        "starts_at,ends_at,company_id,level_config,wheel_config"
     ).eq("status", "active").order("starts_at", desc=True).limit(1).execute())
 
     games = game_res.data or []
@@ -1521,7 +1520,7 @@ async def get_stats(_=Depends(require_admin)):
         def q_banned_users():  return sb.table("users").select("id", count="exact").eq("is_banned", True).execute()
         def q_total_games():   return sb.table("games").select("id", count="exact").execute()
         def q_active_game():   return sb.table("games").select(
-            "id,title,status,total_players,total_winners,total_paid_out,prize_pool_etb,prize_pool_remaining,game_date"
+            "id,title,status,total_players,total_winners,total_paid_out,prize_pool_usd,game_date"
         ).eq("status", "active").limit(1).execute()
         def q_pend_withdraw(): return sb.table("withdrawals").select("id", count="exact").eq("status", "pending").execute()
         def q_active_comp():   return sb.table("companies").select("id", count="exact").eq("status", "active").execute()
@@ -3072,7 +3071,7 @@ async def validate_qr_token(body: QRScanReq):
     """
     sb = get_sb()
     res = await run(lambda: sb.table("qr_codes").select(
-        "*, games!qr_codes_game_id_fkey(id,title,status,game_date,prize_pool_etb,prize_pool_remaining),"
+        "*, games!qr_codes_game_id_fkey(id,title,status,game_date,prize_pool_usd,max_payout_usd),"
         "companies!qr_codes_company_id_fkey(name)"
     ).eq("token", body.token).limit(1).execute())
 
@@ -3126,8 +3125,7 @@ async def validate_qr_token(body: QRScanReq):
         "game_id":       game_id,
         "game_title":    game.get("title"),
         "game_date":     game.get("game_date"),
-        "prize_pool_etb": game.get("prize_pool_etb"),
-        "prize_pool_remaining": game.get("prize_pool_remaining"),
+        "prize_pool_usd": game.get("prize_pool_usd"),
         "company":       (qr.get("companies") or {}).get("name"),
         "label":         qr.get("label"),
     }
@@ -3221,7 +3219,7 @@ async def admin_broadcast_qr(qr_id: str, _=Depends(require_admin)):
     company_data = None
     if game_id:
         g_res = await run(lambda: sb.table("games").select(
-            "id,title,game_date,status,prize_pool_etb,total_players,ends_at,company_id"
+            "id,title,game_date,status,prize_pool_usd,max_payout_usd,total_players,ends_at,company_id"
         ).eq("id", game_id).single().execute())
         game_data = g_res.data
     if company_id:
@@ -3319,18 +3317,13 @@ async def start_session(body: SessionStartReq):
             return {"session": None, "already_played": True, "reason": "Scan the game QR once first to join", "game_config": game_config}
 
     # Get game config
-    game_r = await run(lambda: sb.table("games")
-        .select("prize_pool_remaining,player_cap_pct").eq("id", body.game_id).single().execute())
+    game_r = await run(lambda: sb.table(\"games\")\
+        .select("id,prize_pool_usd,platform_fee_pct").eq("id", body.game_id).single().execute())
     game = game_r.data or {}
-    remaining  = float(game.get("prize_pool_remaining") or 0)
-    cap_pct    = float(game.get("player_cap_pct") or 30)
-    player_cap = round(remaining * cap_pct / 100, 2)
-
     sess_payload = {
-        "game_id": body.game_id, "user_id": body.user_id,
-        "qr_code_id": qr_code_id, "player_cap_etb": player_cap,
-        "current_question": 1, "questions_answered": 0,
-        "wrong_count": 0, "is_active": True
+        "game_id":   body.game_id,
+        "user_id":   body.user_id,
+        "is_active": True
     }
     res = await run(lambda: sb.table("game_sessions").insert(sess_payload).execute())
     return {"session": (res.data or [{}])[0], "cooldown": False,
@@ -3452,46 +3445,30 @@ async def submit_answer(body: AnswerReq):
 async def record_spin(body: SpinReq):
     """
     Record a spin result. Credits user balance via DB trigger (trg_on_spin_insert).
-
-    FIX 6: enforces player_cap_etb — rejects spin if user's session earnings
-    would exceed their cap for this game.
+    Inserts into spin_results with amount_won and level fields.
     """
     sb = get_sb()
 
     # FIX 6: load current session to check player cap
     sess_res = await run(lambda: sb.table("game_sessions")
-        .select("total_earned,player_cap_etb").eq("id", body.session_id).single().execute())
+        .select("total_earned").eq("id", body.session_id).single().execute())
     sess_data = sess_res.data or {}
     total_so_far = float(sess_data.get("total_earned") or 0)
-    cap          = float(sess_data.get("player_cap_etb") or 0)
 
-    # If cap is set and this spin would exceed it, clamp the amount
-    amount = body.amount_etb
-    if cap > 0 and (total_so_far + amount) > cap:
-        amount = max(0, cap - total_so_far)
-        if amount <= 0:
-            # Cap already reached — return without crediting
-            user_res = await run(lambda: sb.table("users")
-                .select("balance,total_earned").eq("id", body.user_id).single().execute())
-            return {"spin": None, "user": user_res.data, "cap_reached": True, "amount_credited": 0}
+    amount = body.amount_won
 
     spin_payload = {
-        "session_id":     body.session_id,
-        "user_id":        body.user_id,
-        "game_id":        body.game_id,
-        "question_number": body.question_number,
-        "segment_label":  body.segment_label,
-        "amount_etb":     amount,  # clamped amount; w-status defaults to 'active' (migration 012)
+        "session_id":    body.session_id,
+        "user_id":       body.user_id,
+        "game_id":       body.game_id,
+        "level":         body.question_number,
+        "segment_label": body.segment_label,
+        "amount_won":    amount,
+        "outcome":       "win" if amount > 0 else "no_win",
     }
     res = await run(lambda: sb.table("spin_results").insert(spin_payload).execute())
 
-    # Update session progress counters
-    await run(lambda: sb.table("game_sessions").update({
-        "current_question":   body.question_number + 1,
-        "questions_answered": body.question_number,
-    }).eq("id", body.session_id).execute())
-
-    # Get updated user balance (trigger already credited it)
+    # Get updated user balance
     user_res = await run(lambda: sb.table("users")
         .select("balance,total_earned").eq("id", body.user_id).single().execute())
 
@@ -3521,80 +3498,16 @@ async def end_session(sid: str, user_id: str):
 # ═══════════════════════════════════════════════════════════════════════════════
 @app.get("/api/deposits")
 async def list_deposits(_=Depends(require_admin), status: str = "", company_id: str = "", page: int = 1, per_page: int = 20, search: str = ""):
-    sb = get_sb()
-
-    def _q():
-        q = sb.table("company_deposits").select("*").order("created_at", desc=True)
-        if status:
-            q = q.eq("status", status)
-        if company_id:
-            q = q.eq("company_id", company_id)
-        if search and search.strip():
-            s = search.strip().replace("%", "")[:80]
-            q = q.ilike("amount_etb", f"%{s}%")  # safe fallback; ref_number search via JS filter
-        offset = (page - 1) * per_page
-        q = q.range(offset, offset + per_page - 1)
-        return q.execute()
-
-    res = await run(_q)
-    rows = res.data or []
-    total = res.count if (res.count is not None) else len(rows)
-
-    # Resolve company names separately (no embed — avoids FK/schema issues)
-    if rows:
-        cids = list({r.get("company_id") for r in rows if r.get("company_id")})
-        try:
-            co_res = await run(
-                lambda: sb.table("companies").select("id,name").in_("id", cids).execute()
-            )
-            co_map = {c["id"]: c.get("name") or "—" for c in (co_res.data or [])}
-        except Exception:
-            co_map = {}
-        for r in rows:
-            r["company_name"] = co_map.get(r.get("company_id")) or "—"
-
-    return {"data": rows, "total": total, "page": page, "per_page": per_page}
+    """company_deposits table not in current schema — return empty list."""
+    return {"data": [], "total": 0, "page": page, "per_page": per_page}
 
 @app.post("/api/deposits/{did}/approve")
 async def approve_deposit(did: str, body: DepositApproveReq, _=Depends(require_admin)):
-    sb = get_sb()
-    admin = await run(lambda: sb.table("users").select("id").eq("role","admin").limit(1).execute())
-    confirmed_by = (admin.data or [{}])[0].get("id")
-    # Fetch the deposit to calculate commission and prize pool
-    dep_res = await run(lambda: sb.table("company_deposits").select("*").eq("id", did).eq("status", "pending").single().execute())
-    if not dep_res.data: raise HTTPException(404, "Deposit not found or already processed")
-    dep = dep_res.data
-    amount = float(dep.get("amount_etb") or 0)
-    commission_pct = float(dep.get("commission_pct") or 15.0)
-    commission_etb = round(amount * commission_pct / 100, 2)
-    prize_pool_etb = round(amount - commission_etb, 2)
-    # Confirm the deposit with calculated values
-    update_data = {
-        "status": "confirmed",
-        "notes": body.notes,
-        "confirmed_by": confirmed_by,
-        "commission_etb": commission_etb,
-        "prize_pool_etb": prize_pool_etb,
-    }
-    try:
-        update_data["processed_at"] = datetime.now(timezone.utc).isoformat()
-        await run(lambda: sb.table("company_deposits").update(update_data).eq("id", did).execute())
-    except Exception:
-        update_data.pop("processed_at", None)
-        await run(lambda: sb.table("company_deposits").update(update_data).eq("id", did).execute())
-    # Add prize_pool_etb to company credit_balance
-    co_res = await run(lambda: sb.table("companies").select("credit_balance").eq("id", dep["company_id"]).single().execute())
-    current_bal = float((co_res.data or {}).get("credit_balance") or 0)
-    await run(lambda: sb.table("companies").update({"credit_balance": current_bal + prize_pool_etb}).eq("id", dep["company_id"]).execute())
-    return {"status": "confirmed", "prize_pool_etb": prize_pool_etb, "commission_etb": commission_etb}
+    raise HTTPException(501, "Deposit management not available: company_deposits table not in schema")
 
 @app.post("/api/deposits/{did}/reject")
 async def reject_deposit(did: str, body: DepositRejectReq, _=Depends(require_admin)):
-    sb = get_sb()
-    await run(lambda: sb.table("company_deposits").update({
-        "status": "rejected", "rejected_reason": body.reason
-    }).eq("id", did).eq("status", "pending").execute())
-    return {"status": "rejected"}
+    raise HTTPException(501, "Deposit management not available: company_deposits table not in schema")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STARTUP
