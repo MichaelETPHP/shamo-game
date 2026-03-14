@@ -5,7 +5,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>SHAMO Admin — QR Manager</title>
-  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap"
     rel="stylesheet">
   <link rel="stylesheet" href="_shared.css">
@@ -503,10 +503,8 @@
   <script src="_shared.js"></script>
   <script>
     // ── CONFIG ──────────────────────────────────────────────────────
-    const SUPABASE_URL = 'https://dlrvbxidyguagwpkslgc.supabase.co';
-    const SUPABASE_ANON_KEY = 'sb_publishable_oqHjqCIPbRg9o5D_mtUYQw_OJun_wwp';
-    const { createClient } = supabase;
-    const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    // Using server API (PostgreSQL via DATABASE_URL). Admin UI calls server
+    // endpoints for games/companies; remove client-side Supabase direct access.
 
     // ── SIDEBAR ─────────────────────────────────────────────────────
     buildSidebar('qr');   // _shared.js will add QR Manager once we update sidebar nav
@@ -545,31 +543,34 @@
     let allGames = [], allCompanies = [];
 
     async function loadSelectData() {
-      const { data: games } = await sb.from('games')
-        .select('id, title, status, game_date')
-        .in('status', ['active', 'scheduled', 'draft'])
-        .order('game_date', { ascending: false }).limit(50);
+      // Fetch admin-protected lists from server API (uses X-Admin-Token via apiFetch)
+      try {
+        const gRes = await apiGet('/games?page=1&per_page=200');
+        const cRes = await apiGet('/companies?page=1&per_page=200&status=active');
+        const games = (gRes && gRes.data) ? gRes.data : [];
+        const companies = (cRes && cRes.data) ? cRes.data : [];
 
-      const { data: companies } = await sb.from('companies')
-        .select('id, name').eq('status', 'active').order('name');
+        // Keep only relevant statuses (active, scheduled, draft)
+        allGames = (games || []).filter(g => ['active', 'scheduled', 'draft'].includes(g.status || ''));
+        allCompanies = companies || [];
 
-      allGames = games || [];
-      allCompanies = companies || [];
+        const gOpts = allGames.map(g => `<option value="${g.id}">${g.title} (${g.game_date || '—'})</option>`).join('');
+        document.getElementById('qrGame').innerHTML = '<option value="">— Choose a game —</option>' + gOpts;
+        document.getElementById('fGame').innerHTML = '<option value="">All Games</option>' + gOpts;
 
-      const gOpts = allGames.map(g => `<option value="${g.id}">${g.title} (${g.game_date || '—'})</option>`).join('');
-      document.getElementById('qrGame').innerHTML = '<option value="">— Choose a game —</option>' + gOpts;
-      document.getElementById('fGame').innerHTML = '<option value="">All Games</option>' + gOpts;
+        const cOpts = allCompanies.map(c => `<option value="${c.id}">${c.name}</option>`).join('');
+        document.getElementById('qrCompany').innerHTML = '<option value="">— Platform game (no company) —</option>' + cOpts;
+        document.getElementById('fCompany').innerHTML = '<option value="">All Companies</option>' + cOpts;
 
-      const cOpts = allCompanies.map(c => `<option value="${c.id}">${c.name}</option>`).join('');
-      document.getElementById('qrCompany').innerHTML = '<option value="">— Platform game (no company) —</option>' + cOpts;
-      document.getElementById('fCompany').innerHTML = '<option value="">All Companies</option>' + cOpts;
-
-      // Auto-select company from URL param and open create modal
-      const urlParams = new URLSearchParams(window.location.search);
-      const preCompany = urlParams.get('company');
-      if (preCompany) {
-        document.getElementById('fCompany').value = preCompany;
-        openCreate(preCompany);
+        // Auto-select company from URL param and open create modal
+        const urlParams = new URLSearchParams(window.location.search);
+        const preCompany = urlParams.get('company');
+        if (preCompany) {
+          document.getElementById('fCompany').value = preCompany;
+          openCreate(preCompany);
+        }
+      } catch (e) {
+        showToast('Failed to load games/companies: ' + (e.message || e), 'error');
       }
     }
 
@@ -881,12 +882,9 @@
     }
 
     // ── REALTIME ────────────────────────────────────────────────────
-    sb.channel('admin-qr')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'qr_codes' }, () => loadQRCodes())
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'qr_scans' }, () => loadScanLog())
-      .subscribe();
-
-    window.addEventListener('beforeunload', () => sb.removeAllChannels());
+    // Supabase realtime removed: use lightweight polling to refresh lists and scans.
+    const _pollInterval = setInterval(() => { loadQRCodes(); loadScanLog(); }, 15000);
+    window.addEventListener('beforeunload', () => clearInterval(_pollInterval));
 
     // ── INIT ────────────────────────────────────────────────────────
     async function init() {

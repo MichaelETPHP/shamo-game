@@ -68,17 +68,17 @@ The app is completely static (no bundler, no npm dependencies).
     - Attach a token or session ID as a URL param.
     - Read that token in `app.js` and enforce **one spin per token**.
 
-- **Supabase (quiz + spin history)**
-  - Persist:
+- **PostgreSQL (quiz + spin history)**
+  - Persist via the server API backed by PostgreSQL (set `DATABASE_URL` in `.env`):
     - Player identifier (e.g. Telegram user id or bot-issued token)
     - Quiz questions served + answers + score
     - Final spin result + timestamp
   - Before letting a user spin:
-    - Query Supabase for any existing, unspent game for that player.
+    - Query the API for any existing, unspent game for that player.
     - If found, show a "You already played this round" state instead of the quiz.
 
 - **Creator-funded $10 pools**
-  - At creation time, store in Supabase:
+  - At creation time, store in the database via the API:
     - Creator id
     - Pool amount (e.g. $10)
     - Prize distribution

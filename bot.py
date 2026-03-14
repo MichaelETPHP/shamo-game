@@ -136,7 +136,7 @@ async def register_player_via_api(
     phone_number: str,
     photo_url: str | None = None,
 ) -> dict | None:
-    """Register or update player in Supabase via /api/player/login. Sends telegram_id, phone, profile image."""
+    """Register or update player via /api/player/login (PostgreSQL DB). Sends telegram_id, phone, profile image."""
     if not photo_url and bot:
         photo_url = await get_profile_photo_url(bot, telegram_id)
     payload = {
