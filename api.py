@@ -26,12 +26,24 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 
-import db as _db
+from supabase import create_client, Client
 
 try:
     import anthropic
 except ImportError:
     anthropic = None
+
+from redis_client import (
+    test_connection as redis_test,
+    increment_active_players,
+    decrement_active_players,
+    get_active_players,
+    create_game_session,
+    get_game_session,
+    update_leaderboard,
+    get_leaderboard,
+    check_rate_limit,
+)
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -44,14 +56,12 @@ API_BASE_URL = (os.getenv("API_BASE_URL") or "").rstrip("/") or f"http://localho
 APP_ENV = (os.getenv("APP_ENV") or "local").strip().lower()
 IS_VPS = APP_ENV in ("production", "vps", "prod", "1", "true")
 
-DATABASE_URL  = (os.getenv("DATABASE_URL") or "").strip()
-DB_SCHEMA     = (os.getenv("DB_SCHEMA") or "shamo").strip()
+SUPABASE_URL  = (os.getenv("SUPABASE_URL") or "").strip()
+SUPABASE_KEY  = (os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_ANON_KEY") or "").strip()
 ADMIN_TOKEN   = (os.getenv("ADMIN_TOKEN") or "").strip()
 BOT_TOKEN     = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 ADMIN_USER    = (os.getenv("ADMIN_USERNAME") or "").strip()
 ADMIN_PASS    = (os.getenv("ADMIN_PASSWORD") or "").strip()
-if not DATABASE_URL:
-    logger.warning("DATABASE_URL not set in .env — all DB calls will fail")
 if not BOT_TOKEN:
     logger.warning("TELEGRAM_BOT_TOKEN not set in .env — /api/player/avatar-url will return 503")
 
@@ -66,10 +76,14 @@ def _shamo_env_script() -> str:
         return (s or "").replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ").replace("</", "<\\/")
     base = esc(API_BASE_URL)
     port = esc(str(PORT))
+    supabase_url = esc(SUPABASE_URL)
+    supabase_anon = esc(os.getenv("SUPABASE_ANON_KEY", ""))
     return (
         f"<script>\n"
         f"  window.SHAMO_API_BASE_URL = '{base}';\n"
         f"  window.SHAMO_PORT = '{port}';\n"
+        f"  window.SHAMO_SUPABASE_URL = '{supabase_url}';\n"
+        f"  window.SHAMO_SUPABASE_ANON_KEY = '{supabase_anon}';\n"
         f"</script>"
     )
 
@@ -105,319 +119,87 @@ class ShamoEnvInjectMiddleware(BaseHTTPMiddleware):
         )
 
 
-# ─── Balance helpers ─────────────────────────────────────────────────────────
-async def _get_active_spin_balance(user_id: str) -> float:
-    """Total ETB earned from spin_results for a user."""
+# ─── Balance helpers (spin_results.amount_etb where w-status = active) ─────────
+def _extract_rpc_scalar(raw) -> float:
+    """Extract numeric from RPC response (scalar, list, or dict)."""
+    if raw is None or raw == "":
+        return 0.0
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, list) and len(raw) > 0:
+        return _extract_rpc_scalar(raw[0])
+    if isinstance(raw, dict):
+        for v in raw.values():
+            if isinstance(v, (int, float)):
+                return float(v)
+            if v is not None and v != "":
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    pass
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+async def _get_active_spin_balance(sb: Client, user_id: str) -> float:
+    """
+    Total ETB from spin_results WHERE user_id (and w-status='active' when available).
+    Tries: RPC get_active_spin_total → table with w-status → RPC get_spin_total_simple → table user_id only.
+    """
     uid = str(user_id).strip()
     if not uid:
         return 0.0
+    # 1) RPC get_active_spin_total (migration 013)
     try:
-        row = await run(lambda: _db.execute(
-            "SELECT COALESCE(SUM(amount_won),0) AS total FROM spin_results WHERE user_id = %s",
-            (uid,), fetch="one", commit=False
-        ))
-        return float((row or {}).get("total") or 0)
+        res = await run(lambda: sb.rpc("get_active_spin_total", {"p_user_id": uid}).execute())
+        return _extract_rpc_scalar(res.data)
     except Exception as e:
-        logger.warning("_get_active_spin_balance: %s", e)
+        logger.warning("get_active_spin_total: %s", e)
+    # 2) RPC get_spin_total_simple — no w-status (migration 014), always works
+    try:
+        res = await run(lambda: sb.rpc("get_spin_total_simple", {"p_user_id": uid}).execute())
+        return _extract_rpc_scalar(res.data)
+    except Exception as e:
+        logger.warning("get_spin_total_simple: %s", e)
+    # 3) Table: user_id only
+    try:
+        res = await run(lambda: sb.table("spin_results").select("amount_etb").eq("user_id", uid).execute())
+        return sum(float(r.get("amount_etb") or 0) for r in (res.data or []))
+    except Exception as e:
+        logger.warning("spin_results table: %s", e)
     return 0.0
 
-# ─── Supabase-compatible shim over psycopg2 ──────────────────────────────────
-# All existing endpoints call:  sb = get_sb()  then  sb.table("x").select("*")...execute()
-# We emulate that API so zero endpoint code needs to change.
+# ─── Singleton Supabase client ────────────────────────────────────────────────
+_sb: Client | None = None
 
-class _Result:
-    """Mimics supabase APIResponse: .data / .count"""
-    def __init__(self, data=None, count=None):
-        self.data  = data if data is not None else []
-        self.count = count
+def get_sb() -> Client:
+    global _sb
+    if _sb is None:
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            raise HTTPException(500, "SUPABASE_URL / SUPABASE_SERVICE_KEY not set in .env")
+        _sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+        logger.info("Supabase client initialized (singleton)")
+    return _sb
 
-class _QueryBuilder:
-    """Fluent psycopg2 query builder emulating supabase-py chaining."""
-
-    def __init__(self, table: str):
-        self._table   = table
-        self._selects = "*"
-        self._filters: list = []          # list of (col, op, val)
-        self._order:   list = []          # list of (col, desc)
-        self._limit_n: Optional[int] = None
-        self._offset_n: Optional[int] = None
-        self._single  = False
-        self._upsert_data: Optional[dict] = None
-        self._insert_data: Optional[Any]  = None
-        self._update_data: Optional[dict] = None
-        self._delete  = False
-        self._on_conflict: Optional[str]  = None
-        self._count_method: Optional[str] = None
-        self._op = "select"
-
-    # ── Read ──────────────────────────────────────────────────────────────────
-    def select(self, cols="*", count=None):
-        self._selects = cols
-        self._op = "select"
-        if count:
-            self._count_method = count
-        return self
-
-    def eq(self, col, val):
-        self._filters.append((col, "=", val))
-        return self
-
-    def neq(self, col, val):
-        self._filters.append((col, "!=", val))
-        return self
-
-    def gt(self, col, val):
-        self._filters.append((col, ">", val))
-        return self
-
-    def gte(self, col, val):
-        self._filters.append((col, ">=", val))
-        return self
-
-    def lt(self, col, val):
-        self._filters.append((col, "<", val))
-        return self
-
-    def lte(self, col, val):
-        self._filters.append((col, "<=", val))
-        return self
-
-    def in_(self, col, vals):
-        self._filters.append((col, "IN", list(vals)))
-        return self
-
-    def is_(self, col, val):
-        self._filters.append((col, "IS", val))
-        return self
-
-    def ilike(self, col, pattern):
-        self._filters.append((col, "ILIKE", pattern))
-        return self
-
-    def order(self, col, desc=False):
-        self._order.append((col, desc))
-        return self
-
-    def limit(self, n):
-        self._limit_n = n
-        return self
-
-    def offset(self, n):
-        self._offset_n = n
-        return self
-
-    def single(self):
-        self._single = True
-        self._limit_n = 1
-        return self
-
-    def maybe_single(self):
-        self._limit_n = 1
-        return self
-
-    def range(self, start: int, end: int):
-        """supabase-py .range(start, end) → LIMIT (end-start+1) OFFSET start"""
-        self._offset_n = start
-        self._limit_n  = end - start + 1
-        return self
-
-    class _NotProxy:
-        """Proxy for .not_.is_() used in supabase-py queries."""
-        def __init__(self, builder):
-            self._b = builder
-        def is_(self, col, val):
-            # .not_.is_(col, 'null') → WHERE col IS NOT NULL
-            self._b._filters.append((col, "IS", None if val == 'null' else val))
-            # Negate: flip NULL → IS NOT NULL
-            col_, op_, val_ = self._b._filters.pop()
-            self._b._filters.append((col_, "IS NOT", val_))
-            return self._b
-        def eq(self, col, val):
-            self._b._filters.append((col, "!=", val))
-            return self._b
-
-    @property
-    def not_(self):
-        return self._NotProxy(self)
-
-    # ── Write ─────────────────────────────────────────────────────────────────
-    def insert(self, data):
-        self._op = "insert"
-        self._insert_data = data
-        return self
-
-    def upsert(self, data, on_conflict=None):
-        self._op = "upsert"
-        self._upsert_data = data
-        self._on_conflict = on_conflict
-        return self
-
-    def update(self, data):
-        self._op = "update"
-        self._update_data = data
-        return self
-
-    def delete(self):
-        self._op = "delete"
-        self._delete = True
-        return self
-
-    # ── Execute ───────────────────────────────────────────────────────────────
-    def _build_where(self):
-        clauses, params = [], []
-        for col, op, val in self._filters:
-            if op == "IN":
-                placeholders = ",".join(["%s"] * len(val))
-                clauses.append(f'"{col}" IN ({placeholders})')
-                params.extend(val)
-            elif op == "IS NOT":
-                clauses.append(f'"{col}" IS NOT NULL')
-            elif op == "IS":
-                clauses.append(f'"{col}" IS {"NULL" if val is None else "NOT NULL"}')
-            else:
-                clauses.append(f'"{col}" {op} %s')
-                params.append(val)
-        return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
-
-    def execute(self) -> _Result:
-        import psycopg2
-        from psycopg2.extras import RealDictCursor
-
-        where, params = self._build_where()
-
-        with _db.get_conn() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                op = self._op
-
-                if op == "select":
-                    # Build column list
-                    cols = self._selects
-                    # Supabase relationship hints like "*, companies(name)" → just "*"
-                    if "(" in cols and ")" in cols:
-                        cols = "*"
-
-                    # When count="exact" requested, run a separate COUNT(*) first
-                    total_count = None
-                    if self._count_method:
-                        count_sql = f'SELECT COUNT(*) AS n FROM "{self._table}"' + where
-                        cur.execute(count_sql, params)
-                        row = cur.fetchone()
-                        total_count = int(row["n"]) if row else 0
-
-                    sql = f'SELECT {cols} FROM "{self._table}"' + where
-                    if self._order:
-                        order_parts = [f'"{c}" {"DESC" if d else "ASC"}' for c, d in self._order]
-                        sql += " ORDER BY " + ", ".join(order_parts)
-                    if self._limit_n is not None:
-                        sql += f" LIMIT {int(self._limit_n)}"
-                    if self._offset_n is not None:
-                        sql += f" OFFSET {int(self._offset_n)}"
-                    cur.execute(sql, params)
-                    rows = [dict(r) for r in cur.fetchall()]
-                    count = total_count if self._count_method else None
-                    if self._single:
-                        return _Result(data=rows[0] if rows else None, count=count)
-                    return _Result(data=rows, count=count)
-
-                elif op == "insert":
-                    rows_in = self._insert_data if isinstance(self._insert_data, list) else [self._insert_data]
-                    results = []
-                    for row in rows_in:
-                        cols_list = list(row.keys())
-                        col_sql  = ", ".join(f'"{c}"' for c in cols_list)
-                        val_sql  = ", ".join(["%s"] * len(cols_list))
-                        vals     = [row[c] for c in cols_list]
-                        sql = f'INSERT INTO "{self._table}" ({col_sql}) VALUES ({val_sql}) RETURNING *'
-                        cur.execute(sql, vals)
-                        r = cur.fetchone()
-                        if r:
-                            results.append(dict(r))
-                    conn.commit()
-                    return _Result(data=results)
-
-                elif op == "upsert":
-                    rows_in = self._upsert_data if isinstance(self._upsert_data, list) else [self._upsert_data]
-                    results = []
-                    for row in rows_in:
-                        cols_list = list(row.keys())
-                        col_sql  = ", ".join(f'"{c}"' for c in cols_list)
-                        val_sql  = ", ".join(["%s"] * len(cols_list))
-                        vals     = [row[c] for c in cols_list]
-                        conflict = f"ON CONFLICT ({self._on_conflict})" if self._on_conflict else "ON CONFLICT DO NOTHING"
-                        updates  = ", ".join(f'"{c}"=EXCLUDED."{c}"' for c in cols_list if c != (self._on_conflict or "id"))
-                        do_part  = f"DO UPDATE SET {updates}" if updates and not self._on_conflict else "DO NOTHING"
-                        if self._on_conflict:
-                            sql = f'INSERT INTO "{self._table}" ({col_sql}) VALUES ({val_sql}) {conflict} {do_part} RETURNING *'
-                        else:
-                            sql = f'INSERT INTO "{self._table}" ({col_sql}) VALUES ({val_sql}) ON CONFLICT DO NOTHING RETURNING *'
-                        cur.execute(sql, vals)
-                        r = cur.fetchone()
-                        if r:
-                            results.append(dict(r))
-                    conn.commit()
-                    return _Result(data=results)
-
-                elif op == "update":
-                    cols_list = list(self._update_data.keys())
-                    set_sql   = ", ".join(f'"{c}"=%s' for c in cols_list)
-                    vals      = [self._update_data[c] for c in cols_list] + params
-                    sql = f'UPDATE "{self._table}" SET {set_sql}' + where + " RETURNING *"
-                    cur.execute(sql, vals)
-                    rows = [dict(r) for r in cur.fetchall()]
-                    conn.commit()
-                    return _Result(data=rows)
-
-                elif op == "delete":
-                    sql = f'DELETE FROM "{self._table}"' + where + " RETURNING *"
-                    cur.execute(sql, params)
-                    rows = [dict(r) for r in cur.fetchall()]
-                    conn.commit()
-                    return _Result(data=rows)
-
-        return _Result()
-
-class _RPC:
-    """Minimal RPC shim — maps supabase .rpc(name, params) to a function call.
-    We don't have the same RPCs in the new schema, so this is a no-op / logs a warning."""
-    def __init__(self, name, params):
-        self._name   = name
-        self._params = params
-
-    def execute(self) -> _Result:
-        logger.warning("RPC %s called via shim — not supported in direct DB mode", self._name)
-        return _Result(data=None)
-
-class _ShamoClient:
-    """Drop-in replacement for supabase.Client used by all endpoints."""
-    def table(self, name: str) -> _QueryBuilder:
-        return _QueryBuilder(name)
-
-    def from_(self, name: str) -> _QueryBuilder:
-        return _QueryBuilder(name)
-
-    def rpc(self, name: str, params: dict = None) -> _RPC:
-        return _RPC(name, params or {})
-
-_shamo_client = _ShamoClient()
-
-def get_sb() -> _ShamoClient:
-    """Return the drop-in DB client. All endpoints call this unchanged."""
-    if not DATABASE_URL:
-        raise HTTPException(500, "DATABASE_URL not set in .env")
-    return _shamo_client
-
-def get_db():
-    """Alias for direct access to the db module."""
-    return _db
+def _reset_sb():
+    global _sb
+    _sb = None
+    logger.warning("Supabase client reset — stale connection detected, reconnecting...")
 
 # ─── Thread-pool ──────────────────────────────────────────────────────────────
 _pool = ThreadPoolExecutor(max_workers=12)
 
 async def run(fn, *args, **kwargs):
-    """Run sync fn in thread-pool."""
+    """Run sync fn in thread-pool. Auto-reconnects on stale HTTP/2 / WinError 10035."""
     loop = asyncio.get_event_loop()
     _fn = partial(fn, *args, **kwargs)
-    return await loop.run_in_executor(_pool, _fn)
+    try:
+        return await loop.run_in_executor(_pool, _fn)
+    except (_httpx.LocalProtocolError, _httpx.RemoteProtocolError, _httpx.ReadError) as exc:
+        logger.warning("HTTP connection error (%s), resetting and retrying...", exc)
+        _reset_sb()
+        return await loop.run_in_executor(_pool, _fn)
 
 async def gather(*fns):
     """Run multiple sync callables concurrently."""
@@ -576,17 +358,17 @@ class BalanceAdjust(BaseModel):
 class GameCreate(BaseModel):
     title: str = "Tonight's SHAMO"; description: Optional[str] = None
     status: str = "draft"; starts_at: str; ends_at: str; game_date: str
-    prize_pool_usd: float = 0.0; max_payout_usd: float = 5700.0
-    platform_fee_pct: float = 15.0
-    company_id: Optional[str] = None
+    prize_pool_etb: float = 0.0; max_prize_etb: float = 5700.0
+    platform_fee_pct: float = 15.0; player_cap_pct: float = 30.0
+    company_id: Optional[str] = None; deposit_id: Optional[str] = None
 
 class GameUpdate(BaseModel):
     title: Optional[str] = None; description: Optional[str] = None
     status: Optional[str] = None; starts_at: Optional[str] = None
     ends_at: Optional[str] = None; game_date: Optional[str] = None
-    prize_pool_usd: Optional[float] = None; max_payout_usd: Optional[float] = None
-    platform_fee_pct: Optional[float] = None
-    company_id: Optional[str] = None
+    prize_pool_etb: Optional[float] = None; max_prize_etb: Optional[float] = None
+    platform_fee_pct: Optional[float] = None; player_cap_pct: Optional[float] = None
+    company_id: Optional[str] = None; deposit_id: Optional[str] = None
 
 class QuestionCreate(BaseModel):
     question_text: str; category: Optional[str] = None
@@ -669,7 +451,7 @@ class AnswerReq(BaseModel):
 
 class SpinReq(BaseModel):
     session_id: str; user_id: str; game_id: str
-    question_number: int; segment_label: str; amount_won: float
+    question_number: int; segment_label: str; amount_etb: float
 
 class DepositApproveReq(BaseModel):
     notes: Optional[str] = None
@@ -713,13 +495,45 @@ class PhoneByTelegramReq(BaseModel):
 @app.get("/api/health")
 async def health():
     try:
-        info = await run(lambda: _db.health_check())
-        if info.get("status") == "ok":
-            return {"status": "ok", "db": "connected", "db_name": info.get("db"), "schema": info.get("schema")}
-        return {"status": "error", "db": "disconnected", "error": info.get("error")}
+        sb = get_sb()
+        await run(lambda: sb.table("users").select("id").limit(1).execute())
+        return {"status": "ok", "db": "connected"}
     except Exception as e:
-        return {"status": "error", "db": "disconnected", "error": str(e)}
+        return {"status": "ok", "db": "disconnected", "error": str(e)}
 
+
+@app.get("/api/redis/health")
+async def redis_health():
+    connected = redis_test()
+    return {"redis": "connected" if connected else "disconnected"}
+
+
+@app.get("/api/players/active")
+async def active_players():
+    count = get_active_players()
+    return {"active_players": count}
+
+
+@app.get("/api/leaderboard")
+async def leaderboard():
+    top = get_leaderboard(10)
+    return {"leaderboard": top}
+
+
+# Add this route temporarily
+async def _test_supabase_impl():
+    try:
+        sb = get_sb()
+        result = await run(lambda: sb.table("users").select("id").limit(1).execute())
+        return {"status": "ok", "row_count": len(result.data or []), "error": None}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+@app.get("/test-supabase")
+async def test_supabase(): return await _test_supabase_impl()
+
+@app.get("/api/test-supabase")
+async def test_supabase_api(): return await _test_supabase_impl()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # AUTH
@@ -1091,7 +905,7 @@ async def player_withdrawals(uid: str):
 
 @app.get("/api/player/{uid}/balance")
 async def player_balance(uid: str):
-    """Balance for withdraw check: SUM(amount_won) from spin_results WHERE user_id."""
+    """Balance for withdraw check: SUM(amount_etb) from spin_results WHERE user_id AND w-status='active'."""
     sb = get_sb()
     bal = await _get_active_spin_balance(sb, uid)
     return {"available_balance": round(bal, 2)}
@@ -1182,7 +996,7 @@ async def player_balance_summary(uid: str, telegram_id: Optional[int] = None):
     }
 
 # ─── Game config from platform_config (for mini-app timer & rules + maintenance) ─
-async def _get_game_config(sb: _ShamoClient) -> dict:
+async def _get_game_config(sb: Client) -> dict:
     """Read game settings from platform_config. Includes maintenance mode for mini-app."""
     try:
         keys = [
@@ -1251,9 +1065,10 @@ async def public_active_game():
     """
     sb = get_sb()
     game_res = await run(lambda: sb.table("games").select(
-        "id,title,status,game_date,prize_pool_usd,max_payout_usd,"
-        "platform_fee_pct,total_players,total_winners,total_paid_out,"
-        "starts_at,ends_at,company_id,level_config,wheel_config"
+        "id,title,status,game_date,prize_pool_etb,prize_pool_remaining,"
+        "platform_fee_pct,player_cap_pct,total_players,total_winners,total_paid_out,"
+        "starts_at,ends_at,company_id,"
+        "companies!games_company_id_fkey(id,name,logo_url,primary_color)"
     ).eq("status", "active").order("starts_at", desc=True).limit(1).execute())
 
     games = game_res.data or []
@@ -1520,7 +1335,7 @@ async def get_stats(_=Depends(require_admin)):
         def q_banned_users():  return sb.table("users").select("id", count="exact").eq("is_banned", True).execute()
         def q_total_games():   return sb.table("games").select("id", count="exact").execute()
         def q_active_game():   return sb.table("games").select(
-            "id,title,status,total_players,total_winners,total_paid_out,prize_pool_usd,game_date"
+            "id,title,status,total_players,total_winners,total_paid_out,prize_pool_etb,prize_pool_remaining,game_date"
         ).eq("status", "active").limit(1).execute()
         def q_pend_withdraw(): return sb.table("withdrawals").select("id", count="exact").eq("status", "pending").execute()
         def q_active_comp():   return sb.table("companies").select("id", count="exact").eq("status", "active").execute()
@@ -1528,13 +1343,8 @@ async def get_stats(_=Depends(require_admin)):
         def q_pend_qs():       return sb.table("questions").select("id", count="exact").eq("status", "pending").execute()
         def q_total_comp():    return sb.table("companies").select("id", count="exact").execute()
         def q_total_qs():      return sb.table("questions").select("id", count="exact").execute()
-        # Get commission income from company_deposits (graceful: table may not exist yet)
-        def q_fee_income():
-            try:
-                return sb.table("company_deposits").select("commission_etb").eq("status", "confirmed").execute()
-            except Exception:
-                class _Empty: data = []; count = 0
-                return _Empty()
+        # FIX 1: get real commission income from company_deposits, not estimated from payouts
+        def q_fee_income():    return sb.table("company_deposits").select("commission_etb").eq("status", "confirmed").execute()
 
         (r_total_users, r_active_users, r_banned_users, r_total_games,
          r_active_game, r_pend_withdraw, r_active_comp, r_pend_comp,
@@ -1831,12 +1641,12 @@ async def create_game(body: GameCreate, _=Depends(require_admin)):
     payload = body.dict()
     payload["created_by"] = created_by
     payload["company_id"] = payload["company_id"] or None
-    # No longer needed: payload["prize_pool_remaining"] = payload["prize_pool_usd"]
+    payload["prize_pool_remaining"] = payload["prize_pool_etb"]
 
     # Auto-create a confirmed deposit when a company game is created with a prize pool
-    deposit_id = payload.pop("deposit_id", None)
-    if payload["company_id"] and payload["prize_pool_usd"] and not deposit_id:
-        prize = float(payload["prize_pool_usd"])
+    deposit_id = payload.get("deposit_id") or None
+    if payload["company_id"] and payload["prize_pool_etb"] and not deposit_id:
+        prize = float(payload["prize_pool_etb"])
         commission_pct = float(payload.get("platform_fee_pct") or 15.0)
         commission_etb = round(prize * commission_pct / 100, 2)
         dep_payload = {
@@ -1844,7 +1654,7 @@ async def create_game(body: GameCreate, _=Depends(require_admin)):
             "amount_etb": prize,
             "commission_pct": commission_pct,
             "commission_etb": commission_etb,
-            "prize_pool_usd": round(prize - commission_etb, 2),
+            "prize_pool_etb": round(prize - commission_etb, 2),
             "status": "confirmed",
         }
         try:
@@ -1866,7 +1676,8 @@ async def create_game(body: GameCreate, _=Depends(require_admin)):
         except Exception:
             pass  # deposit creation is non-blocking — game still gets created
 
-    # Deposit ID is tracked purely within `company_deposits`, no need to append it into `games` payload!
+    payload["deposit_id"] = deposit_id
+
     await run(lambda: sb.table("games").insert(payload).execute())
     res = await run(lambda: sb.table("games").select("*").eq("created_by", created_by).order("created_at", desc=True).limit(1).execute())
     game_data = (res.data or [{}])[0]
@@ -1949,55 +1760,19 @@ async def admin_broadcast_game(game_id: str, _=Depends(require_admin)):
 @app.get("/api/games/{gid}/questions")
 async def get_game_questions_admin(gid: str, _=Depends(require_admin)):
     """Admin: returns questions with is_correct visible."""
-    # The supabase relationship shorthand (questions(...)) isn't supported by the
-    # direct-psycopg2 query shim. Fetch game_questions, questions, and answer_options
-    # via explicit SQL and assemble the nested result here.
-    try:
-        # 1) load mapping of game_questions (preserve sort order)
-        gq_rows = await run(lambda: _db.execute(
-            "SELECT sort_order, question_id FROM shamo.game_questions WHERE game_id = %s ORDER BY sort_order",
-            (gid,), fetch="all", commit=False
-        ))
-        if not gq_rows:
-            return []
-        qids = [r["question_id"] for r in gq_rows]
-
-        # 2) fetch questions
-        placeholders = ",".join(["%s"] * len(qids))
-        qs_sql = f"SELECT id, icon, question_text, category, status, explanation FROM shamo.questions WHERE id IN ({placeholders})"
-        q_rows = await run(lambda: _db.execute(qs_sql, tuple(qids), fetch="all", commit=False))
-        q_map = {q["id"]: q for q in (q_rows or [])}
-
-        # 3) fetch answer options for these questions
-        ao_sql = f"SELECT id, question_id, option_letter, option_text, is_correct, sort_order FROM shamo.answer_options WHERE question_id IN ({placeholders})"
-        ao_rows = await run(lambda: _db.execute(ao_sql, tuple(qids), fetch="all", commit=False))
-        opts_map = {}
-        for o in (ao_rows or []):
-            opts_map.setdefault(o["question_id"], []).append({
-                "id": o["id"], "option_letter": o["option_letter"], "option_text": o["option_text"],
-                "is_correct": o["is_correct"], "sort_order": o.get("sort_order", 0)
-            })
-
-        # 4) assemble result preserving game_questions ordering
-        result = []
-        for r in gq_rows:
-            qid = r.get("question_id")
-            q = q_map.get(qid, {})
-            q_out = {
-                "id": q.get("id"),
-                "icon": q.get("icon") or '🇪🇹',
-                "question_text": q.get("question_text"),
-                "category": q.get("category"),
-                "status": q.get("status"),
-                "explanation": q.get("explanation"),
-                "sort_order": r.get("sort_order", 0),
-                "options": sorted(opts_map.get(qid, []), key=lambda x: x.get("sort_order", 0))
-            }
-            result.append(q_out)
-        return result
-    except Exception as e:
-        logger.error("get_game_questions_admin failed: %s", e)
-        raise HTTPException(500, str(e))
+    sb = get_sb()
+    gq_res = await run(lambda: sb.table("game_questions").select(
+        "sort_order, questions(id, icon, question_text, category, status, explanation,"
+        "answer_options(id, option_letter, option_text, is_correct, sort_order))"
+    ).eq("game_id", gid).order("sort_order").execute())
+    rows = gq_res.data or []
+    result = []
+    for row in rows:
+        q = row.get("questions") or {}
+        q["sort_order"] = row.get("sort_order", 0)
+        q["options"] = sorted(q.pop("answer_options", []) or [], key=lambda x: x.get("sort_order", 0))
+        result.append(q)
+    return result
 
 @app.delete("/api/games/{gid}/questions/{qid}")
 async def remove_question_from_game(gid: str, qid: str, _=Depends(require_admin)):
@@ -2090,8 +1865,7 @@ async def create_question(body: QuestionCreate, _=Depends(require_admin)):
                 .eq("game_id", body.game_id).order("sort_order", desc=True).limit(1).execute())
             next_ord = ((max_ord.data or [{}])[0].get("sort_order") or 0) + 1
             await run(lambda: sb.table("game_questions").insert({
-                "game_id": body.game_id, "question_id": qid, "sort_order": next_ord,
-                "level": "medium"
+                "game_id": body.game_id, "question_id": qid, "sort_order": next_ord
             }).execute())
         qrow["game_id"] = body.game_id
     return qrow
@@ -2421,8 +2195,7 @@ async def bulk_assign_questions_to_game(body: BulkAssignGameReq, _=Depends(requi
         if qid in linked:
             continue
         await run(lambda qid=qid, no=next_ord: sb.table("game_questions").insert({
-            "game_id": body.game_id, "question_id": qid, "sort_order": no,
-            "level": "medium"
+            "game_id": body.game_id, "question_id": qid, "sort_order": no
         }).execute())
         next_ord += 1
         added += 1
@@ -3108,7 +2881,7 @@ async def validate_qr_token(body: QRScanReq):
     """
     sb = get_sb()
     res = await run(lambda: sb.table("qr_codes").select(
-        "*, games!qr_codes_game_id_fkey(id,title,status,game_date,prize_pool_usd,max_payout_usd),"
+        "*, games!qr_codes_game_id_fkey(id,title,status,game_date,prize_pool_etb,prize_pool_remaining),"
         "companies!qr_codes_company_id_fkey(name)"
     ).eq("token", body.token).limit(1).execute())
 
@@ -3162,7 +2935,8 @@ async def validate_qr_token(body: QRScanReq):
         "game_id":       game_id,
         "game_title":    game.get("title"),
         "game_date":     game.get("game_date"),
-        "prize_pool_usd": game.get("prize_pool_usd"),
+        "prize_pool_etb": game.get("prize_pool_etb"),
+        "prize_pool_remaining": game.get("prize_pool_remaining"),
         "company":       (qr.get("companies") or {}).get("name"),
         "label":         qr.get("label"),
     }
@@ -3256,7 +3030,7 @@ async def admin_broadcast_qr(qr_id: str, _=Depends(require_admin)):
     company_data = None
     if game_id:
         g_res = await run(lambda: sb.table("games").select(
-            "id,title,game_date,status,prize_pool_usd,max_payout_usd,total_players,ends_at,company_id"
+            "id,title,game_date,status,prize_pool_etb,total_players,ends_at,company_id"
         ).eq("id", game_id).single().execute())
         game_data = g_res.data
     if company_id:
@@ -3355,12 +3129,17 @@ async def start_session(body: SessionStartReq):
 
     # Get game config
     game_r = await run(lambda: sb.table("games")
-        .select("id,prize_pool_usd,platform_fee_pct").eq("id", body.game_id).single().execute())
+        .select("prize_pool_remaining,player_cap_pct").eq("id", body.game_id).single().execute())
     game = game_r.data or {}
+    remaining  = float(game.get("prize_pool_remaining") or 0)
+    cap_pct    = float(game.get("player_cap_pct") or 30)
+    player_cap = round(remaining * cap_pct / 100, 2)
+
     sess_payload = {
-        "game_id":   body.game_id,
-        "user_id":   body.user_id,
-        "is_active": True
+        "game_id": body.game_id, "user_id": body.user_id,
+        "qr_code_id": qr_code_id, "player_cap_etb": player_cap,
+        "current_question": 1, "questions_answered": 0,
+        "wrong_count": 0, "is_active": True
     }
     res = await run(lambda: sb.table("game_sessions").insert(sess_payload).execute())
     return {"session": (res.data or [{}])[0], "cooldown": False,
@@ -3482,30 +3261,46 @@ async def submit_answer(body: AnswerReq):
 async def record_spin(body: SpinReq):
     """
     Record a spin result. Credits user balance via DB trigger (trg_on_spin_insert).
-    Inserts into spin_results with amount_won and level fields.
+
+    FIX 6: enforces player_cap_etb — rejects spin if user's session earnings
+    would exceed their cap for this game.
     """
     sb = get_sb()
 
     # FIX 6: load current session to check player cap
     sess_res = await run(lambda: sb.table("game_sessions")
-        .select("total_earned").eq("id", body.session_id).single().execute())
+        .select("total_earned,player_cap_etb").eq("id", body.session_id).single().execute())
     sess_data = sess_res.data or {}
     total_so_far = float(sess_data.get("total_earned") or 0)
+    cap          = float(sess_data.get("player_cap_etb") or 0)
 
-    amount = body.amount_won
+    # If cap is set and this spin would exceed it, clamp the amount
+    amount = body.amount_etb
+    if cap > 0 and (total_so_far + amount) > cap:
+        amount = max(0, cap - total_so_far)
+        if amount <= 0:
+            # Cap already reached — return without crediting
+            user_res = await run(lambda: sb.table("users")
+                .select("balance,total_earned").eq("id", body.user_id).single().execute())
+            return {"spin": None, "user": user_res.data, "cap_reached": True, "amount_credited": 0}
 
     spin_payload = {
-        "session_id":    body.session_id,
-        "user_id":       body.user_id,
-        "game_id":       body.game_id,
-        "level":         body.question_number,
-        "segment_label": body.segment_label,
-        "amount_won":    amount,
-        "outcome":       "win" if amount > 0 else "no_win",
+        "session_id":     body.session_id,
+        "user_id":        body.user_id,
+        "game_id":        body.game_id,
+        "question_number": body.question_number,
+        "segment_label":  body.segment_label,
+        "amount_etb":     amount,  # clamped amount; w-status defaults to 'active' (migration 012)
     }
     res = await run(lambda: sb.table("spin_results").insert(spin_payload).execute())
 
-    # Get updated user balance
+    # Update session progress counters
+    await run(lambda: sb.table("game_sessions").update({
+        "current_question":   body.question_number + 1,
+        "questions_answered": body.question_number,
+    }).eq("id", body.session_id).execute())
+
+    # Get updated user balance (trigger already credited it)
     user_res = await run(lambda: sb.table("users")
         .select("balance,total_earned").eq("id", body.user_id).single().execute())
 
@@ -3535,16 +3330,80 @@ async def end_session(sid: str, user_id: str):
 # ═══════════════════════════════════════════════════════════════════════════════
 @app.get("/api/deposits")
 async def list_deposits(_=Depends(require_admin), status: str = "", company_id: str = "", page: int = 1, per_page: int = 20, search: str = ""):
-    """company_deposits table not in current schema — return empty list."""
-    return {"data": [], "total": 0, "page": page, "per_page": per_page}
+    sb = get_sb()
+
+    def _q():
+        q = sb.table("company_deposits").select("*").order("created_at", desc=True)
+        if status:
+            q = q.eq("status", status)
+        if company_id:
+            q = q.eq("company_id", company_id)
+        if search and search.strip():
+            s = search.strip().replace("%", "")[:80]
+            q = q.ilike("amount_etb", f"%{s}%")  # safe fallback; ref_number search via JS filter
+        offset = (page - 1) * per_page
+        q = q.range(offset, offset + per_page - 1)
+        return q.execute()
+
+    res = await run(_q)
+    rows = res.data or []
+    total = res.count if (res.count is not None) else len(rows)
+
+    # Resolve company names separately (no embed — avoids FK/schema issues)
+    if rows:
+        cids = list({r.get("company_id") for r in rows if r.get("company_id")})
+        try:
+            co_res = await run(
+                lambda: sb.table("companies").select("id,name").in_("id", cids).execute()
+            )
+            co_map = {c["id"]: c.get("name") or "—" for c in (co_res.data or [])}
+        except Exception:
+            co_map = {}
+        for r in rows:
+            r["company_name"] = co_map.get(r.get("company_id")) or "—"
+
+    return {"data": rows, "total": total, "page": page, "per_page": per_page}
 
 @app.post("/api/deposits/{did}/approve")
 async def approve_deposit(did: str, body: DepositApproveReq, _=Depends(require_admin)):
-    raise HTTPException(501, "Deposit management not available: company_deposits table not in schema")
+    sb = get_sb()
+    admin = await run(lambda: sb.table("users").select("id").eq("role","admin").limit(1).execute())
+    confirmed_by = (admin.data or [{}])[0].get("id")
+    # Fetch the deposit to calculate commission and prize pool
+    dep_res = await run(lambda: sb.table("company_deposits").select("*").eq("id", did).eq("status", "pending").single().execute())
+    if not dep_res.data: raise HTTPException(404, "Deposit not found or already processed")
+    dep = dep_res.data
+    amount = float(dep.get("amount_etb") or 0)
+    commission_pct = float(dep.get("commission_pct") or 15.0)
+    commission_etb = round(amount * commission_pct / 100, 2)
+    prize_pool_etb = round(amount - commission_etb, 2)
+    # Confirm the deposit with calculated values
+    update_data = {
+        "status": "confirmed",
+        "notes": body.notes,
+        "confirmed_by": confirmed_by,
+        "commission_etb": commission_etb,
+        "prize_pool_etb": prize_pool_etb,
+    }
+    try:
+        update_data["processed_at"] = datetime.now(timezone.utc).isoformat()
+        await run(lambda: sb.table("company_deposits").update(update_data).eq("id", did).execute())
+    except Exception:
+        update_data.pop("processed_at", None)
+        await run(lambda: sb.table("company_deposits").update(update_data).eq("id", did).execute())
+    # Add prize_pool_etb to company credit_balance
+    co_res = await run(lambda: sb.table("companies").select("credit_balance").eq("id", dep["company_id"]).single().execute())
+    current_bal = float((co_res.data or {}).get("credit_balance") or 0)
+    await run(lambda: sb.table("companies").update({"credit_balance": current_bal + prize_pool_etb}).eq("id", dep["company_id"]).execute())
+    return {"status": "confirmed", "prize_pool_etb": prize_pool_etb, "commission_etb": commission_etb}
 
 @app.post("/api/deposits/{did}/reject")
 async def reject_deposit(did: str, body: DepositRejectReq, _=Depends(require_admin)):
-    raise HTTPException(501, "Deposit management not available: company_deposits table not in schema")
+    sb = get_sb()
+    await run(lambda: sb.table("company_deposits").update({
+        "status": "rejected", "rejected_reason": body.reason
+    }).eq("id", did).eq("status", "pending").execute())
+    return {"status": "rejected"}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STARTUP
@@ -3554,6 +3413,6 @@ async def startup():
     logger.info("PORT=%s API_BASE_URL=%s APP_ENV=%s (VPS=%s)", PORT, API_BASE_URL, APP_ENV, IS_VPS)
     try:
         get_sb()
-        logger.info("✅ Direct PostgreSQL DB client ready (schema=%s)", DB_SCHEMA)
+        logger.info("✅ Supabase singleton client ready")
     except Exception as e:
-        logger.warning("⚠️  DB init warning: %s", e)
+        logger.warning("⚠️  Supabase init warning: %s", e)

@@ -5760,16 +5760,12 @@
       }
     }
 
-    // ═══ WHEEL — random spin: equal chance per segment, varied prize amounts ═══
+    // ═══ WHEEL — accurate landing, shuffled per session, hard algorithm ═══
     function _buildBaseSegs() {
       const p = parseFloat(S.activeGame?.prize_pool_remaining || S.activeGame?.prize_pool_etb || 2850);
-      // Wider spread of percentages so prizes vary (not just one amount like 20 ETB)
-      const pcts = [0.005, 0.01, 0.015, 0.02, 0.03, 0.05, 0.07, 0.10, 0.12];
-      const cols = ['#22C55E', '#3B82F6', '#A855F7', '#E8B84B', '#F97316', '#EF4444', '#06B6D4', '#EC4899'];
-      return pcts.map((pc, i) => {
-        const etb = Math.max(5, Math.round(p * pc));
-        return { a: etb, l: etb + ' ETB', tc: cols[i % cols.length] };
-      });
+      const pcts = [0.01, 0.02, 0.03, 0.05, 0.08, 0.12];
+      const cols = ['#22C55E', '#3B82F6', '#A855F7', '#E8B84B', '#F97316', '#EF4444'];
+      return pcts.map((pc, i) => { const etb = Math.max(5, Math.round(p * pc)); return { a: etb, l: etb + ' ETB', tc: cols[i] }; });
     }
     function _shuffleSegs(segs) {
       const a = [...segs];
@@ -5838,8 +5834,12 @@
       S.wheelSegs = segs;
       const N = segs.length;
       const arc = 2 * Math.PI / N;
-      // Random spin: equal probability for every segment (no bias to one prize)
-      const chosen = Math.floor(Math.random() * N);
+      const maxA = Math.max(...segs.map(s => s.a));
+      const weights = segs.map(s => Math.max(1, Math.round(maxA * 0.15) - s.a)); // lower ETB = higher weight
+      const total = weights.reduce((a, b) => a + b, 0);
+      const rnd = Math.random() * total;
+      let chosen = 0, acc = 0;
+      for (let i = 0; i < N; i++) { acc += weights[i]; if (rnd < acc) { chosen = i; break; } chosen = i; }
       S.wonSeg = segs[chosen];
       const mid = chosen * arc + arc / 2;
       const targetAngle = -Math.PI / 2 - mid;
