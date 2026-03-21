@@ -3960,6 +3960,25 @@
       return a;
     }
 
+    function escapeAttr(s) {
+      return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+    }
+
+    // One delegated handler — avoids broken onclick strings with UUIDs / quotes
+    (function initQuestionOptionClicks() {
+      const qo = document.getElementById('qOpts');
+      if (!qo || qo._shamoOptDelegate) return;
+      qo._shamoOptDelegate = true;
+      qo.addEventListener('click', function (ev) {
+        const el = ev.target.closest('.q-opt');
+        if (!el || el.classList.contains('disabled')) return;
+        const idx = parseInt(el.getAttribute('data-idx'), 10);
+        const oid = el.getAttribute('data-opt-id') || '';
+        const letter = (el.getAttribute('data-letter') || '').trim().charAt(0).toUpperCase();
+        if (typeof answerQ === 'function') answerQ(idx, oid, letter);
+      });
+    })();
+
     // Vibration on button/clickable tap (where supported, e.g. Telegram WebView)
     function vibrate() {
       try { if (navigator.vibrate) navigator.vibrate(12); } catch(e){}
@@ -5582,8 +5601,18 @@
             };
             applyGameConfigToDOM();
           }
+        } else {
+          hideLoading();
+          toast(sessData.reason || sessData.detail || 'Could not start game session — try again or rescan QR', 'error', 5000);
+          console.warn('session/start:', sessData);
+          return;
         }
       } catch (e) { console.warn('Session start:', e); }
+      if (dbUser?.id && !S.session?.id) {
+        hideLoading();
+        toast('No game session — check connection and try again', 'error', 5000);
+        return;
+      }
       await startGame();
       hideLoading();
     }
@@ -5594,7 +5623,7 @@
       if (!S.answeredIds || !S.answeredIds.length) S.answeredIds = getAnsweredQuestions(S.session?.id || '');
       if (tg) tg.HapticFeedback?.impactOccurred('medium');
 
-      if (dbUser?.id && !S.session) {
+      if (dbUser?.id && !S.session?.id) {
         try {
           const r = await fetch(API_BASE + '/shamo/api/game/session/start', {
             method: 'POST',
@@ -5616,6 +5645,11 @@
             }
           }
         } catch (e) { console.warn('Session:', e); }
+      }
+
+      if (dbUser?.id && !S.session?.id) {
+        toast('Game session missing — rescan the QR or re-open the game', 'error', 5000);
+        return;
       }
 
       S.questions = S.questions.filter(q => !S.answeredIds.includes(q.id));
@@ -5652,11 +5686,15 @@
       const opts = shuffleArray(q.options || []);
       // Keep display order for answerQ() so correct-option highlight matches DOM indices
       q._displayOpts = opts;
-      document.getElementById('qOpts').innerHTML = opts.map((o, i) => `
-    <div class="q-opt" id="opt${i}" onclick="answerQ(${i},'${o.id}')">
+      document.getElementById('qOpts').innerHTML = opts.map((o, i) => {
+        const letter = String(o.option_letter != null ? o.option_letter : letters[i]).trim().charAt(0).toUpperCase();
+        return `
+    <div class="q-opt" id="opt${i}" role="button" tabindex="0"
+      data-idx="${i}" data-opt-id="${escapeAttr(o.id)}" data-letter="${escapeAttr(letter)}">
       <div class="q-opt-ltr">${letters[i]}</div>
-      <div class="q-opt-txt">${o.option_text}</div>
-    </div>`).join('');
+      <div class="q-opt-txt">${(o.option_text || '').replace(/</g, '&lt;')}</div>
+    </div>`;
+      }).join('');
       // Countdown seconds from Admin → Settings (e.g. 5 = timer shows 5, 4, 3, 2, 1, 0)
       const QUESTION_SEC = Math.max(3, Math.min(30, (S.gameConfig && S.gameConfig.seconds_per_question) || 4));
       let t = QUESTION_SEC;
@@ -5695,13 +5733,16 @@
       qOv.classList.add('show');
     }
 
-    async function answerQ(chosen, optId) {
+    async function answerQ(chosen, optId, optLetter) {
       const qOv = document.getElementById('qOv');
       clearInterval(qOv._timer);
       document.querySelectorAll('.q-opt').forEach(o => o.classList.add('disabled'));
       const ms = Math.round(Date.now() - qOv._started);
       const q = S.questions[S.currentQIndex];
       const cur = S.currentQIndex + 1;
+      const disp = q._displayOpts || q.options || [];
+      const picked = disp[chosen] || {};
+      const letter = (optLetter || picked.option_letter || '').toString().trim().charAt(0).toUpperCase();
 
       // RULE 2: Mark this question as answered immediately (used once, never again)
       markQuestionAnswered(S.session?.id || 'local', q.id);
@@ -5720,7 +5761,8 @@
               user_id: dbUser.id,
               game_id: S.activeGame.id,
               question_id: q.id,
-              selected_option_id: optId,
+              selected_option_id: optId || null,
+              selected_option_letter: letter && 'ABCD'.includes(letter) ? letter : null,
               question_number: cur,
               time_taken_ms: ms
             })
@@ -5735,10 +5777,11 @@
           if (ansData.session) S.session = ansData.session;
           if (typeof ansData.wrong_count === 'number') S.wrongCount = ansData.wrong_count;
         } catch (e) { console.warn('Answer submit:', e); }
+      } else if (dbUser?.id && !S.session?.id) {
+        toast('No session — cannot save answer. Rescan QR.', 'error', 4000);
       }
 
       // Visual feedback (use shuffled order stored on q — not raw q.options)
-      const disp = q._displayOpts || q.options || [];
       document.getElementById('opt' + chosen).classList.add(isCorrect ? 'correct' : 'wrong');
       if (!isCorrect) playWrongSound();
       if (!isCorrect && correctOptionId) {

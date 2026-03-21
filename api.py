@@ -55,6 +55,7 @@ from redis_client import (
     get_leaderboard,
     check_rate_limit,
     clear_prize_pool_cache,
+    clear_shamo_transient_keys,
 )
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -173,12 +174,42 @@ async def _get_active_spin_balance(sb: Client, user_id: str) -> float:
         return _extract_rpc_scalar(res.data)
     except Exception as e:
         logger.warning("get_spin_total_simple: %s", e)
-    # 3) Table: user_id only
+    # 3) Table: user_id only (amount_etb — extended schema)
     try:
         res = await run(lambda: sb.table("spin_results").select("amount_etb").eq("user_id", uid).execute())
         return sum(float(r.get("amount_etb") or 0) for r in (res.data or []))
     except Exception as e:
-        logger.warning("spin_results table: %s", e)
+        logger.warning("spin_results amount_etb: %s", e)
+    # 4) One-click / base schema: amount_won
+    try:
+        res = await run(lambda: sb.table("spin_results").select("amount_won").eq("user_id", uid).execute())
+        return sum(float(r.get("amount_won") or 0) for r in (res.data or []))
+    except Exception as e:
+        logger.warning("spin_results amount_won: %s", e)
+    return 0.0
+
+
+async def _sum_completed_withdrawals(sb: Client, uid: str) -> float:
+    """Sum completed withdrawal payouts. Schema may use `amount` (one-click) or `amount_paid` (extended)."""
+    u = str(uid).strip()
+    if not u:
+        return 0.0
+    for col in ("amount", "amount_paid"):
+        try:
+            wds = await run(
+                lambda c=col: sb.table("withdrawals")
+                .select(c)
+                .eq("user_id", u)
+                .eq("status", "completed")
+                .execute()
+            )
+            return sum(float(r.get(col) or 0) for r in (wds.data or []))
+        except Exception as e:
+            err = str(e).lower()
+            if "does not exist" in err or "42703" in err:
+                continue
+            logger.warning("_sum_completed_withdrawals %s: %s", col, e)
+            continue
     return 0.0
 
 
@@ -240,6 +271,20 @@ def _is_missing_column_pgrst(exc: BaseException, column: str) -> bool:
     return "pgrst204" in low or "schema cache" in low or "could not find" in low
 
 
+def _is_postgres_unique_violation(exc: BaseException) -> bool:
+    """Detect duplicate key / unique index violations from PostgREST/Postgres."""
+    parts: List[str] = [str(exc)]
+    raw = getattr(exc, "_raw_error", None)
+    if isinstance(raw, dict):
+        parts.append(str(raw.get("message", "") or ""))
+        parts.append(str(raw.get("code", "") or ""))
+    if getattr(exc, "args", None):
+        for a in exc.args:
+            parts.append(str(a))
+    blob = " ".join(parts).lower()
+    return "23505" in blob or "duplicate key" in blob or "unique constraint" in blob
+
+
 def _pgrst204_missing_column_name(exc: BaseException) -> Optional[str]:
     """Extract column name from PostgREST PGRST204 message, e.g. \"Could not find the 'max_prize_etb' column\"."""
     raw = getattr(exc, "_raw_error", None)
@@ -258,6 +303,7 @@ def _games_payload_drop_keys(payload: dict, keys: set[str]) -> dict:
 
 # Columns safe to send on INSERT — excludes deposit_id until migration 018 is applied & PostgREST cache refreshed.
 _GAMES_INSERT_KEYS = frozenset({
+    "id",
     "title",
     "description",
     "status",
@@ -286,6 +332,28 @@ _GAMES_INSERT_KEYS = frozenset({
 def _games_insert_payload(payload: dict) -> dict:
     """Only keys that exist on typical games rows — never deposit_id or stray client fields."""
     return {k: v for k, v in payload.items() if k in _GAMES_INSERT_KEYS}
+
+
+def _supabase_insert_execute_only(sb: Client, table: str, row: dict) -> None:
+    """
+    INSERT only — never chain .select() after .insert(). supabase-py 1.x insert builders
+    raise AttributeError on .select(); hasattr(..., 'select') is not reliable.
+    """
+    sb.table(table).insert(row).execute()
+
+
+def _postgrest_error_detail(exc: BaseException) -> Optional[str]:
+    """Human-readable PostgREST / API error message for HTTP responses."""
+    raw = getattr(exc, "_raw_error", None)
+    if isinstance(raw, dict):
+        for key in ("message", "error_description", "hint"):
+            v = raw.get(key)
+            if v:
+                return str(v)
+    msg = getattr(exc, "message", None)
+    if msg:
+        return str(msg)
+    return str(exc) if exc is not None else None
 
 
 def _normalize_question_level_for_game(row: dict) -> str:
@@ -615,6 +683,22 @@ class DenyReq(BaseModel):
 class SettingUpdate(BaseModel):
     settings: Dict[str, Any]
 
+
+CLEAR_TESTING_DATA_PHRASE = "CLEAR_ALL_TEST_DATA"
+
+
+class ClearTestingDataReq(BaseModel):
+    """Danger-zone wipe: requires exact confirmation string."""
+    confirmation: str
+    clear_games: bool = True
+    clear_qr: bool = True
+    clear_deposits: bool = True
+    clear_companies: bool = True
+    clear_non_admin_users: bool = True
+    clear_question_bank: bool = False
+    clear_audit_log: bool = False
+    flush_redis_transient: bool = True
+
 class QRCreateReq(BaseModel):
     game_id: str; company_id: Optional[str] = None; label: Optional[str] = None
     base_url: str; max_scans: int = 0; expiry_hours: int = 24
@@ -631,7 +715,10 @@ class SessionStartReq(BaseModel):
 
 class AnswerReq(BaseModel):
     session_id: str; user_id: str; game_id: str
-    question_id: str; selected_option_id: Optional[str] = None
+    question_id: str
+    selected_option_id: Optional[str] = None
+    # Fallback when client UUID is mangled in HTML / PostgREST returns different id shape
+    selected_option_letter: Optional[str] = None
     question_number: int; time_taken_ms: Optional[int] = None
 
 class SpinReq(BaseModel):
@@ -1147,34 +1234,56 @@ async def player_balance_summary(uid: str, telegram_id: Optional[int] = None):
     available_balance = total_earned
 
     # 2) Total withdrawn (completed only, for display)
-    wds_done = await run(lambda: sb.table("withdrawals").select("amount_paid").eq("user_id", uid).eq("status", "completed").execute())
-    total_withdrawn = sum(float(r.get("amount_paid") or 0) for r in (wds_done.data or []))
+    total_withdrawn = await _sum_completed_withdrawals(sb, uid)
 
-    # 3) Spin rows for breakdown (w-status='active' only)
-    try:
-        q = sb.table("spin_results").select(
-            "amount_etb,segment_label,question_number,game_id,spun_at,games!spin_results_game_id_fkey(title)"
-        ).eq("user_id", uid).eq("w-status", "active").order("spun_at")
-        spins_res = await run(lambda: q.execute())
-        active_rows = spins_res.data or []
-    except Exception:
+    # 3) Spin rows for breakdown (extended: w-status + amount_etb + question_number; base: amount_won + level)
+    active_rows: list = []
+    _spin_selects = (
+        (
+            "amount_etb,segment_label,question_number,game_id,spun_at,games!spin_results_game_id_fkey(title)",
+            True,
+        ),
+        (
+            "amount_etb,segment_label,question_number,game_id,spun_at,games!spin_results_game_id_fkey(title)",
+            False,
+        ),
+        (
+            "amount_won,segment_label,level,game_id,spun_at,games!spin_results_game_id_fkey(title)",
+            False,
+        ),
+    )
+    for sel, use_w_active in _spin_selects:
         try:
-            spins_res = await run(lambda: sb.table("spin_results").select(
-                "amount_etb,segment_label,question_number,game_id,spun_at,games!spin_results_game_id_fkey(title)"
-            ).eq("user_id", uid).order("spun_at").execute())
+            q = (
+                sb.table("spin_results")
+                .select(sel)
+                .eq("user_id", uid)
+                .order("spun_at")
+            )
+            if use_w_active:
+                q = q.eq("w-status", "active")
+            spins_res = await run(lambda qq=q: qq.execute())
             active_rows = spins_res.data or []
+            if active_rows:
+                break
         except Exception:
-            active_rows = []
+            continue
     # Build active_spins array: segment_amount_ETB per spin
     active_spins = []
     for r in active_rows:
         g = r.get("games") or {}
+        amt = r.get("amount_etb")
+        if amt is None:
+            amt = r.get("amount_won")
+        qn = r.get("question_number")
+        if qn is None:
+            qn = r.get("level")
         active_spins.append({
             "segment_label": r.get("segment_label") or "",
-            "amount_etb": round(float(r.get("amount_etb") or 0), 2),
+            "amount_etb": round(float(amt or 0), 2),
             "game_id": r.get("game_id"),
             "game_title": g.get("title") or "Game",
-            "question_number": r.get("question_number"),
+            "question_number": qn,
         })
     return {
         "user": {
@@ -1861,6 +1970,104 @@ def _delete_game_cascade_sync(sb: Client, gid: str) -> None:
     sb.table("games").delete().eq("id", gid).execute()
 
 
+def _delete_all_rows_by_id_sync(sb: Client, table: str, batch: int = 200) -> int:
+    """Delete every row from table (must have id column). Returns rows removed."""
+    n = 0
+    while True:
+        res = sb.table(table).select("id").limit(batch).execute()
+        rows = res.data or []
+        if not rows:
+            break
+        ids = [str(r["id"]) for r in rows]
+        for i in range(0, len(ids), 120):
+            sb.table(table).delete().in_("id", ids[i : i + 120]).execute()
+        n += len(ids)
+    return n
+
+
+def _delete_all_qr_scans_sync(sb: Client, batch: int = 200) -> int:
+    n = 0
+    while True:
+        res = _pg_table(sb, "qr_scans").select("id").limit(batch).execute()
+        rows = res.data or []
+        if not rows:
+            break
+        ids = [str(r["id"]) for r in rows]
+        for i in range(0, len(ids), 120):
+            _pg_table(sb, "qr_scans").delete().in_("id", ids[i : i + 120]).execute()
+        n += len(ids)
+    return n
+
+
+def _delete_all_qr_codes_sync(sb: Client, batch: int = 200) -> int:
+    n = 0
+    while True:
+        res = _pg_table(sb, "qr_codes").select("id").limit(batch).execute()
+        rows = res.data or []
+        if not rows:
+            break
+        ids = [str(r["id"]) for r in rows]
+        for i in range(0, len(ids), 120):
+            _pg_table(sb, "qr_codes").delete().in_("id", ids[i : i + 120]).execute()
+        n += len(ids)
+    return n
+
+
+def _purge_users_batch_sync(sb: Client, uids: List[str], admin_id: Optional[str]) -> None:
+    """Remove user rows and direct FK dependents (bulk). Call after games/companies/deposits cleared."""
+    if not uids:
+        return
+    CHUNK = 80
+    for i in range(0, len(uids), CHUNK):
+        chunk = uids[i : i + CHUNK]
+        sb.table("game_sessions").delete().in_("user_id", chunk).execute()
+        sb.table("transactions").delete().in_("user_id", chunk).execute()
+        sb.table("round_answers").delete().in_("user_id", chunk).execute()
+        sb.table("spin_results").delete().in_("user_id", chunk).execute()
+        try:
+            _pg_table(sb, "qr_scans").delete().in_("user_id", chunk).execute()
+        except Exception:
+            pass
+        sb.table("leaderboard").delete().in_("user_id", chunk).execute()
+        sb.table("withdrawals").delete().in_("user_id", chunk).execute()
+        sb.table("notifications").delete().in_("user_id", chunk).execute()
+        if admin_id:
+            try:
+                sb.table("questions").update({"created_by": admin_id}).in_("created_by", chunk).execute()
+            except Exception:
+                pass
+            try:
+                sb.table("games").update({"created_by": admin_id}).in_("created_by", chunk).execute()
+            except Exception:
+                pass
+            try:
+                _pg_table(sb, "qr_codes").update({"created_by": admin_id}).in_("created_by", chunk).execute()
+            except Exception:
+                pass
+        try:
+            sb.table("questions").update({"reviewed_by": None}).in_("reviewed_by", chunk).execute()
+        except Exception:
+            pass
+        try:
+            sb.table("company_deposits").update({"confirmed_by": None}).in_("confirmed_by", chunk).execute()
+        except Exception:
+            pass
+        try:
+            sb.table("withdrawals").update({"processed_by": None}).in_("processed_by", chunk).execute()
+        except Exception:
+            pass
+        try:
+            sb.table("audit_log").update({"actor_id": None}).in_("actor_id", chunk).execute()
+        except Exception:
+            pass
+        try:
+            sb.table("platform_config").update({"updated_by": None}).in_("updated_by", chunk).execute()
+        except Exception:
+            pass
+        sb.table("companies").delete().in_("owner_id", chunk).execute()
+        sb.table("users").delete().in_("id", chunk).execute()
+
+
 @app.get("/api/games")
 async def list_games(
     request: Request, _=Depends(require_admin),
@@ -1941,18 +2148,105 @@ async def create_game(body: GameCreate, _=Depends(require_admin)):
     sb = get_sb()
     admin = await run(lambda: sb.table("users").select("id").eq("role", "admin").limit(1).execute())
     created_by = (admin.data or [{}])[0].get("id")
+    if not created_by:
+        u0 = await run(
+            lambda: sb.table("users").select("id").eq("telegram_id", 0).limit(1).execute()
+        )
+        created_by = (u0.data or [{}])[0].get("id")
+    if not created_by:
+        raise HTTPException(
+            503,
+            "Cannot create games: add a user with role='admin' (or telegram_id=0 platform user) in the database.",
+        )
     payload = body.dict()
     payload["created_by"] = created_by
     payload["company_id"] = payload["company_id"] or None
     payload["prize_pool_remaining"] = payload["prize_pool_etb"]
 
-    # Auto-create a confirmed deposit when a company game is created with a prize pool
     deposit_id = payload.get("deposit_id") or None
+
+    # Company games: title must differ from other draft / scheduled / active games (case-insensitive).
+    cid = payload["company_id"]
+    title_raw = (payload.get("title") or "").strip()
+    if cid and title_raw:
+        clash = await run(
+            lambda: sb.table("games")
+            .select("id,title")
+            .eq("company_id", cid)
+            .in_("status", ["draft", "scheduled", "active"])
+            .execute()
+        )
+        tnorm = title_raw.lower()
+        for row in clash.data or []:
+            if (row.get("title") or "").strip().lower() == tnorm:
+                raise HTTPException(
+                    400,
+                    "This company already has a game with this title (draft, scheduled, or active). "
+                    "Use a different title.",
+                )
+
+    # deposit_id links to company_deposits — omit from INSERT (whitelist); optional UPDATE after row exists.
+    insert_payload: dict = dict(_games_insert_payload(payload))
+    # Deterministic id when supported: reliable fetch after insert (no .insert().select()).
+    game_uuid: Optional[str] = str(uuid.uuid4())
+    insert_payload["id"] = game_uuid
+
+    # 1) Insert game FIRST so we never leave an orphan deposit if insert fails.
+    for _attempt in range(32):
+        try:
+            p = dict(insert_payload)
+
+            await run(lambda pl=p: _supabase_insert_execute_only(sb, "games", pl))
+            break
+        except Exception as e:
+            col = _pgrst204_missing_column_name(e)
+            if col and col in insert_payload:
+                logger.warning("games.create: column %r not in schema — omitting from insert.", col)
+                insert_payload = _games_payload_drop_keys(insert_payload, {col})
+                if col == "id":
+                    game_uuid = None  # fall back to select by created_by + created_at
+                continue
+            if _is_postgres_unique_violation(e) and "idx_games_date_company" in str(e).lower():
+                raise HTTPException(
+                    409,
+                    "This database still limits one game per company per calendar day. "
+                    "Run migration migrations/027_games_allow_multiple_per_company_date.sql (drop index idx_games_date_company).",
+                ) from e
+            logger.exception("games.create: insert failed")
+            raise HTTPException(400, _postgrest_error_detail(e) or str(e)) from e
+    else:
+        raise HTTPException(500, "games insert failed after omitting unknown columns")
+
+    if game_uuid:
+        res = await run(
+            lambda gid=game_uuid: sb.table("games").select("*").eq("id", gid).limit(1).execute()
+        )
+    else:
+        res = await run(
+            lambda: sb.table("games")
+            .select("*")
+            .eq("created_by", created_by)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+    game_row = (res.data or [{}])[0]
+    game_id = str(game_row.get("id") or "") if game_row else ""
+
+    if not game_id:
+        raise HTTPException(
+            500,
+            "Game insert appeared to succeed but the row could not be read — check RLS, schema, and service key.",
+        )
+
+    # 2) Auto deposit + credit only after the game row exists (rollback game if this fails).
     if payload["company_id"] and payload["prize_pool_etb"] and not deposit_id:
         prize = float(payload["prize_pool_etb"])
         commission_pct = float(payload.get("platform_fee_pct") or 15.0)
         commission_etb = round(prize * commission_pct / 100, 2)
+        dep_uuid = str(uuid.uuid4())
         dep_payload = {
+            "id": dep_uuid,
             "company_id": payload["company_id"],
             "amount_etb": prize,
             "commission_pct": commission_pct,
@@ -1961,54 +2255,88 @@ async def create_game(body: GameCreate, _=Depends(require_admin)):
             "status": "confirmed",
         }
         try:
-            await run(lambda: sb.table("company_deposits").insert(dep_payload).execute())
-            dep_res = await run(lambda: sb.table("company_deposits")
+
+            def _dep_ins():
+                pl = dict(dep_payload)
+                _supabase_insert_execute_only(sb, "company_deposits", pl)
+
+            await run(_dep_ins)
+            dep_one = await run(
+                lambda did=dep_uuid: sb.table("company_deposits")
                 .select("id")
-                .eq("company_id", payload["company_id"])
-                .eq("status", "confirmed")
-                .order("created_at", desc=True)
+                .eq("id", did)
                 .limit(1)
-                .execute())
-            if dep_res.data:
-                deposit_id = dep_res.data[0].get("id")
-                # Deduct from company credit_balance
-                co_res = await run(lambda: sb.table("companies").select("credit_balance").eq("id", payload["company_id"]).single().execute())
-                current = float((co_res.data or {}).get("credit_balance") or 0)
-                new_bal = max(0.0, current - prize)
-                await run(lambda: sb.table("companies").update({"credit_balance": new_bal}).eq("id", payload["company_id"]).execute())
-        except Exception:
-            pass  # deposit creation is non-blocking — game still gets created
+                .execute()
+            )
+            if dep_one.data:
+                deposit_id = str(dep_one.data[0].get("id"))
+            if not deposit_id:
+                dep_res = await run(
+                    lambda: sb.table("company_deposits")
+                    .select("id")
+                    .eq("company_id", payload["company_id"])
+                    .eq("status", "confirmed")
+                    .order("created_at", desc=True)
+                    .limit(1)
+                    .execute()
+                )
+                if dep_res.data:
+                    deposit_id = str(dep_res.data[0].get("id"))
+            if not deposit_id:
+                raise RuntimeError("company_deposits insert did not return an id")
 
-    # deposit_id links to company_deposits — omit from INSERT (whitelist); optional UPDATE after row exists.
-    insert_payload: dict = dict(_games_insert_payload(payload))
-
-    # Legacy DBs / stale PostgREST cache: strip any column PostgREST rejects (PGRST204) and retry.
-    for _attempt in range(32):
-        try:
-            p = dict(insert_payload)
-            await run(lambda pl=p: sb.table("games").insert(pl).execute())
-            break
+            co_res = await run(
+                lambda: sb.table("companies")
+                .select("credit_balance")
+                .eq("id", payload["company_id"])
+                .single()
+                .execute()
+            )
+            current = float((co_res.data or {}).get("credit_balance") or 0)
+            new_bal = max(0.0, current - prize)
+            await run(
+                lambda: sb.table("companies")
+                .update({"credit_balance": new_bal})
+                .eq("id", payload["company_id"])
+                .execute()
+            )
         except Exception as e:
-            col = _pgrst204_missing_column_name(e)
-            if col and col in insert_payload:
-                logger.warning("games.create: column %r not in schema — omitting from insert.", col)
-                insert_payload = _games_payload_drop_keys(insert_payload, {col})
-                continue
-            raise
-    else:
-        raise HTTPException(500, "games insert failed after omitting unknown columns")
+            logger.exception("create_game: deposit/balance failed after game insert; rolling back game %s", game_id)
+            try:
+                await run(lambda g=game_id: _delete_game_cascade_sync(sb, g))
+            except Exception as e2:
+                logger.error("create_game: rollback failed for game %s: %s", game_id, e2)
+            if _is_missing_relation_error(e, "company_deposits"):
+                raise HTTPException(
+                    503,
+                    "company_deposits table missing or unreachable — game was not kept. Run deposits migration.",
+                ) from e
+            raise HTTPException(
+                500,
+                f"Could not record deposit or update company balance; game was not created. ({e})",
+            ) from e
 
-    res = await run(lambda: sb.table("games").select("*").eq("created_by", created_by).order("created_at", desc=True).limit(1).execute())
-    game_row = (res.data or [{}])[0]
-    if deposit_id and game_row.get("id"):
+    if deposit_id:
         try:
-            gid, did = game_row["id"], deposit_id
+            gid, did = game_id, deposit_id
             await run(lambda: sb.table("games").update({"deposit_id": did}).eq("id", gid).execute())
         except Exception as e:
             if _is_missing_column_pgrst(e, "deposit_id"):
                 logger.info("games.deposit_id: column not in schema — skipped (run migrations/018_games_deposit_id.sql).")
             else:
-                logger.warning("games.deposit_id update skipped: %s", e)
+                logger.exception("games.deposit_id update failed; rolling back game %s", game_id)
+                try:
+                    await run(lambda g=game_id: _delete_game_cascade_sync(sb, g))
+                except Exception as e2:
+                    logger.error("create_game: rollback after deposit_id failure: %s", e2)
+                raise HTTPException(
+                    500,
+                    f"Game created but linking deposit_id failed; game was removed. ({e})",
+                ) from e
+        # Refresh row for response
+        fres = await run(lambda: sb.table("games").select("*").eq("id", game_id).limit(1).execute())
+        if fres.data:
+            game_row = fres.data[0]
 
     game_data = normalize_game_prize_fields(game_row)
     if deposit_id:
@@ -2021,6 +2349,31 @@ async def update_game(gid: str, body: GameUpdate, _=Depends(require_admin)):
     updates = body.dict(exclude_none=True)
     if not updates: raise HTTPException(400, "Nothing to update")
     sb = get_sb()
+    if "title" in updates:
+        new_title = (updates.get("title") or "").strip()
+        if new_title:
+            gcur = await run(
+                lambda: sb.table("games").select("company_id").eq("id", gid).limit(1).execute()
+            )
+            crow = (gcur.data or [{}])[0]
+            ccid = crow.get("company_id")
+            if ccid:
+                clash = await run(
+                    lambda: sb.table("games")
+                    .select("id,title")
+                    .eq("company_id", ccid)
+                    .in_("status", ["draft", "scheduled", "active"])
+                    .execute()
+                )
+                tnorm = new_title.lower()
+                for row in clash.data or []:
+                    if str(row.get("id")) == str(gid):
+                        continue
+                    if (row.get("title") or "").strip().lower() == tnorm:
+                        raise HTTPException(
+                            400,
+                            "Another game for this company already uses this title. Choose a different title.",
+                        )
     u: dict = dict(updates)
     for _attempt in range(32):
         try:
@@ -2035,6 +2388,12 @@ async def update_game(gid: str, body: GameUpdate, _=Depends(require_admin)):
                 if not u:
                     raise HTTPException(400, "No updatable fields left for this database schema") from e
                 continue
+            if _is_postgres_unique_violation(e) and "idx_games_date_company" in str(e).lower():
+                raise HTTPException(
+                    409,
+                    "Database still enforces one game per company per calendar day. "
+                    "Run migrations/027_games_allow_multiple_per_company_date.sql.",
+                ) from e
             raise
     else:
         raise HTTPException(500, "games update failed after omitting unknown columns")
@@ -2258,6 +2617,57 @@ async def create_question(body: QuestionCreate, _=Depends(require_admin)):
 
 
 # ─── AI question generation (Anthropic Claude) ─────────────────────────────────
+def _extract_httpx_status_error(exc: BaseException) -> Optional[_httpx.HTTPStatusError]:
+    """Anthropic SDK often wraps httpx.HTTPStatusError in __cause__ / __context__."""
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, _httpx.HTTPStatusError):
+            return cur
+        cur = cur.__cause__ or cur.__context__
+    return None
+
+
+def _anthropic_api_error_from_response(resp: Any) -> HTTPException:
+    """Map a httpx-like response (status + body) to a FastAPI error."""
+    code = int(getattr(resp, "status_code", 0) or 0)
+    try:
+        body = (getattr(resp, "text", None) or "").strip()[:900]
+    except Exception:
+        body = ""
+    if code == 401:
+        return HTTPException(
+            502,
+            "Anthropic API key rejected (401). Set a valid ANTHROPIC_API_KEY in .env (Console → API keys).",
+        )
+    if code == 403:
+        return HTTPException(
+            502,
+            "Anthropic returned 403 Forbidden — usually: invalid/revoked API key, billing not enabled, "
+            "or this model is not allowed on your account. Check https://console.anthropic.com — "
+            f"model in .env: {ANTHROPIC_MODEL}. "
+            + (f" API says: {body}" if body else ""),
+        )
+    if code == 404:
+        return HTTPException(
+            502,
+            f"Claude model not found (404). Set ANTHROPIC_MODEL to a model your key can use (current: {ANTHROPIC_MODEL}). "
+            + (body or ""),
+        )
+    if code == 429:
+        return HTTPException(
+            429,
+            "Claude rate limit (429). Wait and retry, or reduce question count.",
+        )
+    return HTTPException(502, f"Claude API error {code}. " + (body or ""))
+
+
+def _anthropic_api_error_response(http_e: _httpx.HTTPStatusError) -> HTTPException:
+    """Backward-compatible wrapper for httpx.HTTPStatusError."""
+    return _anthropic_api_error_from_response(http_e.response)
+
+
 def _generate_questions_via_claude(
     categories: List[str],
     difficulty: str,
@@ -2320,13 +2730,15 @@ def _generate_questions_via_claude(
             "Connection to Claude failed (network or proxy dropped). Try again, use fewer questions (e.g. 5), or disable proxy for this app."
         ) from e
     except _httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            raise HTTPException(
-                502,
-                "Claude model not found (404). Set ANTHROPIC_MODEL in .env to a valid model id (e.g. claude-opus-4-6)."
-            ) from e
-        raise HTTPException(502, f"Claude API error: {e.response.status_code}") from e
+        raise _anthropic_api_error_response(e) from e
     except Exception as e:
+        http_e = _extract_httpx_status_error(e)
+        if http_e is not None:
+            raise _anthropic_api_error_response(http_e) from e
+        # Anthropic SDK often raises APIStatusError with .response; may use raise ... from None (no __cause__ chain).
+        resp = getattr(e, "response", None)
+        if resp is not None and getattr(resp, "status_code", None) is not None:
+            raise _anthropic_api_error_from_response(resp) from e
         if type(e).__name__ == "APIConnectionError" or "connection" in str(e).lower() or "disconnected" in str(e).lower():
             raise HTTPException(
                 502,
@@ -2336,7 +2748,8 @@ def _generate_questions_via_claude(
             raise HTTPException(502, "Claude model not found (404). Set ANTHROPIC_MODEL in .env to a valid model id (e.g. claude-opus-4-6).") from e
         if "404" in str(e) or "not_found" in str(e).lower():
             raise HTTPException(502, "Claude model not found (404). Set ANTHROPIC_MODEL in .env to a valid model id (e.g. claude-opus-4-6).") from e
-        raise
+        logger.exception("Claude generate_questions: unexpected error")
+        raise HTTPException(502, f"Claude request failed: {type(e).__name__}: {e}") from e
     text = ""
     for block in (msg.content or []):
         if getattr(block, "text", None):
@@ -3106,6 +3519,308 @@ async def update_settings(body: SettingUpdate, _=Depends(require_admin)):
         await run(lambda r=row: sb.table("platform_config").upsert(r, on_conflict="key").execute())
     return {"message": "Settings saved", "updated": list(body.settings.keys())}
 
+
+@app.post("/api/admin/clear-testing-data")
+async def admin_clear_testing_data(body: ClearTestingDataReq, _=Depends(require_admin)):
+    """
+    Remove testing data in FK-safe order. Preserves every user where:
+    role == 'admin', OR telegram_id == 0, OR telegram_username (case-insensitive) == 'admin'.
+    Requires body.confirmation == CLEAR_ALL_TEST_DATA.
+    """
+    if (body.confirmation or "").strip() != CLEAR_TESTING_DATA_PHRASE:
+        raise HTTPException(
+            400,
+            f'Type the exact phrase "{CLEAR_TESTING_DATA_PHRASE}" to confirm.',
+        )
+    if not any(
+        [
+            body.clear_games,
+            body.clear_qr,
+            body.clear_deposits,
+            body.clear_companies,
+            body.clear_non_admin_users,
+            body.clear_question_bank,
+            body.clear_audit_log,
+            body.flush_redis_transient,
+        ]
+    ):
+        raise HTTPException(400, "Enable at least one clear option.")
+
+    sb = get_sb()
+    steps: List[Dict[str, Any]] = []
+
+    def _step(name: str, ok: bool, detail: str, extra: Optional[Dict] = None):
+        row: Dict[str, Any] = {"step": name, "ok": ok, "detail": detail}
+        if extra:
+            row.update(extra)
+        steps.append(row)
+
+    # ── Resolve preserved users + primary admin id for FK reassign ─────────────
+    preserved_ids: set[str] = set()
+    admin_id: Optional[str] = None
+    offset = 0
+    page_sz = 400
+    while True:
+        res = await run(
+            lambda o=offset: sb.table("users")
+            .select("id,role,telegram_id,telegram_username")
+            .range(o, o + page_sz - 1)
+            .execute()
+        )
+        rows = res.data or []
+        if not rows:
+            break
+        for row in rows:
+            uid = str(row["id"])
+            if row.get("role") == "admin":
+                preserved_ids.add(uid)
+                admin_id = admin_id or uid
+            if row.get("telegram_id") == 0:
+                preserved_ids.add(uid)
+                admin_id = admin_id or uid
+            un = (row.get("telegram_username") or "").strip().lower()
+            if un == "admin":
+                preserved_ids.add(uid)
+                admin_id = admin_id or uid
+        if len(rows) < page_sz:
+            break
+        offset += page_sz
+
+    if body.clear_non_admin_users and not preserved_ids:
+        raise HTTPException(
+            400,
+            "No preserved accounts (admin role, telegram_id=0, or @admin). "
+            "Refusing to delete users.",
+        )
+    if body.clear_non_admin_users and not admin_id:
+        raise HTTPException(
+            400,
+            "Could not resolve an admin user id for FK safety. Add a user with role=admin.",
+        )
+
+    # ── 1) Games (cascade QR tied to games, sessions, etc.) ───────────────────
+    if body.clear_games:
+        try:
+            game_ids: List[str] = []
+            go = 0
+            while True:
+                gr = await run(
+                    lambda o=go: sb.table("games")
+                    .select("id")
+                    .range(o, o + page_sz - 1)
+                    .execute()
+                )
+                chunk = gr.data or []
+                if not chunk:
+                    break
+                game_ids.extend(str(g["id"]) for g in chunk)
+                if len(chunk) < page_sz:
+                    break
+                go += page_sz
+            failed_g: List[str] = []
+            for gid in game_ids:
+                try:
+                    await run(lambda g=gid: _delete_game_cascade_sync(sb, g))
+                except Exception as e:
+                    logger.warning("clear-testing game %s: %s", gid, e)
+                    failed_g.append(gid)
+            _step(
+                "games",
+                len(failed_g) == 0,
+                f"Removed {len(game_ids) - len(failed_g)} game(s)" + (f"; failed {len(failed_g)}" if failed_g else ""),
+                {"count": len(game_ids) - len(failed_g), "failed": failed_g[:20]},
+            )
+        except Exception as e:
+            logger.exception("clear-testing games")
+            _step("games", False, str(e))
+
+    # ── 2) Remaining QR rows ────────────────────────────────────────────────
+    if body.clear_qr:
+        try:
+            n_scan = await run(lambda: _delete_all_qr_scans_sync(sb))
+            n_code = await run(lambda: _delete_all_qr_codes_sync(sb))
+            _step("qr", True, f"Deleted {n_scan} scan row(s), {n_code} QR code row(s).", {"scans": n_scan, "codes": n_code})
+        except Exception as e:
+            if _is_missing_relation_error(e, "qr_scans") or "qr_scans" in str(e).lower():
+                try:
+                    n_code = await run(lambda: _delete_all_qr_codes_sync(sb))
+                    _step("qr", True, f"qr_scans missing; removed {n_code} QR code row(s).", {"codes": n_code})
+                except Exception as e2:
+                    _step("qr", False, str(e2))
+            else:
+                _step("qr", False, str(e))
+
+    # ── 3) Deposits (before companies — RESTRICT) ────────────────────────────
+    if body.clear_deposits:
+        try:
+            n = await run(lambda: _delete_all_rows_by_id_sync(sb, "company_deposits"))
+            _step("company_deposits", True, f"Deleted {n} deposit row(s).", {"count": n})
+        except Exception as e:
+            if _is_missing_relation_error(e, "company_deposits"):
+                _step("company_deposits", True, "Table not present — skipped.", {"skipped": True})
+            else:
+                _step("company_deposits", False, str(e))
+
+    # ── 4) Companies ─────────────────────────────────────────────────────────
+    if body.clear_companies:
+        try:
+            n = await run(lambda: _delete_all_rows_by_id_sync(sb, "companies"))
+            _step("companies", True, f"Deleted {n} company row(s).", {"count": n})
+        except Exception as e:
+            _step("companies", False, str(e))
+
+    # ── 5) Question bank (optional) ──────────────────────────────────────────
+    if body.clear_question_bank:
+        try:
+            nq = 0
+            while True:
+                qr = await run(lambda: sb.table("questions").select("id").limit(200).execute())
+                qrows = qr.data or []
+                if not qrows:
+                    break
+                ids = [str(r["id"]) for r in qrows]
+                await run(
+                    lambda ids=ids: sb.table("game_questions").delete().in_("question_id", ids).execute()
+                )
+                await run(lambda ids=ids: sb.table("questions").delete().in_("id", ids).execute())
+                nq += len(ids)
+            _step("questions", True, f"Deleted {nq} question(s) (and links).", {"count": nq})
+        except Exception as e:
+            _step("questions", False, str(e))
+
+    # ── 6) Non-preserved users ───────────────────────────────────────────────
+    if body.clear_non_admin_users:
+        try:
+            to_delete: List[str] = []
+            uo = 0
+            while True:
+                ur = await run(
+                    lambda o=uo: sb.table("users").select("id").range(o, o + page_sz - 1).execute()
+                )
+                urows = ur.data or []
+                if not urows:
+                    break
+                for u in urows:
+                    uid = str(u["id"])
+                    if uid not in preserved_ids:
+                        to_delete.append(uid)
+                if len(urows) < page_sz:
+                    break
+                uo += page_sz
+            await run(lambda: _purge_users_batch_sync(sb, to_delete, admin_id))
+            _step("users", True, f"Deleted {len(to_delete)} non-admin user(s).", {"count": len(to_delete)})
+        except Exception as e:
+            logger.exception("clear-testing users")
+            _step("users", False, str(e))
+
+    # ── 7) Audit log (optional) ─────────────────────────────────────────────
+    if body.clear_audit_log:
+        try:
+            na = 0
+            while True:
+                ar = await run(lambda: sb.table("audit_log").select("id").limit(400).execute())
+                arows = ar.data or []
+                if not arows:
+                    break
+                aids = [r["id"] for r in arows]
+                await run(lambda aids=aids: sb.table("audit_log").delete().in_("id", aids).execute())
+                na += len(aids)
+            _step("audit_log", True, f"Deleted {na} audit row(s).", {"count": na})
+        except Exception as e:
+            if _is_missing_relation_error(e, "audit_log"):
+                _step("audit_log", True, "Table not present — skipped.", {"skipped": True})
+            else:
+                _step("audit_log", False, str(e))
+
+    # ── 8) Redis transient keys ──────────────────────────────────────────────
+    if body.flush_redis_transient:
+        try:
+            nkeys = await run(lambda: clear_shamo_transient_keys())
+            _step("redis", True, f"Removed {nkeys} Redis key(s).", {"count": nkeys})
+        except Exception as e:
+            _step("redis", False, str(e))
+
+    all_ok = all(s.get("ok") for s in steps)
+    return {
+        "ok": all_ok,
+        "phrase_required": CLEAR_TESTING_DATA_PHRASE,
+        "preserved_user_count": len(preserved_ids),
+        "steps": steps,
+    }
+
+
+@app.post("/api/admin/danger/reset-streaks")
+async def admin_reset_all_streaks(_=Depends(require_admin)):
+    """Set current_streak = 0 for all users."""
+    sb = get_sb()
+    try:
+        await run(
+            lambda: sb.table("users").update({"current_streak": 0}).neq("id", "00000000-0000-0000-0000-000000000000").execute()
+        )
+        return {"ok": True, "message": "All user streaks reset to 0."}
+    except Exception as e:
+        logger.exception("reset-streaks")
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/admin/danger/ban-inactive-zero-balance")
+async def admin_ban_inactive_zero_balance(_=Depends(require_admin)):
+    """
+    Ban users who never played, have zero balance, are not admin/platform, not already banned.
+    """
+    sb = get_sb()
+    page_sz = 400
+    try:
+        to_ban: List[str] = []
+        uo = 0
+        while True:
+            ur = await run(
+                lambda o=uo: sb.table("users")
+                .select(
+                    "id,role,telegram_id,telegram_username,games_played,balance,is_banned"
+                )
+                .range(o, o + page_sz - 1)
+                .execute()
+            )
+            urows = ur.data or []
+            if not urows:
+                break
+            for u in urows:
+                uid = str(u["id"])
+                if u.get("role") == "admin":
+                    continue
+                if u.get("telegram_id") == 0:
+                    continue
+                if (u.get("telegram_username") or "").strip().lower() == "admin":
+                    continue
+                if u.get("is_banned"):
+                    continue
+                bal = float(u.get("balance") or 0)
+                gp = int(u.get("games_played") or 0)
+                if gp == 0 and bal == 0:
+                    to_ban.append(uid)
+            if len(urows) < page_sz:
+                break
+            uo += page_sz
+
+        banned = 0
+        upd = {
+            "is_banned": True,
+            "ban_reason": "Auto: inactive zero balance (admin cleanup)",
+        }
+        for i in range(0, len(to_ban), 100):
+            chunk = to_ban[i : i + 100]
+            await run(
+                lambda c=chunk: sb.table("users").update(upd).in_("id", c).execute()
+            )
+            banned += len(chunk)
+
+        return {"ok": True, "banned_count": banned, "message": f"Banned {banned} user(s)."}
+    except Exception as e:
+        logger.exception("ban-inactive")
+        raise HTTPException(500, str(e))
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # ANALYTICS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3841,16 +4556,31 @@ def _coerce_pg_bool(val: Any) -> bool:
     return bool(val)
 
 
+def _norm_uuid_str(val: Any) -> str:
+    if val is None:
+        return ""
+    s = str(val).strip().lower().replace("{", "").replace("}", "")
+    return s
+
+
+def _uuid_equal(a: Any, b: Any) -> bool:
+    """Compare UUIDs from JSON / PostgREST / client (case, braces)."""
+    na, nb = _norm_uuid_str(a), _norm_uuid_str(b)
+    return bool(na) and na == nb
+
+
 async def _resolve_round_answer_level(sb: Client, game_id: str, question_id: str) -> str:
     """
     round_answers.level is NOT NULL (question_level enum). Prefer game_questions.level
     for this game, then questions.level, else 'easy'.
     """
+    qid = str(question_id).strip()
+    gid = str(game_id).strip()
     gq = await run(
         lambda: sb.table("game_questions")
         .select("level")
-        .eq("game_id", game_id)
-        .eq("question_id", question_id)
+        .eq("game_id", gid)
+        .eq("question_id", qid)
         .limit(1)
         .execute()
     )
@@ -3858,7 +4588,7 @@ async def _resolve_round_answer_level(sb: Client, game_id: str, question_id: str
     lvl = (row.get("level") or "").strip().lower()
     if lvl in ("easy", "medium", "hard"):
         return lvl
-    qr = await run(lambda: sb.table("questions").select("level").eq("id", question_id).limit(1).execute())
+    qr = await run(lambda: sb.table("questions").select("level").eq("id", qid).limit(1).execute())
     row2 = (qr.data or [{}])[0] if qr.data else {}
     lvl2 = (row2.get("level") or "").strip().lower()
     if lvl2 in ("easy", "medium", "hard"):
@@ -3875,53 +4605,104 @@ async def submit_answer(body: AnswerReq):
     """
     sb = get_sb()
 
+    qid = str(body.question_id).strip()
+    gid = str(body.game_id).strip()
     is_correct = False
     status_val = "timeout"
     opt_id = str(body.selected_option_id).strip() if body.selected_option_id else ""
+    row: Dict[str, Any] = {}
+    resolved_option_id: Optional[str] = None
 
-    if opt_id:
-        # Server-side truth: option must belong to this question and is_correct from DB
+    def _pick_opt_row(r: Dict[str, Any]) -> bool:
+        nonlocal row, resolved_option_id, is_correct, status_val
+        if not r or not r.get("id"):
+            return False
+        if not _uuid_equal(r.get("question_id"), qid):
+            logger.warning(
+                "submit_answer: option %s belongs to question %s, expected %s",
+                r.get("id"),
+                r.get("question_id"),
+                qid,
+            )
+            return False
+        row = r
+        resolved_option_id = str(r["id"])
+        is_correct = _coerce_pg_bool(r.get("is_correct"))
+        status_val = "correct" if is_correct else "wrong"
+        return True
+
+    # 1) Lookup by answer_options.id (primary)
+    if opt_id and opt_id.lower() not in ("undefined", "null", "none"):
         try:
             opt_res = await run(
                 lambda oid=opt_id: sb.table("answer_options")
-                .select("is_correct,question_id")
+                .select("id,is_correct,question_id,option_letter")
                 .eq("id", oid)
                 .limit(1)
                 .execute()
             )
-            row = (opt_res.data or [{}])[0] if opt_res.data else {}
-            if row.get("question_id") != body.question_id:
-                logger.warning(
-                    "submit_answer: option %s does not belong to question %s",
-                    opt_id,
-                    body.question_id,
-                )
+            cand = (opt_res.data or [{}])[0] if opt_res.data else {}
+            if cand and not _pick_opt_row(cand):
+                row = {}
+                resolved_option_id = None
                 is_correct = False
                 status_val = "wrong"
-            else:
-                is_correct = _coerce_pg_bool(row.get("is_correct"))
-                status_val = "correct" if is_correct else "wrong"
         except Exception as e:
-            logger.warning("submit_answer option lookup: %s", e)
-            is_correct = False
-            status_val = "wrong"
+            logger.warning("submit_answer option-by-id lookup: %s", e)
+            row = {}
 
-    q_level = await _resolve_round_answer_level(sb, body.game_id, body.question_id)
+    # 2) Fallback: question_id + option letter (mini-app always sends this too)
+    if not row and body.selected_option_letter:
+        lt = str(body.selected_option_letter).strip().upper()[:1]
+        if lt in ("A", "B", "C", "D"):
+            try:
+                opt_res2 = await run(
+                    lambda: sb.table("answer_options")
+                    .select("id,is_correct,question_id,option_letter")
+                    .eq("question_id", qid)
+                    .eq("option_letter", lt)
+                    .limit(1)
+                    .execute()
+                )
+                cand2 = (opt_res2.data or [{}])[0] if opt_res2.data else {}
+                # CHAR(1) padding in some DBs — try starts-with if exact match misses
+                if not cand2 or not cand2.get("id"):
+                    try:
+                        opt_res2b = await run(
+                            lambda: sb.table("answer_options")
+                            .select("id,is_correct,question_id,option_letter")
+                            .eq("question_id", qid)
+                            .like("option_letter", f"{lt}%")
+                            .limit(1)
+                            .execute()
+                        )
+                        cand2 = (opt_res2b.data or [{}])[0] if opt_res2b.data else {}
+                    except Exception:
+                        cand2 = {}
+                if cand2:
+                    _pick_opt_row(cand2)
+            except Exception as e:
+                logger.warning("submit_answer option-by-letter lookup: %s", e)
 
-    # Schema: round_answers requires `level` (enum). Do not send `question_number` unless the
-    # column exists — it is not in the stock SHAMO migration and breaks inserts (→ 500 → client shows "wrong").
+    q_level = await _resolve_round_answer_level(sb, gid, qid)
+
+    # Schema: round_answers requires `level` (enum).
     ans_payload: Dict[str, Any] = {
-        "session_id": body.session_id,
-        "user_id": body.user_id,
-        "game_id": body.game_id,
-        "question_id": body.question_id,
+        "session_id": str(body.session_id).strip(),
+        "user_id": str(body.user_id).strip(),
+        "game_id": gid,
+        "question_id": qid,
         "level": q_level,
-        "selected_option_id": body.selected_option_id,
+        "selected_option_id": resolved_option_id or (opt_id or None),
         "is_correct": is_correct,
         "status": status_val,
         "time_taken_ms": body.time_taken_ms,
     }
-    await run(lambda pl=dict(ans_payload): sb.table("round_answers").insert(pl).execute())
+    try:
+        await run(lambda pl=dict(ans_payload): sb.table("round_answers").insert(pl).execute())
+    except Exception as e:
+        logger.exception("submit_answer: round_answers insert failed: %s", e)
+        raise HTTPException(500, f"Could not save answer: {e}") from e
 
     # DB trigger (trg_on_round_answer) updates wrong_count and cooldown automatically
     # Fetch updated session to return to client
@@ -3930,8 +4711,14 @@ async def submit_answer(body: AnswerReq):
     sess = sess_res.data or {}
 
     # Also return the correct option_id so mini-app can highlight it
-    correct_opt_res = await run(lambda: sb.table("answer_options")
-        .select("id").eq("question_id", body.question_id).eq("is_correct", True).limit(1).execute())
+    correct_opt_res = await run(
+        lambda: sb.table("answer_options")
+        .select("id")
+        .eq("question_id", qid)
+        .eq("is_correct", True)
+        .limit(1)
+        .execute()
+    )
     correct_option_id = ((correct_opt_res.data or [{}])[0]).get("id")
 
     return {
@@ -3970,15 +4757,27 @@ async def record_spin(body: SpinReq):
                 .select("balance,total_earned").eq("id", body.user_id).single().execute())
             return {"spin": None, "user": user_res.data, "cap_reached": True, "amount_credited": 0}
 
-    spin_payload = {
-        "session_id":     body.session_id,
-        "user_id":        body.user_id,
-        "game_id":        body.game_id,
-        "question_number": body.question_number,
-        "segment_label":  body.segment_label,
-        "amount_etb":     amount,  # clamped amount; w-status defaults to 'active' (migration 012)
+    # DB: one-click schema uses amount_won (NOT NULL); trigger on_spin_result_insert credits NEW.amount_won.
+    # Optional column amount_etb (migration 029) is mirrored for clients that SELECT amount_etb.
+    spin_level = max(1, min(3, int(body.question_number or 1)))
+    amt = round(float(amount), 2)
+    spin_payload: Dict[str, Any] = {
+        "session_id":    str(body.session_id).strip(),
+        "user_id":       str(body.user_id).strip(),
+        "game_id":       str(body.game_id).strip(),
+        "level":         spin_level,
+        "segment_label": str(body.segment_label or "").strip() or "?",
+        "amount_won":    amt,
     }
-    res = await run(lambda: sb.table("spin_results").insert(spin_payload).execute())
+    try:
+        res = await run(
+            lambda pl={**spin_payload, "amount_etb": amt}: sb.table("spin_results").insert(pl).execute()
+        )
+    except Exception as e:
+        if _is_missing_column_pgrst(e, "amount_etb"):
+            res = await run(lambda pl=dict(spin_payload): sb.table("spin_results").insert(pl).execute())
+        else:
+            raise
 
     # Update session progress counters
     await run(lambda: sb.table("game_sessions").update({

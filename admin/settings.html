@@ -131,6 +131,183 @@
       font-weight: 600;
       margin-left: .4rem
     }
+
+    .dz-block {
+      padding: 1rem 1.25rem 1.25rem;
+      border-bottom: 1px solid var(--border)
+    }
+
+    .dz-block:last-child {
+      border-bottom: none
+    }
+
+    .dz-lead {
+      font-size: .78rem;
+      color: var(--muted);
+      line-height: 1.5;
+      margin: .35rem 0 .85rem
+    }
+
+    .dz-progress-wrap {
+      margin-top: .75rem;
+      display: none
+    }
+
+    .dz-progress-wrap.active {
+      display: block
+    }
+
+    .dz-progress-track {
+      height: 8px;
+      border-radius: 99px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      overflow: hidden
+    }
+
+    .dz-progress-fill {
+      height: 100%;
+      width: 0%;
+      border-radius: 99px;
+      background: linear-gradient(90deg, #7c3aed, #ef4444);
+      transition: width .35s ease
+    }
+
+    .dz-progress-meta {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: .4rem;
+      font-size: .72rem;
+      color: var(--muted)
+    }
+
+    .dz-check-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: .5rem .85rem;
+      margin: .65rem 0
+    }
+
+    .dz-check {
+      display: flex;
+      align-items: flex-start;
+      gap: .5rem;
+      font-size: .8rem;
+      color: var(--text);
+      cursor: pointer;
+      line-height: 1.35
+    }
+
+    .dz-check input {
+      margin-top: 3px;
+      accent-color: #ef4444
+    }
+
+    .dz-check small {
+      display: block;
+      font-size: .68rem;
+      color: var(--muted);
+      font-weight: 400;
+      margin-top: .1rem
+    }
+
+    details.dz-advanced {
+      margin: .75rem 0;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--surface)
+    }
+
+    details.dz-advanced summary {
+      padding: .65rem .85rem;
+      font-size: .8rem;
+      font-weight: 600;
+      cursor: pointer;
+      list-style: none;
+      display: flex;
+      align-items: center;
+      gap: .4rem
+    }
+
+    details.dz-advanced summary::-webkit-details-marker {
+      display: none
+    }
+
+    details.dz-advanced[open] summary {
+      border-bottom: 1px solid var(--border)
+    }
+
+    .dz-advanced-body {
+      padding: .75rem .85rem 1rem
+    }
+
+    .dz-phrase-input {
+      width: 100%;
+      max-width: 360px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: .5rem .75rem;
+      color: var(--text);
+      font-family: ui-monospace, monospace;
+      font-size: .78rem;
+      margin-top: .35rem
+    }
+
+    .dz-phrase-input:focus {
+      outline: none;
+      border-color: #ef4444
+    }
+
+    .dz-log {
+      margin-top: .85rem;
+      max-height: 220px;
+      overflow: auto;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: rgba(0, 0, 0, .2);
+      font-family: ui-monospace, monospace;
+      font-size: .72rem;
+      padding: .65rem .75rem;
+      line-height: 1.45;
+      display: none
+    }
+
+    .dz-log.visible {
+      display: block
+    }
+
+    .dz-log .ok {
+      color: #86efac
+    }
+
+    .dz-log .bad {
+      color: #fca5a5
+    }
+
+    .dz-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .5rem;
+      align-items: center;
+      margin-top: .75rem
+    }
+
+    .dz-preset {
+      font-size: .75rem;
+      color: var(--muted);
+      text-decoration: underline;
+      cursor: pointer;
+      background: none;
+      border: none;
+      font-family: inherit;
+      padding: 0
+    }
+
+    .dz-preset:hover {
+      color: var(--text)
+    }
   </style>
 </head>
 
@@ -367,21 +544,79 @@
           <div class="s-header" style="background:rgba(239,68,68,.05)"><span>⛔</span>
             <h2 style="color:#FCA5A5">Danger Zone</h2>
           </div>
+
+          <div class="dz-block">
+            <div class="s-info" style="padding:0;border:none">
+              <div class="name" style="color:#FCA5A5">Clear all testing data</div>
+              <p class="dz-lead">
+                Removes deposits, games (and related play data), QR codes &amp; scans, companies, and
+                <strong>non-admin</strong> users. Preserves accounts with <code>role = admin</code>,
+                <code>telegram_id = 0</code>, or Telegram username <code>admin</code> (case-insensitive).
+              </p>
+            </div>
+
+            <details class="dz-advanced">
+              <summary><span>⚙️</span> Advanced — choose what to wipe</summary>
+              <div class="dz-advanced-body">
+                <div class="dz-check-grid" id="dzClearOpts">
+                  <label class="dz-check"><input type="checkbox" id="dz_games" checked />
+                    <span>Games &amp; play data<small>Sessions, leaderboard, spins, answers, per-game QR</small></span></label>
+                  <label class="dz-check"><input type="checkbox" id="dz_qr" checked />
+                    <span>All QR data<small>Remaining scans + QR code rows</small></span></label>
+                  <label class="dz-check"><input type="checkbox" id="dz_deposits" checked />
+                    <span>Company deposits<small>All rows in company_deposits</small></span></label>
+                  <label class="dz-check"><input type="checkbox" id="dz_companies" checked />
+                    <span>Companies<small>Brands + linked question scope via FK</small></span></label>
+                  <label class="dz-check"><input type="checkbox" id="dz_users" checked />
+                    <span>Registered users (non-admin)<small>Keeps admin / platform / @admin</small></span></label>
+                  <label class="dz-check"><input type="checkbox" id="dz_questions" />
+                    <span>Entire question bank<small>All questions — use only on pure test DB</small></span></label>
+                  <label class="dz-check"><input type="checkbox" id="dz_audit" />
+                    <span>Audit log<small>public.audit_log rows</small></span></label>
+                  <label class="dz-check"><input type="checkbox" id="dz_redis" checked />
+                    <span>Redis transient keys<small>shamo:pool:*, session, rate limits</small></span></label>
+                </div>
+                <button type="button" class="dz-preset" onclick="dzPresetDefaults()">Reset options to recommended testing wipe</button>
+              </div>
+            </details>
+
+            <label style="font-size:.78rem;font-weight:600;color:var(--muted)">Confirmation phrase</label>
+            <div style="font-size:.72rem;color:var(--muted);margin:.15rem 0 .25rem">Type exactly:
+              <code style="color:#FCA5A5">CLEAR_ALL_TEST_DATA</code>
+            </div>
+            <input type="text" class="dz-phrase-input" id="dzConfirmPhrase" autocomplete="off"
+              placeholder="CLEAR_ALL_TEST_DATA" spellcheck="false" />
+
+            <div class="dz-actions">
+              <button type="button" class="btn btn-red" id="dzClearBtn" onclick="dzRunClearTesting()">🗑️ Clear testing data</button>
+              <span style="font-size:.72rem;color:var(--muted)">Irreversible. Run on staging / dev first.</span>
+            </div>
+
+            <div class="dz-progress-wrap" id="dzProgressWrap">
+              <div class="dz-progress-track">
+                <div class="dz-progress-fill" id="dzProgressFill"></div>
+              </div>
+              <div class="dz-progress-meta">
+                <span id="dzProgressLabel">Preparing…</span>
+                <span id="dzProgressPct">0%</span>
+              </div>
+            </div>
+            <pre class="dz-log" id="dzLog" aria-live="polite"></pre>
+          </div>
+
           <div class="s-row">
             <div class="s-info">
               <div class="name" style="color:#FCA5A5">Reset All Streaks</div>
-              <div class="desc">Reset every user's current streak to 0.</div>
+              <div class="desc">Set every user's <code>current_streak</code> to 0.</div>
             </div>
-            <button class="btn btn-red btn-sm"
-              onclick="dangerAction('Reset all streaks?','UPDATE users SET current_streak=0')">Run</button>
+            <button class="btn btn-red btn-sm" type="button" onclick="dzResetStreaks()">Run</button>
           </div>
           <div class="s-row">
             <div class="s-info">
               <div class="name" style="color:#FCA5A5">Ban Inactive Zero-Balance Users</div>
-              <div class="desc">Ban users who never played and have $0 balance.</div>
+              <div class="desc">Ban users who never played, balance 0, excluding admins / platform / @admin.</div>
             </div>
-            <button class="btn btn-red btn-sm"
-              onclick="dangerAction('Ban all inactive zero-balance users?','BAN_INACTIVE')">Run</button>
+            <button class="btn btn-red btn-sm" type="button" onclick="dzBanInactive()">Run</button>
           </div>
         </div>
 
@@ -450,9 +685,126 @@
       } catch (e) { showToast(e.message, 'error'); }
     }
 
-    function dangerAction(msg) {
-      if (!confirm(msg + '\n\nThis action cannot be undone!')) return;
-      showToast('Action executed (connect server-side logic)', 'info');
+    const CLEAR_PHRASE = 'CLEAR_ALL_TEST_DATA';
+
+    function dzPresetDefaults() {
+      document.getElementById('dz_games').checked = true;
+      document.getElementById('dz_qr').checked = true;
+      document.getElementById('dz_deposits').checked = true;
+      document.getElementById('dz_companies').checked = true;
+      document.getElementById('dz_users').checked = true;
+      document.getElementById('dz_questions').checked = false;
+      document.getElementById('dz_audit').checked = false;
+      document.getElementById('dz_redis').checked = true;
+    }
+
+    function dzSetProgress(pct, label) {
+      const wrap = document.getElementById('dzProgressWrap');
+      const fill = document.getElementById('dzProgressFill');
+      const lab = document.getElementById('dzProgressLabel');
+      const pc = document.getElementById('dzProgressPct');
+      wrap.classList.add('active');
+      fill.style.width = Math.min(100, Math.max(0, pct)) + '%';
+      if (label) lab.textContent = label;
+      pc.textContent = Math.round(Math.min(100, Math.max(0, pct))) + '%';
+    }
+
+    function dzHideProgress() {
+      document.getElementById('dzProgressWrap').classList.remove('active');
+      document.getElementById('dzProgressFill').style.width = '0%';
+    }
+
+    function dzRenderLog(steps) {
+      const el = document.getElementById('dzLog');
+      if (!steps || !steps.length) {
+        el.classList.remove('visible');
+        el.textContent = '';
+        return;
+      }
+      el.classList.add('visible');
+      el.innerHTML = steps.map(s => {
+        const ok = s.ok ? 'ok' : 'bad';
+        const icon = s.ok ? '✓' : '✗';
+        let extra = '';
+        if (s.count != null) extra += ` (${s.count})`;
+        return `<span class="${ok}">${icon} ${escapeHtml(s.step)}: ${escapeHtml(s.detail || '')}${extra}</span>`;
+      }).join('\n');
+    }
+
+    function escapeHtml(t) {
+      if (!t) return '';
+      const d = document.createElement('div');
+      d.textContent = t;
+      return d.innerHTML;
+    }
+
+    async function dzRunClearTesting() {
+      const phrase = (document.getElementById('dzConfirmPhrase').value || '').trim();
+      if (phrase !== CLEAR_PHRASE) {
+        showToast('Type the exact phrase CLEAR_ALL_TEST_DATA to confirm.', 'error');
+        return;
+      }
+      const opts = {
+        clear_games: document.getElementById('dz_games').checked,
+        clear_qr: document.getElementById('dz_qr').checked,
+        clear_deposits: document.getElementById('dz_deposits').checked,
+        clear_companies: document.getElementById('dz_companies').checked,
+        clear_non_admin_users: document.getElementById('dz_users').checked,
+        clear_question_bank: document.getElementById('dz_questions').checked,
+        clear_audit_log: document.getElementById('dz_audit').checked,
+        flush_redis_transient: document.getElementById('dz_redis').checked,
+      };
+      if (!Object.values(opts).some(Boolean)) {
+        showToast('Enable at least one option in Advanced.', 'error');
+        return;
+      }
+      if (!confirm('This will permanently delete selected data.\n\nAre you absolutely sure?')) return;
+
+      const btn = document.getElementById('dzClearBtn');
+      btn.disabled = true;
+      document.getElementById('dzLog').classList.remove('visible');
+      dzSetProgress(4, 'Starting…');
+      let fake = 4;
+      const tick = setInterval(() => {
+        fake = Math.min(fake + 3 + Math.random() * 6, 92);
+        dzSetProgress(fake, 'Clearing on server…');
+      }, 450);
+
+      try {
+        const data = await apiFetch('/admin/clear-testing-data', {
+          method: 'POST',
+          body: {
+            confirmation: phrase,
+            ...opts,
+          },
+        });
+        clearInterval(tick);
+        dzSetProgress(100, data.ok ? 'Done' : 'Finished with errors');
+        dzRenderLog(data.steps || []);
+        showToast(data.ok ? 'Testing data cleared.' : 'Some steps failed — see log below.', data.ok ? 'success' : 'warning');
+      } catch (e) {
+        clearInterval(tick);
+        dzHideProgress();
+        showToast(e.message || 'Request failed', 'error');
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function dzResetStreaks() {
+      if (!confirm('Reset every user\'s current streak to 0?\n\nThis cannot be undone.')) return;
+      try {
+        const r = await apiPost('/admin/danger/reset-streaks', {});
+        showToast(r.message || 'Streaks reset.', 'success');
+      } catch (e) { showToast(e.message, 'error'); }
+    }
+
+    async function dzBanInactive() {
+      if (!confirm('Ban all inactive users with zero balance (except admins / platform / @admin)?')) return;
+      try {
+        const r = await apiPost('/admin/danger/ban-inactive-zero-balance', {});
+        showToast(r.message || 'Done.', 'success');
+      } catch (e) { showToast(e.message, 'error'); }
     }
 
     loadSettings();

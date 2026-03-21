@@ -1,9 +1,9 @@
 {
   "env": {
     "ANTHROPIC_BASE_URL": "https://openrouter.ai/api",
-    "ANTHROPIC_AUTH_TOKEN": "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",
+    "ANTHROPIC_AUTH_TOKEN": "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",
     "ANTHROPIC_API_KEY": "",
-    "ANTHROPIC_MODEL": "openrouter/hunter-alpha"
+    "ANTHROPIC_MODEL": "anthropic/claude-3.7-sonnet:thinking"
   }
 
 }

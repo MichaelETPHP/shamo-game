@@ -201,3 +201,24 @@ def clear_prize_pool_cache(pool_id: str) -> None:
         r.delete(f"shamo:pool:{pool_id}")
     except Exception as e:
         logger.debug("clear_prize_pool_cache: %s", e)
+
+
+def clear_shamo_transient_keys() -> int:
+    """
+    Delete SHAMO non-persistent Redis keys (prize pools, per-user session JSON, rate limits).
+    Returns number of keys removed. Safe no-op if Redis off.
+    """
+    if not _ok():
+        return 0
+    n = 0
+    try:
+        for pattern in ("shamo:pool:*", "shamo:session:*", "shamo:rate:*"):
+            for key in r.scan_iter(match=pattern, count=200):
+                try:
+                    r.delete(key)
+                    n += 1
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.debug("clear_shamo_transient_keys: %s", e)
+    return n

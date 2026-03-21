@@ -22,6 +22,9 @@ venv/
 *.tmp
 *.temp
 
+# Local documentation (not tracked)
+Doc/
+
 # Editor & OS files
 .DS_Store
 Thumbs.db
