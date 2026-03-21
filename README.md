@@ -58,6 +58,31 @@ The app is completely static (no bundler, no npm dependencies).
 
 > Note: for the Mini App to work inside Telegram, `SHAMO_WEBAPP_URL` must point to an HTTPS-hosted copy of this app, not `localhost`.
 
+## Environment (one place)
+
+All database-related variables are read from `.env` in **`shamo_env.py`**:
+
+| Variable | Used for |
+|----------|----------|
+| `SUPABASE_URL` | PostgREST / Supabase HTTP API (`supabase-py`, mini-app `fetch` to `/rest/v1`) |
+| `SUPABASE_KEY` or `SUPABASE_ANON_KEY` | Anon JWT injected into the mini-app |
+| `SUPABASE_SERVICE_KEY` | Service-role JWT for the Python API (server) |
+| `DATABASE_URL` | Direct PostgreSQL (`db.py`, migration scripts) |
+| `DB_SCHEMA` | `search_path` for raw SQL (default `public`) |
+
+Copy **`ENV_SELF_HOSTED.sample`** as a template. `SUPABASE_URL` must be your **API** URL (where `/rest/v1` lives), not only the `db.*` Postgres host.
+
+### One-shot schema + default settings + sample rows
+
+Run **`migrations/shamo_one_click_install_and_seed.sql`** in the Supabase SQL editor (or `psql`) on a **new** database or empty `shamo` schema. It:
+
+- Creates schema **`shamo`**, enums, all tables, indexes, triggers, views, RLS policies
+- Upserts **`platform_config`** defaults (fees, withdrawal limits, `usd_to_etb_rate`, etc.)
+- Inserts admin user **`telegram_id = 0`** (for API “created_by” lookups) and **15** approved quiz questions + answers
+- Adds **sample** player, company **`sample-roasters-plc`**, confirmed deposit, **draft** game, **3 `game_questions`**, and an **inactive** QR stub
+
+Expose the **`shamo`** schema to PostgREST (Supabase: *Settings → API → Exposed schemas*) or align `DB_SCHEMA` / API with your host’s schema.
+
 ## Where to integrate real services
 
 - **Withdrawals** — handled via Telebirr; configure in admin panel and `.env`.

@@ -93,6 +93,38 @@ SHAMO_WEBAPP_URL = (os.getenv("SHAMO_WEBAPP_URL") or "").strip()
 API_BASE_URL     = (os.getenv("API_BASE_URL") or "").rstrip("/")
 
 
+def _env_float(key: str, default: float) -> float:
+    try:
+        v = os.getenv(key)
+        if v is None or not str(v).strip():
+            return default
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        v = os.getenv(key)
+        if v is None or not str(v).strip():
+            return default
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+# HTTP timeouts for api.telegram.org (seconds). Slow networks / proxies need higher values.
+TELEGRAM_CONNECT_TIMEOUT = _env_float("TELEGRAM_CONNECT_TIMEOUT", 25.0)
+TELEGRAM_READ_TIMEOUT = _env_float("TELEGRAM_READ_TIMEOUT", 60.0)
+TELEGRAM_WRITE_TIMEOUT = _env_float("TELEGRAM_WRITE_TIMEOUT", 30.0)
+TELEGRAM_POOL_TIMEOUT = _env_float("TELEGRAM_POOL_TIMEOUT", 15.0)
+# Long-polling uses a separate client; read timeout should cover get_updates long poll + margin.
+TELEGRAM_GET_UPDATES_READ_TIMEOUT = _env_float("TELEGRAM_GET_UPDATES_READ_TIMEOUT", 50.0)
+TELEGRAM_GET_UPDATES_CONNECT_TIMEOUT = _env_float("TELEGRAM_GET_UPDATES_CONNECT_TIMEOUT", 25.0)
+# Retries when delete_webhook / bootstrap fails (0 = none). Use -1 for unlimited (not recommended).
+TELEGRAM_BOOTSTRAP_RETRIES = _env_int("TELEGRAM_BOOTSTRAP_RETRIES", 10)
+
+
 # ─── Telegram initData validator ─────────────────────────────
 def validate_init_data(init_data: str, bot_token: str) -> bool:
     try:
@@ -634,7 +666,19 @@ def build_application() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN in .env")
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .connect_timeout(TELEGRAM_CONNECT_TIMEOUT)
+        .read_timeout(TELEGRAM_READ_TIMEOUT)
+        .write_timeout(TELEGRAM_WRITE_TIMEOUT)
+        .pool_timeout(TELEGRAM_POOL_TIMEOUT)
+        .get_updates_connect_timeout(TELEGRAM_GET_UPDATES_CONNECT_TIMEOUT)
+        .get_updates_read_timeout(TELEGRAM_GET_UPDATES_READ_TIMEOUT)
+        .get_updates_write_timeout(TELEGRAM_WRITE_TIMEOUT)
+        .get_updates_pool_timeout(TELEGRAM_POOL_TIMEOUT)
+        .build()
+    )
     application.add_handler(CommandHandler("start",  start))
     application.add_handler(CommandHandler("play",   play_cmd))
     application.add_handler(CommandHandler("help",   help_cmd))
@@ -657,7 +701,10 @@ def main() -> None:
     logger.info("Instance lock acquired on port %d.", _LOCK_PORT)
     application = build_application()
     logger.info("SHAMO bot starting (standalone)… Mini App: %s API: %s", SHAMO_WEBAPP_URL, API_BASE_URL)
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        bootstrap_retries=TELEGRAM_BOOTSTRAP_RETRIES,
+    )
 
 
 if __name__ == "__main__":

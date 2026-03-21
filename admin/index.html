@@ -165,7 +165,11 @@
     async function loadStats() {
       try {
         const s = await apiGet('/stats');
-        document.getElementById('statsGrid').innerHTML = [
+        const warn = s.stats_degraded
+          ? `<div style="grid-column:1/-1;padding:.85rem 1rem;background:rgba(249,115,22,.12);border:1px solid rgba(249,115,22,.35);border-radius:10px;font-size:.82rem;color:#fdba74;margin-bottom:.35rem">⚠️ Dashboard data may be incomplete. ${String(s.stats_error || '').replace(/</g, '&lt;')}</div>`
+          : '';
+        const payoutShow = (s.total_payout != null && s.total_payout !== '') ? s.total_payout : (s.platform_fee_income ?? 0);
+        document.getElementById('statsGrid').innerHTML = warn + [
           { icon: '👥', label: 'Total Users', val: fmtN(s.total_users), cls: 'blue' },
           { icon: '✅', label: 'Active Users', val: fmtN(s.active_users), cls: 'green' },
           { icon: '🚫', label: 'Banned', val: fmtN(s.banned_users), cls: 'red' },
@@ -173,12 +177,13 @@
           { icon: '🏢', label: 'Companies', val: fmtN(s.total_companies), cls: 'gold' },
           { icon: '❓', label: 'Pending Questions', val: fmtN(s.pending_questions), cls: 'gold' },
           { icon: '💸', label: 'Pending Withdrawals', val: fmtN(s.pending_withdrawals), cls: 'orange' },
-          { icon: '💰', label: 'Total Paid Out', val: fmt$(s.total_payout), cls: 'green' },
+          { icon: '💰', label: 'Platform fee income', val: fmt$(payoutShow), cls: 'green' },
         ].map(s => `<div class="stat-card ${s.cls}">
       <div class="stat-icon ${s.cls}">${s.icon}</div>
       <div class="stat-value">${s.val}</div>
       <div class="stat-label">${s.label}</div>
     </div>`).join('');
+        if (s.stats_degraded) showToast('Some stats could not be loaded — check API logs / database.', 'error', 5000);
       } catch (e) {
         document.getElementById('statsGrid').innerHTML = `<div style="color:var(--muted);grid-column:1/-1;text-align:center">❌ Failed to load stats: ${e.message}</div>`;
       }

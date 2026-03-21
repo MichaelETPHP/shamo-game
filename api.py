@@ -4,8 +4,8 @@ SHAMO Admin API — FastAPI backend  (v3.1 — Fixed for /shamo/ paths)
 Port and API base URL come from .env (PORT, API_BASE_URL).
 Run: uvicorn api:app --port $PORT --reload   (PORT from .env)
 """
-import os, json, logging, asyncio, secrets as _secrets, uuid
-from urllib.parse import quote
+import os, re, json, logging, asyncio, secrets as _secrets, uuid
+from urllib.parse import quote, urlparse, parse_qsl, parse_qs, urlencode, urlunparse
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
@@ -19,6 +19,17 @@ from dotenv import load_dotenv
 _env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(_env_path)
 
+from shamo_env import (
+    SUPABASE_URL,
+    SUPABASE_ANON_KEY,
+    SUPABASE_KEY,
+    DATABASE_URL,
+    DB_SCHEMA,
+    POSTGREST_SCHEMA,
+    QR_REST_SCHEMA,
+)
+from game_currency import normalize_game_prize_fields, normalize_games_list
+
 from fastapi import FastAPI, HTTPException, Request, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, StreamingResponse, Response
@@ -26,7 +37,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 
-from supabase import create_client, Client
+from supabase import create_client, Client, ClientOptions
 
 try:
     import anthropic
@@ -56,8 +67,7 @@ API_BASE_URL = (os.getenv("API_BASE_URL") or "").rstrip("/") or f"http://localho
 APP_ENV = (os.getenv("APP_ENV") or "local").strip().lower()
 IS_VPS = APP_ENV in ("production", "vps", "prod", "1", "true")
 
-SUPABASE_URL  = (os.getenv("SUPABASE_URL") or "").strip()
-SUPABASE_KEY  = (os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_ANON_KEY") or "").strip()
+# Supabase / DB: see shamo_env.py (loads SUPABASE_*, DATABASE_URL, DB_SCHEMA from .env)
 ADMIN_TOKEN   = (os.getenv("ADMIN_TOKEN") or "").strip()
 BOT_TOKEN     = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 ADMIN_USER    = (os.getenv("ADMIN_USERNAME") or "").strip()
@@ -77,7 +87,7 @@ def _shamo_env_script() -> str:
     base = esc(API_BASE_URL)
     port = esc(str(PORT))
     supabase_url = esc(SUPABASE_URL)
-    supabase_anon = esc(os.getenv("SUPABASE_ANON_KEY", ""))
+    supabase_anon = esc(SUPABASE_ANON_KEY)
     return (
         f"<script>\n"
         f"  window.SHAMO_API_BASE_URL = '{base}';\n"
@@ -170,6 +180,148 @@ async def _get_active_spin_balance(sb: Client, user_id: str) -> float:
         logger.warning("spin_results table: %s", e)
     return 0.0
 
+
+# ─── Optional tables (migrations not applied) — avoid 500 on stats / deposits ────
+def _is_missing_relation_error(exc: BaseException, table_name: str) -> bool:
+    """Postgres 42P01 / PostgREST: relation ... does not exist."""
+    raw = str(exc)
+    low = raw.lower()
+    tn = table_name.strip().lower().strip('"')
+    if tn not in low and f"public.{tn}" not in low:
+        return False
+    return "does not exist" in low or "42p01" in low
+
+
+def _empty_rows_response():
+    class R:
+        data = []
+
+    return R()
+
+
+DEPOSITS_TABLE_HINT = "Create the table by running migrations/016_company_deposits.sql in your SQL editor."
+
+
+try:
+    from postgrest.exceptions import APIError as _PostgrestAPIError
+except ImportError:
+    _PostgrestAPIError = ()  # type: ignore
+
+
+def _is_missing_column_pgrst(exc: BaseException, column: str) -> bool:
+    """PostgREST PGRST204 — column not exposed / not in schema cache."""
+    col = column.lower().strip('"')
+    # postgrest.APIError stores the JSON body on _raw_error; args[0] is str(self), not the dict.
+    raw = getattr(exc, "_raw_error", None)
+    if isinstance(raw, dict):
+        if str(raw.get("code", "")).upper() == "PGRST204" and col in str(raw.get("message", "")).lower():
+            return True
+    if _PostgrestAPIError and isinstance(exc, _PostgrestAPIError):
+        d = getattr(exc, "args", None)
+        if d and isinstance(d[0], dict):
+            if str(d[0].get("code", "")).upper() == "PGRST204" and col in str(d[0].get("message", "")).lower():
+                return True
+        msg = (getattr(exc, "message", None) or str(exc) or "").lower()
+        code = str(getattr(exc, "code", "") or "").upper()
+        if code == "PGRST204" and col in msg:
+            return True
+    parts = [str(exc)]
+    if getattr(exc, "args", None):
+        for a in exc.args:
+            if isinstance(a, dict):
+                parts.append(str(a.get("message", "")))
+                parts.append(str(a.get("code", "")))
+            else:
+                parts.append(str(a))
+    low = " ".join(parts).lower()
+    if col not in low:
+        return False
+    return "pgrst204" in low or "schema cache" in low or "could not find" in low
+
+
+def _pgrst204_missing_column_name(exc: BaseException) -> Optional[str]:
+    """Extract column name from PostgREST PGRST204 message, e.g. \"Could not find the 'max_prize_etb' column\"."""
+    raw = getattr(exc, "_raw_error", None)
+    msg = ""
+    if isinstance(raw, dict) and str(raw.get("code", "")).upper() == "PGRST204":
+        msg = str(raw.get("message", "") or "")
+    if not msg:
+        msg = str(getattr(exc, "message", None) or "")
+    m = re.search(r"Could not find the '([^']+)' column", msg, re.IGNORECASE)
+    return m.group(1) if m else None
+
+
+def _games_payload_drop_keys(payload: dict, keys: set[str]) -> dict:
+    return {k: v for k, v in payload.items() if k not in keys}
+
+
+# Columns safe to send on INSERT — excludes deposit_id until migration 018 is applied & PostgREST cache refreshed.
+_GAMES_INSERT_KEYS = frozenset({
+    "title",
+    "description",
+    "status",
+    "starts_at",
+    "ends_at",
+    "game_date",
+    "company_id",
+    "created_by",
+    "prize_pool_etb",
+    "max_prize_etb",
+    "platform_fee_pct",
+    "player_cap_pct",
+    "prize_pool_remaining",
+    # legacy USD (some DBs still expect these on insert)
+    "prize_pool_usd",
+    "max_payout_usd",
+    "level_config",
+    "wheel_config",
+    "telegram_channel",
+    "share_link",
+    "platform_fee_etb",
+    "usd_to_etb_rate",
+})
+
+
+def _games_insert_payload(payload: dict) -> dict:
+    """Only keys that exist on typical games rows — never deposit_id or stray client fields."""
+    return {k: v for k, v in payload.items() if k in _GAMES_INSERT_KEYS}
+
+
+def _normalize_question_level_for_game(row: dict) -> str:
+    """Map questions row → game_questions.level (NOT NULL)."""
+    raw = row.get("level")
+    if raw is None:
+        raw = row.get("difficulty")
+    if isinstance(raw, str) and raw.strip():
+        v = raw.strip().lower()
+        if v in ("easy", "medium", "hard"):
+            return v
+        if v in ("1", "e", "beginner"):
+            return "easy"
+        if v in ("2", "m", "intermediate"):
+            return "medium"
+        if v in ("3", "h", "advanced"):
+            return "hard"
+    return "easy"
+
+
+def _norm_qid(qid: Any) -> str:
+    return str(qid).strip() if qid is not None else ""
+
+
+def _insert_game_question_row(sb: Client, game_id: str, question_id: str, level: str, sort_order: int):
+    """Sync insert for thread-pool; always sends a valid level (Postgres NOT NULL)."""
+    lv = level if level in ("easy", "medium", "hard") else "easy"
+    return sb.table("game_questions").insert(
+        {
+            "game_id": _norm_qid(game_id),
+            "question_id": _norm_qid(question_id),
+            "level": lv,
+            "sort_order": int(sort_order),
+        }
+    ).execute()
+
+
 # ─── Singleton Supabase client ────────────────────────────────────────────────
 _sb: Client | None = None
 
@@ -177,10 +329,32 @@ def get_sb() -> Client:
     global _sb
     if _sb is None:
         if not SUPABASE_URL or not SUPABASE_KEY:
-            raise HTTPException(500, "SUPABASE_URL / SUPABASE_SERVICE_KEY not set in .env")
-        _sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-        logger.info("Supabase client initialized (singleton)")
+            raise HTTPException(
+                500,
+                "SUPABASE_URL and SUPABASE_SERVICE_KEY (or SUPABASE_KEY) not set in .env — see shamo_env.py",
+            )
+        # PostgREST resolves /rest/v1/<table> against this schema (see POSTGREST_SCHEMA in shamo_env.py).
+        _sb = create_client(
+            SUPABASE_URL,
+            SUPABASE_KEY,
+            options=ClientOptions(schema=POSTGREST_SCHEMA),
+        )
+        logger.info(
+            "Supabase client initialized (singleton, PostgREST schema=%s, QR_REST_SCHEMA=%s)",
+            POSTGREST_SCHEMA,
+            QR_REST_SCHEMA or f"(same as {POSTGREST_SCHEMA})",
+        )
     return _sb
+
+
+def _pg_table(sb: Client, name: str):
+    """
+    Builder for qr_codes / qr_scans when they use QR_REST_SCHEMA (split from POSTGREST_SCHEMA).
+    If QR_REST_SCHEMA is empty, uses the main client schema (typically public).
+    """
+    if QR_REST_SCHEMA and QR_REST_SCHEMA != POSTGREST_SCHEMA:
+        return sb.schema(QR_REST_SCHEMA).from_(name)
+    return sb.table(name)
 
 def _reset_sb():
     global _sb
@@ -261,12 +435,17 @@ async def lifespan(app: FastAPI):
     _bot_task = None
     try:
         from telegram import Update
-        from bot import build_application, set_bot_app
+        from bot import TELEGRAM_BOOTSTRAP_RETRIES, build_application, set_bot_app
         _bot_app = build_application()
         set_bot_app(_bot_app)
         await _bot_app.initialize()
         await _bot_app.start()
-        _bot_task = asyncio.create_task(_bot_app.updater.start_polling(allowed_updates=Update.ALL_TYPES))
+        _bot_task = asyncio.create_task(
+            _bot_app.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                bootstrap_retries=TELEGRAM_BOOTSTRAP_RETRIES,
+            )
+        )
         logger.info("Bot started (in-process) for broadcasts")
     except Exception as e:
         logger.warning("Bot startup skipped (run bot.py separately): %s", e)
@@ -375,12 +554,14 @@ class QuestionCreate(BaseModel):
     explanation: Optional[str] = None; icon: str = "🇪🇹"
     company_id: Optional[str] = None; is_sponsored: bool = False
     game_id: Optional[str] = None
+    level: str = "easy"  # easy | medium | hard — required for game_questions.level
     options: list
 
 class QuestionUpdate(BaseModel):
     question_text: Optional[str] = None
     category: Optional[str] = None; explanation: Optional[str] = None
     status: Optional[str] = None; icon: Optional[str] = None
+    level: Optional[str] = None  # easy | medium | hard
     options: Optional[list] = None  # if set, replace all answer_options (items: {letter, text, is_correct})
 
 class RejectReq(BaseModel):
@@ -497,15 +678,29 @@ async def health():
     try:
         sb = get_sb()
         await run(lambda: sb.table("users").select("id").limit(1).execute())
-        return {"status": "ok", "db": "connected"}
+        return {
+            "status": "ok",
+            "db": "connected",
+            "db_schema": DB_SCHEMA,
+            "direct_pg_configured": bool(DATABASE_URL),
+        }
     except Exception as e:
-        return {"status": "ok", "db": "disconnected", "error": str(e)}
+        return {
+            "status": "ok",
+            "db": "disconnected",
+            "db_schema": DB_SCHEMA,
+            "direct_pg_configured": bool(DATABASE_URL),
+            "error": str(e),
+        }
 
 
 @app.get("/api/redis/health")
 async def redis_health():
     connected = redis_test()
-    return {"redis": "connected" if connected else "disconnected"}
+    return {
+        "redis": "connected" if connected else "disconnected",
+        "hint": "Set REDIS_DISABLED=1 in .env if you are not running Redis (API and DB still work).",
+    }
 
 
 @app.get("/api/players/active")
@@ -833,8 +1028,8 @@ async def player_delete_account(body: DeleteAccountReq):
         # 2) transactions — references user_id, no CASCADE
         await run(lambda: sb.table("transactions").delete().eq("user_id", uid).execute())
         # 3) qr_scans — by user_id and by telegram_id (no CASCADE from users)
-        await run(lambda: sb.table("qr_scans").delete().eq("user_id", uid).execute())
-        await run(lambda: sb.table("qr_scans").delete().eq("telegram_id", body.telegram_id).execute())
+        await run(lambda: _pg_table(sb, "qr_scans").delete().eq("user_id", uid).execute())
+        await run(lambda: _pg_table(sb, "qr_scans").delete().eq("telegram_id", body.telegram_id).execute())
         # 4) withdrawals, leaderboard, notifications (explicit; also have ON DELETE CASCADE from users)
         await run(lambda: sb.table("withdrawals").delete().eq("user_id", uid).execute())
         await run(lambda: sb.table("leaderboard").delete().eq("user_id", uid).execute())
@@ -1065,17 +1260,14 @@ async def public_active_game():
     """
     sb = get_sb()
     game_res = await run(lambda: sb.table("games").select(
-        "id,title,status,game_date,prize_pool_etb,prize_pool_remaining,"
-        "platform_fee_pct,player_cap_pct,total_players,total_winners,total_paid_out,"
-        "starts_at,ends_at,company_id,"
-        "companies!games_company_id_fkey(id,name,logo_url,primary_color)"
+        "*,companies!games_company_id_fkey(id,name,logo_url,primary_color)"
     ).eq("status", "active").order("starts_at", desc=True).limit(1).execute())
 
     games = game_res.data or []
     if not games:
         return {"game": None, "winners": [], "live_claims": []}
 
-    game = games[0]
+    game = normalize_game_prize_fields(games[0])
     game_id = game["id"]
 
     # Top 3 winners for this game
@@ -1124,7 +1316,7 @@ async def debug_active_games():
     out = []
     for g in rows:
         gq = await run(lambda gi=g["id"]: sb.table("game_questions").select("id", count="exact").eq("game_id", gi).execute())
-        qr = await run(lambda gi=g["id"]: sb.table("qr_codes").select("id", count="exact").eq("game_id", gi).eq("status", "active").execute())
+        qr = await run(lambda gi=g["id"]: _pg_table(sb, "qr_codes").select("id", count="exact").eq("game_id", gi).eq("status", "active").execute())
         out.append({
             "id":         g["id"],
             "title":      g["title"],
@@ -1150,11 +1342,9 @@ async def public_active_games_list():
     game_ids_from_active: list = []
     game_ids_from_qr: list = []
     try:
-        games_res = await run(lambda: sb.table("games").select(
-            "id,title,status,game_date,prize_pool_etb,prize_pool_remaining,"
-            "total_players,total_winners,total_paid_out,starts_at,ends_at,company_id,updated_at"
-        ).eq("status", "active").order("updated_at", desc=True).limit(20).execute())
-        active_games = games_res.data or []
+        games_res = await run(lambda: sb.table("games").select("*")
+        .eq("status", "active").order("updated_at", desc=True).limit(20).execute())
+        active_games = normalize_games_list(games_res.data or [])
         game_ids_from_active = [g["id"] for g in active_games]
         logger.info("public_active_games_list: found %d status=active games", len(active_games))
     except Exception as e:
@@ -1162,7 +1352,7 @@ async def public_active_games_list():
         active_games = []
 
     try:
-        qr_res = await run(lambda: sb.table("qr_codes").select("game_id").eq("status", "active").execute())
+        qr_res = await run(lambda: _pg_table(sb, "qr_codes").select("game_id").eq("status", "active").execute())
         qr_rows = qr_res.data or []
         game_ids_from_qr = list({r["game_id"] for r in qr_rows if r.get("game_id")} - set(game_ids_from_active or []))
     except Exception as e:
@@ -1172,11 +1362,9 @@ async def public_active_games_list():
     games = list(active_games)
     if game_ids_from_qr:
         try:
-            extra_res = await run(lambda: sb.table("games").select(
-                "id,title,status,game_date,prize_pool_etb,prize_pool_remaining,"
-                "total_players,total_winners,total_paid_out,starts_at,ends_at,company_id,updated_at"
-            ).in_("id", game_ids_from_qr).order("updated_at", desc=True).execute())
-            extra = extra_res.data or []
+            extra_res = await run(lambda: sb.table("games").select("*")
+            .in_("id", game_ids_from_qr).order("updated_at", desc=True).execute())
+            extra = normalize_games_list(extra_res.data or [])
             games = games + extra
             logger.info("public_active_games_list: added %d games with active QR (draft/scheduled)", len(extra))
         except Exception as e:
@@ -1204,7 +1392,7 @@ async def public_active_games_list():
     game_ids = [g["id"] for g in games]
 
     try:
-        qr_res = await run(lambda: sb.table("qr_codes")
+        qr_res = await run(lambda: _pg_table(sb, "qr_codes")
             .select("game_id,token,label,status,qr_url")
             .in_("game_id", game_ids).eq("status", "active")
             .order("created_at").execute())
@@ -1221,6 +1409,7 @@ async def public_active_games_list():
         })
 
     for g in games:
+        normalize_game_prize_fields(g)
         g["join_codes"] = qr_by_game.get(g["id"], [])[:5]
         first_qr = (qr_by_game.get(g["id"]) or [None])[0]
         g["join_code"] = first_qr["token"] if first_qr else None
@@ -1243,13 +1432,11 @@ async def public_game_by_id(game_id: str):
     except (ValueError, TypeError):
         raise HTTPException(404, "Game not found")
     sb = get_sb()
-    res = await run(lambda: sb.table("games")
-        .select("id,title,status,game_date,prize_pool_etb,prize_pool_remaining,total_players,company_id")
-        .eq("id", game_id).limit(1).execute())
+    res = await run(lambda: sb.table("games").select("*").eq("id", game_id).limit(1).execute())
     rows = res.data or []
     if not rows:
         raise HTTPException(404, "Game not found")
-    g = rows[0]
+    g = normalize_game_prize_fields(rows[0])
     cid = g.get("company_id")
     if cid:
         co_res = await run(lambda: sb.table("companies")
@@ -1334,17 +1521,22 @@ async def get_stats(_=Depends(require_admin)):
         def q_active_users():  return sb.table("users").select("id", count="exact").eq("is_active", True).eq("is_banned", False).execute()
         def q_banned_users():  return sb.table("users").select("id", count="exact").eq("is_banned", True).execute()
         def q_total_games():   return sb.table("games").select("id", count="exact").execute()
-        def q_active_game():   return sb.table("games").select(
-            "id,title,status,total_players,total_winners,total_paid_out,prize_pool_etb,prize_pool_remaining,game_date"
-        ).eq("status", "active").limit(1).execute()
+        def q_active_game():   return sb.table("games").select("*").eq("status", "active").limit(1).execute()
         def q_pend_withdraw(): return sb.table("withdrawals").select("id", count="exact").eq("status", "pending").execute()
         def q_active_comp():   return sb.table("companies").select("id", count="exact").eq("status", "active").execute()
         def q_pend_comp():     return sb.table("companies").select("id", count="exact").eq("status", "pending").execute()
         def q_pend_qs():       return sb.table("questions").select("id", count="exact").eq("status", "pending").execute()
         def q_total_comp():    return sb.table("companies").select("id", count="exact").execute()
         def q_total_qs():      return sb.table("questions").select("id", count="exact").execute()
-        # FIX 1: get real commission income from company_deposits, not estimated from payouts
-        def q_fee_income():    return sb.table("company_deposits").select("commission_etb").eq("status", "confirmed").execute()
+
+        def q_fee_income():
+            try:
+                return sb.table("company_deposits").select("commission_etb").eq("status", "confirmed").execute()
+            except Exception as e:
+                if _is_missing_relation_error(e, "company_deposits"):
+                    logger.warning("get_stats: company_deposits missing — platform_fee_income=0. %s", e)
+                    return _empty_rows_response()
+                raise
 
         (r_total_users, r_active_users, r_banned_users, r_total_games,
          r_active_game, r_pend_withdraw, r_active_comp, r_pend_comp,
@@ -1356,7 +1548,7 @@ async def get_stats(_=Depends(require_admin)):
 
         # FIX 1: sum actual commission_etb from confirmed deposits
         fee_income = sum(float(d.get("commission_etb") or 0) for d in (r_fee_income.data or []))
-        active_game = (r_active_game.data or [None])[0]
+        active_game = normalize_game_prize_fields((r_active_game.data or [None])[0])
 
         return {
             "total_users":         r_total_users.count or 0,
@@ -1375,8 +1567,23 @@ async def get_stats(_=Depends(require_admin)):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("Stats error: %s", e)
-        raise HTTPException(500, str(e))
+        logger.exception("Stats degraded (returning zeros): %s", e)
+        return {
+            "total_users": 0,
+            "active_users": 0,
+            "banned_users": 0,
+            "total_games": 0,
+            "active_game": None,
+            "pending_withdrawals": 0,
+            "active_companies": 0,
+            "pending_companies": 0,
+            "total_companies": 0,
+            "pending_questions": 0,
+            "total_questions": 0,
+            "platform_fee_income": 0,
+            "stats_degraded": True,
+            "stats_error": str(e),
+        }
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # USERS
@@ -1454,9 +1661,9 @@ async def delete_user(uid: str, _=Depends(require_admin)):
         sb.table("round_answers").delete().eq("user_id", uid).execute()
         sb.table("spin_results").delete().eq("user_id", uid).execute()
         # 4. qr_scans — nullable user_id reference, NO CASCADE
-        sb.table("qr_scans").delete().eq("user_id", uid).execute()
+        _pg_table(sb, "qr_scans").delete().eq("user_id", uid).execute()
         if telegram_id:
-            sb.table("qr_scans").delete().eq("telegram_id", telegram_id).execute()
+            _pg_table(sb, "qr_scans").delete().eq("telegram_id", telegram_id).execute()
         # 5. leaderboard, withdrawals, notifications (CASCADE from users, but explicit)
         sb.table("leaderboard").delete().eq("user_id", uid).execute()
         sb.table("withdrawals").delete().eq("user_id", uid).execute()
@@ -1470,7 +1677,7 @@ async def delete_user(uid: str, _=Depends(require_admin)):
                 sb.table("games").update({"created_by": admin_id}).eq("created_by", uid).execute()
             except Exception: pass
             try:
-                sb.table("qr_codes").update({"created_by": admin_id}).eq("created_by", uid).execute()
+                _pg_table(sb, "qr_codes").update({"created_by": admin_id}).eq("created_by", uid).execute()
             except Exception: pass
         else:
             # No other admin → delete questions/games/qr_codes created by this user
@@ -1486,7 +1693,7 @@ async def delete_user(uid: str, _=Depends(require_admin)):
             sb.table("questions").update({"reviewed_by": None}).eq("reviewed_by", uid).execute()
         except Exception: pass
         try:
-            sb.table("qr_codes").update({"revoked_by": None}).eq("revoked_by", uid).execute()
+            _pg_table(sb, "qr_codes").update({"revoked_by": None}).eq("revoked_by", uid).execute()
         except Exception: pass
         try:
             sb.table("company_deposits").update({"confirmed_by": None}).eq("confirmed_by", uid).execute()
@@ -1569,12 +1776,12 @@ async def clear_user_game_test(uid: str, body: ClearGameTestReq = None, _=Depend
         telegram_id = (user_row.data or [{}])[0].get("telegram_id") if user_row.data else None
 
         # 1) qr_scans — by user_id and by telegram_id (removes "already entered" from QR flow)
-        q_scans = sb.table("qr_scans").delete().eq("user_id", uid)
+        q_scans = _pg_table(sb, "qr_scans").delete().eq("user_id", uid)
         if game_id:
             q_scans = q_scans.eq("game_id", game_id)
         await run(lambda: q_scans.execute())
         if telegram_id is not None:
-            q_scans_tg = sb.table("qr_scans").delete().eq("telegram_id", telegram_id)
+            q_scans_tg = _pg_table(sb, "qr_scans").delete().eq("telegram_id", telegram_id)
             if game_id:
                 q_scans_tg = q_scans_tg.eq("game_id", game_id)
             await run(lambda: q_scans_tg.execute())
@@ -1608,18 +1815,27 @@ async def clear_user_game_test(uid: str, body: ClearGameTestReq = None, _=Depend
 @app.get("/api/games")
 async def list_games(
     request: Request, _=Depends(require_admin),
-    page: int = 1, per_page: int = 20, status: str = "", search: str = ""
+    page: int = 1, per_page: int = 20, status: str = "", search: str = "", company_id: str = ""
 ):
     sb = get_sb()
     def _query():
         q = sb.table("games").select("*, companies(name)", count="exact")
-        if status: q = q.eq("status", status)
-        if search: q = q.ilike("title", f"%{search}%")
+        if status:
+            q = q.eq("status", status)
+        if search:
+            q = q.ilike("title", f"%{search}%")
+        # __platform__ = games with no sponsoring company (company_id IS NULL)
+        cid = (company_id or "").strip()
+        if cid == "__platform__":
+            q = q.is_("company_id", "null")
+        elif cid:
+            q = q.eq("company_id", cid)
         offset = (page - 1) * per_page
         return q.order("created_at", desc=True).range(offset, offset + per_page - 1).execute()
     res = await run(_query)
     games = res.data or []
     for g in games:
+        normalize_game_prize_fields(g)
         g["company_name"] = (g.pop("companies", None) or {}).get("name") or g.get("company_name")
     return {"data": games, "total": res.count or 0, "page": page, "per_page": per_page}
 
@@ -1630,6 +1846,7 @@ async def get_game(gid: str, _=Depends(require_admin)):
     rows = res.data or []
     if not rows: raise HTTPException(404, "Game not found")
     g = rows[0]
+    normalize_game_prize_fields(g)
     g["company_name"] = (g.pop("companies", None) or {}).get("name")
     return g
 
@@ -1676,11 +1893,40 @@ async def create_game(body: GameCreate, _=Depends(require_admin)):
         except Exception:
             pass  # deposit creation is non-blocking — game still gets created
 
-    payload["deposit_id"] = deposit_id
+    # deposit_id links to company_deposits — omit from INSERT (whitelist); optional UPDATE after row exists.
+    insert_payload: dict = dict(_games_insert_payload(payload))
 
-    await run(lambda: sb.table("games").insert(payload).execute())
+    # Legacy DBs / stale PostgREST cache: strip any column PostgREST rejects (PGRST204) and retry.
+    for _attempt in range(32):
+        try:
+            p = dict(insert_payload)
+            await run(lambda pl=p: sb.table("games").insert(pl).execute())
+            break
+        except Exception as e:
+            col = _pgrst204_missing_column_name(e)
+            if col and col in insert_payload:
+                logger.warning("games.create: column %r not in schema — omitting from insert.", col)
+                insert_payload = _games_payload_drop_keys(insert_payload, {col})
+                continue
+            raise
+    else:
+        raise HTTPException(500, "games insert failed after omitting unknown columns")
+
     res = await run(lambda: sb.table("games").select("*").eq("created_by", created_by).order("created_at", desc=True).limit(1).execute())
-    game_data = (res.data or [{}])[0]
+    game_row = (res.data or [{}])[0]
+    if deposit_id and game_row.get("id"):
+        try:
+            gid, did = game_row["id"], deposit_id
+            await run(lambda: sb.table("games").update({"deposit_id": did}).eq("id", gid).execute())
+        except Exception as e:
+            if _is_missing_column_pgrst(e, "deposit_id"):
+                logger.info("games.deposit_id: column not in schema — skipped (run migrations/018_games_deposit_id.sql).")
+            else:
+                logger.warning("games.deposit_id update skipped: %s", e)
+
+    game_data = normalize_game_prize_fields(game_row)
+    if deposit_id:
+        game_data["deposit_id"] = deposit_id
     return game_data
 
 @app.put("/api/games/{gid}")
@@ -1688,7 +1934,23 @@ async def update_game(gid: str, body: GameUpdate, _=Depends(require_admin)):
     updates = body.dict(exclude_none=True)
     if not updates: raise HTTPException(400, "Nothing to update")
     sb = get_sb()
-    await run(lambda: sb.table("games").update(updates).eq("id", gid).execute())
+    u: dict = dict(updates)
+    for _attempt in range(32):
+        try:
+            up = dict(u)
+            await run(lambda pl=up: sb.table("games").update(pl).eq("id", gid).execute())
+            break
+        except Exception as e:
+            col = _pgrst204_missing_column_name(e)
+            if col and col in u:
+                logger.warning("games.update: column %r not in schema — omitting.", col)
+                u = _games_payload_drop_keys(u, {col})
+                if not u:
+                    raise HTTPException(400, "No updatable fields left for this database schema") from e
+                continue
+            raise
+    else:
+        raise HTTPException(500, "games update failed after omitting unknown columns")
     return await get_game(gid, _)
 
 @app.delete("/api/games/{gid}")
@@ -1698,7 +1960,7 @@ async def delete_game(gid: str, _=Depends(require_admin)):
 
     def _delete_game_cascade():
         # Tables that reference games(id) without CASCADE — delete in dependency order
-        sb.table("qr_scans").delete().eq("game_id", gid).execute()
+        _pg_table(sb, "qr_scans").delete().eq("game_id", gid).execute()
         sb.table("round_answers").delete().eq("game_id", gid).execute()
         sb.table("spin_results").delete().eq("game_id", gid).execute()
         # Now delete game (CASCADE will remove game_sessions, game_questions, qr_codes, leaderboard)
@@ -1716,7 +1978,7 @@ async def activate_game(gid: str, _=Depends(require_admin)):
     sb = get_sb()
     # Use count queries (more reliable than data checks)
     gq_res  = await run(lambda: sb.table("game_questions").select("id", count="exact").eq("game_id", gid).execute())
-    qr_res  = await run(lambda: sb.table("qr_codes").select("id", count="exact").eq("game_id", gid).eq("status", "active").execute())
+    qr_res  = await run(lambda: _pg_table(sb, "qr_codes").select("id", count="exact").eq("game_id", gid).eq("status", "active").execute())
     gq_count = gq_res.count or 0
     qr_count = qr_res.count or 0
     if gq_count == 0:
@@ -1759,18 +2021,61 @@ async def admin_broadcast_game(game_id: str, _=Depends(require_admin)):
 
 @app.get("/api/games/{gid}/questions")
 async def get_game_questions_admin(gid: str, _=Depends(require_admin)):
-    """Admin: returns questions with is_correct visible."""
+    """
+    Admin: questions linked to a game with options and is_correct.
+    Uses separate queries — avoids PostgREST deep-embed failures (missing columns, FK hint names).
+    """
     sb = get_sb()
-    gq_res = await run(lambda: sb.table("game_questions").select(
-        "sort_order, questions(id, icon, question_text, category, status, explanation,"
-        "answer_options(id, option_letter, option_text, is_correct, sort_order))"
-    ).eq("game_id", gid).order("sort_order").execute())
+
+    def _gq_select(cols: str):
+        return (
+            sb.table("game_questions")
+            .select(cols)
+            .eq("game_id", gid)
+            .order("sort_order")
+            .execute()
+        )
+
+    try:
+        gq_res = await run(lambda: _gq_select("question_id, sort_order, level"))
+    except Exception:
+        gq_res = await run(lambda: _gq_select("question_id, sort_order"))
     rows = gq_res.data or []
-    result = []
-    for row in rows:
-        q = row.get("questions") or {}
-        q["sort_order"] = row.get("sort_order", 0)
-        q["options"] = sorted(q.pop("answer_options", []) or [], key=lambda x: x.get("sort_order", 0))
+    if not rows:
+        return []
+    qids = [r["question_id"] for r in rows if r.get("question_id")]
+    if not qids:
+        return []
+    order_map = {str(r["question_id"]): r.get("sort_order", 0) for r in rows}
+    level_map = {str(r["question_id"]): r.get("level") for r in rows if r.get("question_id")}
+
+    q_res = await run(lambda: sb.table("questions").select("*").in_("id", qids).execute())
+    q_by_id = {str(q["id"]): q for q in (q_res.data or [])}
+
+    opts_res = await run(
+        lambda: sb.table("answer_options").select("*").in_("question_id", qids).order("sort_order").execute()
+    )
+    opts_by_q: Dict[str, list] = {}
+    for opt in opts_res.data or []:
+        pid = opt.get("question_id")
+        if pid:
+            opts_by_q.setdefault(str(pid), []).append(opt)
+
+    result: list[dict] = []
+    for r in rows:
+        qid = r.get("question_id")
+        if not qid:
+            continue
+        sk = str(qid)
+        base = q_by_id.get(sk)
+        if not base:
+            continue
+        q = dict(base)
+        q["sort_order"] = order_map.get(sk, 0)
+        if level_map.get(sk) is not None:
+            q["game_level"] = level_map.get(sk)
+        opts = sorted(opts_by_q.get(sk, []), key=lambda x: x.get("sort_order", 0))
+        q["options"] = opts
         result.append(q)
     return result
 
@@ -1841,11 +2146,14 @@ async def create_question(body: QuestionCreate, _=Depends(require_admin)):
     sb = get_sb()
     admin = await run(lambda: sb.table("users").select("id").eq("role", "admin").limit(1).execute())
     created_by = (admin.data or [{}])[0].get("id")
+    qlvl = (body.level or "easy").strip().lower()
+    if qlvl not in ("easy", "medium", "hard"):
+        qlvl = "easy"
     payload = {
         "question_text": body.question_text, "category": body.category,
         "explanation": body.explanation, "icon": body.icon,
         "company_id": body.company_id, "is_sponsored": body.is_sponsored,
-        "created_by": created_by, "status": "approved"
+        "created_by": created_by, "status": "approved", "level": qlvl,
     }
     qrow_res = await run(lambda: sb.table("questions").insert(payload).execute())
     qrow = (qrow_res.data or [{}])[0]
@@ -1864,8 +2172,8 @@ async def create_question(body: QuestionCreate, _=Depends(require_admin)):
             max_ord = await run(lambda: sb.table("game_questions").select("sort_order")
                 .eq("game_id", body.game_id).order("sort_order", desc=True).limit(1).execute())
             next_ord = ((max_ord.data or [{}])[0].get("sort_order") or 0) + 1
-            await run(lambda: sb.table("game_questions").insert({
-                "game_id": body.game_id, "question_id": qid, "sort_order": next_ord
+            await run(lambda g=body.game_id, qi=qid, no=next_ord, lv=qlvl: sb.table("game_questions").insert({
+                "game_id": g, "question_id": qi, "sort_order": no, "level": lv,
             }).execute())
         qrow["game_id"] = body.game_id
     return qrow
@@ -2119,6 +2427,13 @@ async def generate_questions_admin(body: GenerateQuestionsReq, _=Depends(require
 
     saved = 0
     ai_prompt_summary = f"Categories: {', '.join(body.categories) or 'General'}. Difficulty: {body.difficulty}. Language: {body.language or 'English'}."
+    diff_l = (body.difficulty or "Medium").strip().lower()
+    if diff_l in ("easy", "e"):
+        ai_level = "easy"
+    elif diff_l in ("hard", "h"):
+        ai_level = "hard"
+    else:
+        ai_level = "medium"
     for q in questions:
         try:
             payload = {
@@ -2128,6 +2443,7 @@ async def generate_questions_admin(body: GenerateQuestionsReq, _=Depends(require
                 "icon": "🤖",
                 "created_by": created_by,
                 "status": "approved",
+                "level": ai_level,
                 "source": "AI Generated",
                 "language": body.language or "English",
                 "ai_prompt": ai_prompt_summary,
@@ -2178,25 +2494,36 @@ async def bulk_delete_questions(body: BulkDeleteQuestionsReq, _=Depends(require_
 @app.post("/api/questions/bulk-assign-game")
 async def bulk_assign_questions_to_game(body: BulkAssignGameReq, _=Depends(require_admin)):
     """Link selected questions to a game (add game_questions rows). Skips if already linked."""
-    qids = [x for x in (body.question_ids or []) if isinstance(x, str) and len(x) == 36]
+    raw_ids = body.question_ids or []
+    qids = [_norm_qid(x) for x in raw_ids if isinstance(x, str) and len(_norm_qid(x)) == 36]
     if not qids:
         raise HTTPException(400, "No valid question ids")
-    if not (body.game_id or len(body.game_id) == 36):
+    gid = (body.game_id or "").strip()
+    if len(gid) != 36:
         raise HTTPException(400, "Valid game_id required")
     sb = get_sb()
+    # game_questions.level is NOT NULL — derive from questions.level (or default easy).
+    qres = await run(lambda: sb.table("questions").select("*").in_("id", qids).execute())
+    level_by_qid: dict[str, str] = {}
+    for row in qres.data or []:
+        rk = _norm_qid(row.get("id"))
+        if not rk:
+            continue
+        level_by_qid[rk] = _normalize_question_level_for_game(row)
     existing = await run(lambda: sb.table("game_questions").select("question_id")
-        .eq("game_id", body.game_id).in_("question_id", qids).execute())
-    linked = {row["question_id"] for row in (existing.data or [])}
+        .eq("game_id", gid).in_("question_id", qids).execute())
+    linked = {_norm_qid(row["question_id"]) for row in (existing.data or []) if row.get("question_id")}
     max_ord = await run(lambda: sb.table("game_questions").select("sort_order")
-        .eq("game_id", body.game_id).order("sort_order", desc=True).limit(1).execute())
+        .eq("game_id", gid).order("sort_order", desc=True).limit(1).execute())
     next_ord = ((max_ord.data or [{}])[0].get("sort_order") or 0) + 1
     added = 0
     for qid in qids:
         if qid in linked:
             continue
-        await run(lambda qid=qid, no=next_ord: sb.table("game_questions").insert({
-            "game_id": body.game_id, "question_id": qid, "sort_order": no
-        }).execute())
+        lvl = level_by_qid.get(qid) or "easy"
+        if lvl not in ("easy", "medium", "hard"):
+            lvl = "easy"
+        await run(_insert_game_question_row, sb, gid, qid, lvl, next_ord)
         next_ord += 1
         added += 1
     return {"message": f"Assigned {added} question(s) to game", "added": added}
@@ -2206,8 +2533,19 @@ async def bulk_assign_questions_to_game(body: BulkAssignGameReq, _=Depends(requi
 async def update_question(qid: str, body: QuestionUpdate, _=Depends(require_admin)):
     sb = get_sb()
     updates = {k: v for k, v in body.dict(exclude_none=True).items() if k != "options"}
+    if "level" in updates:
+        lv = str(updates["level"]).strip().lower()
+        if lv in ("easy", "medium", "hard"):
+            updates["level"] = lv
+        else:
+            updates.pop("level", None)
     if updates:
         await run(lambda: sb.table("questions").update(updates).eq("id", qid).execute())
+        if "level" in updates:
+            try:
+                await run(lambda lv=updates["level"]: sb.table("game_questions").update({"level": lv}).eq("question_id", qid).execute())
+            except Exception as e:
+                logger.warning("game_questions.level sync skipped for %s: %s", qid, e)
     if body.options is not None:
         await run(lambda: sb.table("answer_options").delete().eq("question_id", qid).execute())
         allowed_letters = ("A", "B", "C", "D")
@@ -2648,20 +2986,27 @@ async def topup_company(cid: str, body: TopUpReq, _=Depends(require_admin)):
             last_err = e
             continue
     else:
+        if last_err and _is_missing_relation_error(last_err, "company_deposits"):
+            raise HTTPException(503, DEPOSITS_TABLE_HINT)
         msg = str(last_err) if last_err else "Insert failed"
-        raise HTTPException(503, f"Failed to create deposit. Run migration 016 in Supabase. Detail: {msg}")
+        raise HTTPException(503, f"Failed to create deposit. {DEPOSITS_TABLE_HINT} Detail: {msg}")
 
     # Fetch the row we just inserted (most recent pending deposit for this company)
-    fetched = await run(lambda: sb.table("company_deposits")
-        .select("id, status, amount_etb")
-        .eq("company_id", cid)
-        .eq("status", "pending")
-        .order("created_at", desc=True)
-        .limit(1)
-        .execute())
+    try:
+        fetched = await run(lambda: sb.table("company_deposits")
+            .select("id, status, amount_etb")
+            .eq("company_id", cid)
+            .eq("status", "pending")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute())
+    except Exception as e:
+        if _is_missing_relation_error(e, "company_deposits"):
+            raise HTTPException(503, DEPOSITS_TABLE_HINT)
+        raise
     rows = fetched.data if (fetched and fetched.data) else []
     if not rows:
-        raise HTTPException(500, "Deposit was not saved — check RLS policies on company_deposits in Supabase.")
+        raise HTTPException(503, "Deposit insert may have succeeded but could not be read — check RLS or run migration 016.")
 
     return {"deposit_id": str(rows[0]["id"]), "status": "pending", "amount_etb": amount}
 
@@ -2697,8 +3042,15 @@ async def get_analytics(days: int = 30, _=Depends(require_admin)):
         def q_streak():        return sb.table("users").select("id", count="exact").gt("current_streak", 1).execute()
         def q_wd_total():      return sb.table("withdrawals").select("id", count="exact").execute()
         def q_wd_done():       return sb.table("withdrawals").select("id", count="exact").eq("status", "completed").execute()
-        # FIX 1: use real commission_etb from deposits
-        def q_fee_income():    return sb.table("company_deposits").select("commission_etb").eq("status", "confirmed").execute()
+
+        def q_fee_income():
+            try:
+                return sb.table("company_deposits").select("commission_etb").eq("status", "confirmed").execute()
+            except Exception as e:
+                if _is_missing_relation_error(e, "company_deposits"):
+                    logger.warning("get_analytics: company_deposits missing — fee=0. %s", e)
+                    return _empty_rows_response()
+                raise
 
         (r_earners, r_comp, r_users, r_banned,
          r_streak, r_wd_total, r_wd_done, r_fee) = await gather(
@@ -2727,19 +3079,112 @@ async def get_analytics(days: int = 30, _=Depends(require_admin)):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("Analytics error: %s", e)
-        raise HTTPException(500, str(e))
+        logger.exception("Analytics degraded: %s", e)
+        return {
+            "user_growth": [],
+            "payout_trend": [],
+            "question_accuracy_by_category": [],
+            "level_stats": None,
+            "top_earners": [],
+            "company_spend": [],
+            "health": {
+                "ban_rate": 0,
+                "retention_rate": 0,
+                "withdrawal_success_rate": 0,
+                "platform_fee_income": 0,
+            },
+            "analytics_degraded": True,
+            "analytics_error": str(e),
+        }
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # QR CODES
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _token_from_target_url(url: str) -> str:
+    """Extract mini-app token from stored URL (?qr= or Telegram ?startapp=)."""
+    if not url:
+        return ""
+    q = parse_qs(urlparse(url).query)
+    for key in ("qr", "startapp"):
+        vals = q.get(key)
+        if vals and str(vals[0]).strip():
+            return str(vals[0]).strip()
+    return ""
+
+
+def _build_qr_target_url(base_url: str, token: str, game_id: str, company_id: Optional[str]) -> str:
+    """
+    Deep link for mini-app (matches admin/qr-manager.html buildQRUrl): ?qr=&g=&c=
+    """
+    raw = (base_url or "").strip().rstrip("?")
+    if not raw:
+        raw = "https://invalid.local/game"
+    if "://" not in raw:
+        raw = "https://" + raw.lstrip("/")
+    p = urlparse(raw)
+    qd = dict(parse_qsl(p.query, keep_blank_values=True))
+    qd["qr"] = token
+    qd["g"] = str(game_id).strip()
+    if company_id:
+        qd["c"] = str(company_id).strip()
+    path = p.path or "/"
+    return urlunparse((p.scheme, p.netloc, path, p.params, urlencode(qd), p.fragment))
+
+
+def _qr_find_by_token_sync(sb: Client, token: str) -> List[dict]:
+    """Resolve row by token column (extended schema) or target_url / qr_url containing token (shamo schema)."""
+    tok = (token or "").strip()
+    if not tok:
+        return []
+    try:
+        r = _pg_table(sb, "qr_codes").select("*").eq("token", tok).limit(1).execute()
+        if r.data:
+            return list(r.data)
+    except Exception:
+        pass
+    try:
+        r2 = _pg_table(sb, "qr_codes").select("*").ilike("target_url", f"%{tok}%").limit(3).execute()
+        if r2.data:
+            return [r2.data[0]]
+    except Exception:
+        pass
+    try:
+        r3 = _pg_table(sb, "qr_codes").select("*").ilike("qr_url", f"%{tok}%").limit(3).execute()
+        if r3.data:
+            return [r3.data[0]]
+    except Exception:
+        pass
+    return []
+
+
+def _qr_row_effective_status(qr: dict) -> str:
+    if qr.get("status"):
+        return str(qr["status"])
+    return "active" if qr.get("is_active", True) else "revoked"
+
+
+def _qr_row_out_for_admin(qr: dict, token_fallback: str = "", url_fallback: str = "") -> dict:
+    """Normalize qr_codes row for admin UI (token / qr_url / status)."""
+    out = dict(qr)
+    url = out.get("qr_url") or out.get("target_url") or url_fallback
+    tok = (out.get("token") or "").strip() or token_fallback or _token_from_target_url(url)
+    out["token"] = tok
+    out["qr_url"] = url
+    out["target_url"] = out.get("target_url") or url
+    if "status" not in out or out["status"] is None:
+        out["status"] = _qr_row_effective_status(out)
+    return out
+
+
 @app.get("/api/qr/scans")
 async def list_qr_scans(_=Depends(require_admin), limit: int = 50, game_id: str = ""):
     """Admin: returns recent scans with full player, QR, and game details."""
     sb = get_sb()
     try:
         def _q():
-            q = sb.table("qr_scans").select(
+            q = _pg_table(sb, "qr_scans").select(
                 "id,qr_code_id,qr_token,game_id,user_id,telegram_id,phone_number,"
                 "entry_status,block_reason,scanned_at"
             ).order("scanned_at", desc=True).limit(limit)
@@ -2770,10 +3215,18 @@ async def list_qr_scans(_=Depends(require_admin), limit: int = 50, game_id: str 
 
     try:
         if qr_ids:
-            qrr = await run(lambda: sb.table("qr_codes").select(
-                "id,token,label,status,scan_count"
-            ).in_("id", qr_ids).execute())
-            qr_map = {q["id"]: q for q in (qrr.data or [])}
+            try:
+                qrr = await run(lambda: _pg_table(sb, "qr_codes").select(
+                    "id,token,label,status,scan_count"
+                ).in_("id", qr_ids).execute())
+            except Exception:
+                qrr = await run(lambda: _pg_table(sb, "qr_codes").select(
+                    "id,label,scan_count,is_active,target_url,qr_url"
+                ).in_("id", qr_ids).execute())
+            qr_map = {}
+            for q in (qrr.data or []):
+                qm = _qr_row_out_for_admin(q)
+                qr_map[qm["id"]] = qm
     except Exception: pass
 
     try:
@@ -2794,16 +3247,60 @@ async def list_qr_scans(_=Depends(require_admin), limit: int = 50, game_id: str 
 @app.get("/api/qr")
 async def list_qr(_=Depends(require_admin), game_id: str = "", company_id: str = "", status: str = ""):
     sb = get_sb()
-    def _q():
-        q = sb.table("qr_codes").select(
+
+    def _q_embed():
+        q = _pg_table(sb, "qr_codes").select(
             "*, games!qr_codes_game_id_fkey(title,game_date,status), companies!qr_codes_company_id_fkey(name)"
         ).order("created_at", desc=True).limit(200)
-        if game_id:    q = q.eq("game_id", game_id)
-        if company_id: q = q.eq("company_id", company_id)
-        if status:     q = q.eq("status", status)
+        if game_id:
+            q = q.eq("game_id", game_id)
+        if company_id:
+            q = q.eq("company_id", company_id)
+        if status:
+            q = q.eq("status", status)
         return q.execute()
-    res = await run(_q)
-    return res.data or []
+
+    def _q_simple():
+        q = _pg_table(sb, "qr_codes").select("*").order("created_at", desc=True).limit(200)
+        if game_id:
+            q = q.eq("game_id", game_id)
+        if company_id:
+            q = q.eq("company_id", company_id)
+        if status:
+            q = q.eq("status", status)
+        return q.execute()
+
+    try:
+        res = await run(_q_embed)
+    except Exception as e:
+        logger.warning("list_qr: embed select failed (%s), using qr_codes only.", e)
+        try:
+            res = await run(_q_simple)
+        except Exception as e2:
+            logger.warning("list_qr: simple failed (%s), retrying with is_active filter.", e2)
+
+            def _q_shamo_status():
+                q = _pg_table(sb, "qr_codes").select("*").order("created_at", desc=True).limit(200)
+                if game_id:
+                    q = q.eq("game_id", game_id)
+                if company_id:
+                    q = q.eq("company_id", company_id)
+                if status == "active":
+                    q = q.eq("is_active", True)
+                elif status in ("revoked", "expired"):
+                    q = q.eq("is_active", False)
+                elif status:
+                    q = q.eq("status", status)
+                return q.execute()
+
+            try:
+                res = await run(_q_shamo_status)
+            except Exception as e3:
+                logger.error("list_qr: exhausted fallbacks: %s", e3)
+                raise
+
+    rows = res.data or []
+    return [_qr_row_out_for_admin(r) for r in rows]
 
 # External QR image API — store this URL in DB; never generate PNG locally
 QR_IMAGE_API_BASE = "https://api.qrserver.com/v1/create-qr-code/?size=160x160&data="
@@ -2815,19 +3312,49 @@ async def create_qr(body: QRCreateReq, _=Depends(require_admin)):
     created_by = (admin.data or [{}])[0].get("id")
     token = "SHQ_" + _secrets.token_hex(16).upper()
     expires_at = (datetime.now(timezone.utc) + timedelta(hours=body.expiry_hours)).isoformat() if body.expiry_hours > 0 else None
-    base_url = body.base_url.rstrip("?")
-    qr_url   = f"{base_url}?startapp={token}"
+    target_url = _build_qr_target_url(body.base_url, token, body.game_id, body.company_id)
     # Store exact external API URL for QR image (no local generation)
-    qr_image_url = QR_IMAGE_API_BASE + quote(qr_url, safe="")
-    payload  = {
-        "token": token, "game_id": body.game_id, "company_id": body.company_id or None,
-        "created_by": created_by, "label": body.label, "qr_url": qr_url,
+    qr_image_url = QR_IMAGE_API_BASE + quote(target_url, safe="")
+    extended = {
+        "token": token,
+        "game_id": body.game_id,
+        "company_id": body.company_id or None,
+        "created_by": created_by,
+        "label": body.label,
+        "qr_url": target_url,
+        "target_url": target_url,
         "qr_image_url": qr_image_url,
-        "base_url": body.base_url, "max_scans": body.max_scans, "expires_at": expires_at,
-        "status": "active", "scan_count": 0
+        "base_url": body.base_url,
+        "max_scans": body.max_scans,
+        "expires_at": expires_at,
+        "status": "active",
+        "scan_count": 0,
     }
-    res = await run(lambda: sb.table("qr_codes").insert(payload).execute())
-    qr_row = (res.data or [{}])[0]
+    shamo_min = {
+        "game_id": body.game_id,
+        "company_id": body.company_id or None,
+        "label": body.label,
+        "target_url": target_url,
+        "qr_image_url": qr_image_url,
+        "created_by": created_by,
+        "scan_count": 0,
+        "is_active": True,
+    }
+    qr_row = None
+    try:
+        res = await run(lambda: _pg_table(sb, "qr_codes").insert(extended).execute())
+        qr_row = (res.data or [None])[0]
+    except Exception as e:
+        logger.warning("create_qr: extended insert failed (%s), trying shamo.qr_codes shape.", e)
+        try:
+            res = await run(lambda: _pg_table(sb, "qr_codes").insert(shamo_min).execute())
+            qr_row = (res.data or [None])[0]
+        except Exception as e2:
+            logger.error("create_qr: shamo insert failed: %s", e2)
+            raise HTTPException(500, detail=str(e2))
+    if not qr_row:
+        raise HTTPException(500, detail="Failed to create QR code")
+    qr_row = _qr_row_out_for_admin(qr_row, token_fallback=token, url_fallback=target_url)
     # Notification center: notify users when a QR code is generated (fire-and-forget)
     try:
         game_id = qr_row.get("game_id")
@@ -2835,10 +3362,8 @@ async def create_qr(body: QRCreateReq, _=Depends(require_admin)):
         game_data = None
         company_data = None
         if game_id:
-            g_res = await run(lambda: sb.table("games").select(
-                "id,title,game_date,status,prize_pool_etb,total_players,ends_at,company_id"
-            ).eq("id", game_id).single().execute())
-            game_data = g_res.data
+            g_res = await run(lambda: sb.table("games").select("*").eq("id", game_id).single().execute())
+            game_data = normalize_game_prize_fields(g_res.data)
         if company_id:
             c_res = await run(lambda: sb.table("companies").select("id,name").eq("id", company_id).single().execute())
             company_data = c_res.data
@@ -2863,8 +3388,8 @@ async def delete_qr(body: QRDeleteReq, _=Depends(require_admin)):
     sb = get_sb()
     try:
         await run(lambda: sb.table("game_sessions").update({"qr_code_id": None}).eq("qr_code_id", qid).execute())
-        await run(lambda: sb.table("qr_scans").delete().eq("qr_code_id", qid).execute())
-        await run(lambda: sb.table("qr_codes").delete().eq("id", qid).execute())
+        await run(lambda: _pg_table(sb, "qr_scans").delete().eq("qr_code_id", qid).execute())
+        await run(lambda: _pg_table(sb, "qr_codes").delete().eq("id", qid).execute())
     except Exception as e:
         logger.warning("delete_qr %s: %s", qid, e)
         raise HTTPException(500, str(e))
@@ -2878,32 +3403,48 @@ async def validate_qr_token(body: QRScanReq):
     FIX 2: now also checks whether this user (by user_id OR telegram_id) already
     has an entry in qr_scans for this game, returning already_played=True so the
     mini-app can block re-entry immediately.
+
+    Resolves QR by token column or by target_url/qr_url containing the token (shamo schema).
     """
     sb = get_sb()
-    res = await run(lambda: sb.table("qr_codes").select(
-        "*, games!qr_codes_game_id_fkey(id,title,status,game_date,prize_pool_etb,prize_pool_remaining),"
-        "companies!qr_codes_company_id_fkey(name)"
-    ).eq("token", body.token).limit(1).execute())
-
-    rows = res.data or []
+    rows = await run(lambda: _qr_find_by_token_sync(sb, body.token))
     if not rows:
         return {"ok": False, "reason": "Invalid QR code"}
 
     qr = rows[0]
+    st = _qr_row_effective_status(qr)
+    if st != "active":
+        return {"ok": False, "reason": f"QR code is {st}"}
 
-    if qr["status"] != "active":
-        return {"ok": False, "reason": f"QR code is {qr['status']}"}
-
-    if qr["expires_at"]:
-        exp = datetime.fromisoformat(qr["expires_at"].replace("Z", "+00:00"))
+    exp_raw = qr.get("expires_at")
+    if exp_raw:
+        exp = datetime.fromisoformat(str(exp_raw).replace("Z", "+00:00"))
         if exp < datetime.now(timezone.utc):
-            await run(lambda: sb.table("qr_codes").update({"status": "expired"}).eq("id", qr["id"]).execute())
+            try:
+                await run(lambda: _pg_table(sb, "qr_codes").update({"status": "expired"}).eq("id", qr["id"]).execute())
+            except Exception:
+                await run(lambda: _pg_table(sb, "qr_codes").update({"is_active": False}).eq("id", qr["id"]).execute())
             return {"ok": False, "reason": "QR code has expired"}
 
-    if qr["max_scans"] > 0 and qr["scan_count"] >= qr["max_scans"]:
+    max_scans = int(qr.get("max_scans") or 0)
+    scan_count = int(qr.get("scan_count") or 0)
+    if max_scans > 0 and scan_count >= max_scans:
         return {"ok": False, "reason": "QR code scan limit reached"}
 
     game = qr.get("games") or {}
+    if not game or not game.get("id"):
+        gid = qr.get("game_id")
+        if gid:
+            try:
+                g_res = await run(lambda: sb.table("games").select("*").eq("id", gid).single().execute())
+                game = normalize_game_prize_fields(g_res.data or {}) or {}
+            except Exception:
+                game = {}
+        else:
+            game = {}
+    else:
+        normalize_game_prize_fields(game)
+
     if game.get("status") not in ("active", "scheduled"):
         return {"ok": False, "reason": f"Game is {game.get('status', 'unavailable')}"}
 
@@ -2913,7 +3454,7 @@ async def validate_qr_token(body: QRScanReq):
     qr_code_id = qr["id"]
     if body.user_id or body.telegram_id:
         def _check_scan():
-            q = sb.table("qr_scans").select("id,entry_status").eq("qr_code_id", qr_code_id)
+            q = _pg_table(sb, "qr_scans").select("id,entry_status").eq("qr_code_id", qr_code_id)
             if body.user_id:
                 q = q.eq("user_id", body.user_id)
             elif body.telegram_id:
@@ -2928,16 +3469,27 @@ async def validate_qr_token(body: QRScanReq):
                 "already_played": True
             }
 
+    out_token = (qr.get("token") or "").strip() or (body.token or "").strip()
+    company_name = (qr.get("companies") or {}).get("name")
+    if company_name is None and qr.get("company_id"):
+        try:
+            c_res = await run(
+                lambda: sb.table("companies").select("name").eq("id", qr["company_id"]).single().execute()
+            )
+            company_name = (c_res.data or {}).get("name")
+        except Exception:
+            company_name = None
+
     return {
         "ok": True,
         "qr_code_id":    qr["id"],
-        "token":         qr["token"],
+        "token":         out_token,
         "game_id":       game_id,
         "game_title":    game.get("title"),
         "game_date":     game.get("game_date"),
         "prize_pool_etb": game.get("prize_pool_etb"),
         "prize_pool_remaining": game.get("prize_pool_remaining"),
-        "company":       (qr.get("companies") or {}).get("name"),
+        "company":       company_name,
         "label":         qr.get("label"),
     }
 
@@ -2945,15 +3497,17 @@ async def validate_qr_token(body: QRScanReq):
 async def get_qr_image(qid: str):
     """Redirect to stored QR image URL from api.qrserver.com (no local generation)."""
     sb = get_sb()
-    res = await run(lambda: sb.table("qr_codes").select("qr_image_url,qr_url").eq("id", qid).limit(1).execute())
+    # select * — column sets differ (shamo: target_url; extended: qr_url, token, …)
+    res = await run(lambda: _pg_table(sb, "qr_codes").select("*").eq("id", qid).limit(1).execute())
     rows = res.data or []
     if not rows:
         raise HTTPException(404, "QR code not found")
     row = rows[0]
     image_url = row.get("qr_image_url")
+    data_url = row.get("qr_url") or row.get("target_url") or ""
     if not image_url:
         # Backfill for rows created before qr_image_url existed
-        image_url = QR_IMAGE_API_BASE + quote((row.get("qr_url") or ""), safe="")
+        image_url = QR_IMAGE_API_BASE + quote(data_url, safe="")
     return RedirectResponse(url=image_url, status_code=302)
 
 @app.post("/api/qr/scan")
@@ -2966,9 +3520,7 @@ async def record_qr_scan(body: QRScanReq):
     """
     sb = get_sb()
 
-    qr_res = await run(lambda: sb.table("qr_codes").select("id,game_id")
-        .eq("token", body.token).limit(1).execute())
-    qr_rows = qr_res.data or []
+    qr_rows = await run(lambda: _qr_find_by_token_sync(sb, body.token))
     if not qr_rows:
         raise HTTPException(404, "QR code not found")
     qr = qr_rows[0]
@@ -2978,7 +3530,7 @@ async def record_qr_scan(body: QRScanReq):
     qr_code_id = qr["id"]
     if body.user_id or body.telegram_id:
         def _check():
-            q = sb.table("qr_scans").select("id").eq("qr_code_id", qr_code_id)
+            q = _pg_table(sb, "qr_scans").select("id").eq("qr_code_id", qr_code_id)
             if body.user_id:    q = q.eq("user_id", body.user_id)
             elif body.telegram_id: q = q.eq("telegram_id", body.telegram_id)
             return q.limit(1).execute()
@@ -2996,7 +3548,7 @@ async def record_qr_scan(body: QRScanReq):
         "entry_status": "entered"
     }
     try:
-        res = await run(lambda: sb.table("qr_scans").insert(scan).execute())
+        res = await run(lambda: _pg_table(sb, "qr_scans").insert(scan).execute())
         return (res.data or [{}])[0]
     except Exception as e:
         # Fallback: DB unique constraint still catches edge-case race conditions
@@ -3009,7 +3561,10 @@ async def record_qr_scan(body: QRScanReq):
 async def revoke_qr(qid: str, _=Depends(require_admin)):
     """Revoke a QR code (stops scanning; keeps record). Idempotent."""
     sb = get_sb()
-    await run(lambda: sb.table("qr_codes").update({"status": "revoked"}).eq("id", qid).execute())
+    try:
+        await run(lambda: _pg_table(sb, "qr_codes").update({"status": "revoked"}).eq("id", qid).execute())
+    except Exception:
+        await run(lambda: _pg_table(sb, "qr_codes").update({"is_active": False}).eq("id", qid).execute())
     return {"ok": True, "status": "revoked", "id": qid}
 
 
@@ -3020,7 +3575,7 @@ async def admin_broadcast_qr(qr_id: str, _=Depends(require_admin)):
     Sends "New QR code ready" to all users with notifications_enabled.
     """
     sb = get_sb()
-    qr_res = await run(lambda: sb.table("qr_codes").select("*").eq("id", qr_id).limit(1).execute())
+    qr_res = await run(lambda: _pg_table(sb, "qr_codes").select("*").eq("id", qr_id).limit(1).execute())
     if not qr_res.data:
         raise HTTPException(404, "QR code not found")
     qr = qr_res.data[0]
@@ -3029,10 +3584,8 @@ async def admin_broadcast_qr(qr_id: str, _=Depends(require_admin)):
     game_data = None
     company_data = None
     if game_id:
-        g_res = await run(lambda: sb.table("games").select(
-            "id,title,game_date,status,prize_pool_etb,total_players,ends_at,company_id"
-        ).eq("id", game_id).single().execute())
-        game_data = g_res.data
+        g_res = await run(lambda: sb.table("games").select("*").eq("id", game_id).single().execute())
+        game_data = normalize_game_prize_fields(g_res.data)
     if company_id:
         c_res = await run(lambda: sb.table("companies").select("id,name").eq("id", company_id).single().execute())
         company_data = c_res.data
@@ -3111,12 +3664,12 @@ async def start_session(body: SessionStartReq):
     # Resolve qr_code_id (only when joining via QR)
     qr_code_id = None
     if body.qr_token:
-        qr_r = await run(lambda: sb.table("qr_codes").select("id")
+        qr_r = await run(lambda: _pg_table(sb, "qr_codes").select("id")
             .eq("token", body.qr_token).single().execute())
         if qr_r.data: qr_code_id = qr_r.data["id"]
     else:
         # Attend without QR: must have scanned this game once (qr_scans record)
-        scan_check = sb.table("qr_scans").select("id").eq("game_id", body.game_id)
+        scan_check = _pg_table(sb, "qr_scans").select("id").eq("game_id", body.game_id)
         if body.user_id:
             scan_check = scan_check.eq("user_id", body.user_id)
         elif body.telegram_id is not None:
@@ -3128,9 +3681,8 @@ async def start_session(body: SessionStartReq):
             return {"session": None, "already_played": True, "reason": "Scan the game QR once first to join", "game_config": game_config}
 
     # Get game config
-    game_r = await run(lambda: sb.table("games")
-        .select("prize_pool_remaining,player_cap_pct").eq("id", body.game_id).single().execute())
-    game = game_r.data or {}
+    game_r = await run(lambda: sb.table("games").select("*").eq("id", body.game_id).single().execute())
+    game = normalize_game_prize_fields(game_r.data or {}) or {}
     remaining  = float(game.get("prize_pool_remaining") or 0)
     cap_pct    = float(game.get("player_cap_pct") or 30)
     player_cap = round(remaining * cap_pct / 100, 2)
@@ -3333,21 +3885,38 @@ async def list_deposits(_=Depends(require_admin), status: str = "", company_id: 
     sb = get_sb()
 
     def _q():
-        q = sb.table("company_deposits").select("*").order("created_at", desc=True)
+        q = sb.table("company_deposits").select("*", count="exact").order("created_at", desc=True)
         if status:
             q = q.eq("status", status)
         if company_id:
             q = q.eq("company_id", company_id)
         if search and search.strip():
             s = search.strip().replace("%", "")[:80]
-            q = q.ilike("amount_etb", f"%{s}%")  # safe fallback; ref_number search via JS filter
+            q = q.ilike("notes", f"%{s}%")
         offset = (page - 1) * per_page
         q = q.range(offset, offset + per_page - 1)
         return q.execute()
 
-    res = await run(_q)
+    try:
+        res = await run(_q)
+    except Exception as e:
+        if _is_missing_relation_error(e, "company_deposits"):
+            logger.warning("list_deposits: table missing. %s", e)
+            return {
+                "data": [],
+                "total": 0,
+                "page": page,
+                "per_page": per_page,
+                "deposits_table_missing": True,
+                "hint": DEPOSITS_TABLE_HINT,
+            }
+        logger.error("list_deposits: %s", e)
+        raise HTTPException(500, str(e))
+
     rows = res.data or []
-    total = res.count if (res.count is not None) else len(rows)
+    total = getattr(res, "count", None)
+    if total is None:
+        total = len(rows)
 
     # Resolve company names separately (no embed — avoids FK/schema issues)
     if rows:
@@ -3369,9 +3938,14 @@ async def approve_deposit(did: str, body: DepositApproveReq, _=Depends(require_a
     sb = get_sb()
     admin = await run(lambda: sb.table("users").select("id").eq("role","admin").limit(1).execute())
     confirmed_by = (admin.data or [{}])[0].get("id")
-    # Fetch the deposit to calculate commission and prize pool
-    dep_res = await run(lambda: sb.table("company_deposits").select("*").eq("id", did).eq("status", "pending").single().execute())
-    if not dep_res.data: raise HTTPException(404, "Deposit not found or already processed")
+    try:
+        dep_res = await run(lambda: sb.table("company_deposits").select("*").eq("id", did).eq("status", "pending").single().execute())
+    except Exception as e:
+        if _is_missing_relation_error(e, "company_deposits"):
+            raise HTTPException(503, DEPOSITS_TABLE_HINT)
+        raise HTTPException(500, str(e))
+    if not dep_res.data:
+        raise HTTPException(404, "Deposit not found or already processed")
     dep = dep_res.data
     amount = float(dep.get("amount_etb") or 0)
     commission_pct = float(dep.get("commission_pct") or 15.0)
@@ -3388,9 +3962,16 @@ async def approve_deposit(did: str, body: DepositApproveReq, _=Depends(require_a
     try:
         update_data["processed_at"] = datetime.now(timezone.utc).isoformat()
         await run(lambda: sb.table("company_deposits").update(update_data).eq("id", did).execute())
-    except Exception:
+    except Exception as e1:
+        if _is_missing_relation_error(e1, "company_deposits"):
+            raise HTTPException(503, DEPOSITS_TABLE_HINT)
         update_data.pop("processed_at", None)
-        await run(lambda: sb.table("company_deposits").update(update_data).eq("id", did).execute())
+        try:
+            await run(lambda: sb.table("company_deposits").update(update_data).eq("id", did).execute())
+        except Exception as e2:
+            if _is_missing_relation_error(e2, "company_deposits"):
+                raise HTTPException(503, DEPOSITS_TABLE_HINT)
+            raise HTTPException(500, str(e2))
     # Add prize_pool_etb to company credit_balance
     co_res = await run(lambda: sb.table("companies").select("credit_balance").eq("id", dep["company_id"]).single().execute())
     current_bal = float((co_res.data or {}).get("credit_balance") or 0)
@@ -3400,9 +3981,14 @@ async def approve_deposit(did: str, body: DepositApproveReq, _=Depends(require_a
 @app.post("/api/deposits/{did}/reject")
 async def reject_deposit(did: str, body: DepositRejectReq, _=Depends(require_admin)):
     sb = get_sb()
-    await run(lambda: sb.table("company_deposits").update({
-        "status": "rejected", "rejected_reason": body.reason
-    }).eq("id", did).eq("status", "pending").execute())
+    try:
+        await run(lambda: sb.table("company_deposits").update({
+            "status": "rejected", "rejected_reason": body.reason
+        }).eq("id", did).eq("status", "pending").execute())
+    except Exception as e:
+        if _is_missing_relation_error(e, "company_deposits"):
+            raise HTTPException(503, DEPOSITS_TABLE_HINT)
+        raise HTTPException(500, str(e))
     return {"status": "rejected"}
 
 # ═══════════════════════════════════════════════════════════════════════════════

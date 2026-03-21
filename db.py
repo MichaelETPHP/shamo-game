@@ -11,9 +11,10 @@ Public API
   pool             → the underlying psycopg2.pool.ThreadedConnectionPool (for advanced use)
 """
 import logging
-import os
 from contextlib import contextmanager
 from typing import Any, Optional
+
+from shamo_env import DATABASE_URL, DB_SCHEMA
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +30,7 @@ except ImportError:
     _PSYCOPG2_OK = False
     logger.warning("psycopg2 not installed — DB pool disabled. Run: pip install psycopg2-binary")
 
-# ── Config ────────────────────────────────────────────────────────────────────
-DATABASE_URL: str = (os.getenv("DATABASE_URL") or "").strip()
-DB_SCHEMA:    str = (os.getenv("DB_SCHEMA") or "public").strip()
+# ── Config from shamo_env.py (.env: DATABASE_URL, DB_SCHEMA) ───────────────────
 
 # ── Connection pool (lazy-initialised) ───────────────────────────────────────
 _pool: Optional[Any] = None   # psycopg2.pool.ThreadedConnectionPool
@@ -51,7 +50,7 @@ def _init_pool() -> None:
         minconn=2,
         maxconn=20,
         dsn=DATABASE_URL,
-        options=f"-c search_path={DB_SCHEMA},public",   # ← always use shamo schema
+        options=f"-c search_path={DB_SCHEMA},public",   # DB_SCHEMA from .env (default public)
     )
     logger.info("DB pool created [schema=%s] → %s", DB_SCHEMA,
                 DATABASE_URL.split("@")[-1])   # log host only, no password

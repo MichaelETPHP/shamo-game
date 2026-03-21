@@ -100,6 +100,10 @@
                         <option value="draft">Draft</option>
                         <option value="ended">Ended</option>
                     </select>
+                    <select id="companyFilter" title="Filter games by sponsor company" onchange="loadGames(1)" style="min-width:200px">
+                        <option value="">All companies</option>
+                        <option value="__platform__">Platform only (no company)</option>
+                    </select>
                     <button class="btn btn-primary" onclick="openCreateGame()">＋ New Game</button>
                 </div>
             </div>
@@ -191,9 +195,10 @@
                 <div class="form-row">
                     <div class="form-group">
                         <label>Company (optional)</label>
-                        <select id="gCompany">
-                            <option value="">— Platform Game —</option>
+                        <select id="gCompany" onchange="syncCompanyFilterFromModal()" title="Choosing a company filters the list below to that company’s games. Platform = no sponsor.">
+                            <option value="">— Platform Game (no company) —</option>
                         </select>
+                        <div style="font-size:.72rem;color:var(--muted);margin-top:4px">List updates: <b>Platform</b> → platform games only · <b>Company</b> → that company’s games</div>
                     </div>
                 </div>
 
@@ -247,18 +252,33 @@ Join SHAMO now. Test your knowledge. Spin. Win. Enjoy the game.`;
         buildSidebar('games');
         requireAuth();
 
-        // ── Load companies for picker ───────────────────────────────
+        // ── Load companies for modal + top filter (active + pending) ───────────
         async function loadCompanies() {
             try {
-                const r = await apiGet('/companies?per_page=100&status=active');
+                const r = await apiGet('/companies?per_page=200');
                 allCompanies = r.data || [];
-                const sel = document.getElementById('gCompany');
+                const gSel = document.getElementById('gCompany');
+                const fSel = document.getElementById('companyFilter');
+                const keepG = gSel.value;
+                const keepF = fSel.value;
+                while (gSel.options.length > 1) gSel.remove(1);
+                while (fSel.options.length > 2) fSel.remove(2);
                 allCompanies.forEach(c => {
-                    const o = document.createElement('option');
-                    o.value = c.id; o.textContent = c.name;
-                    sel.appendChild(o);
+                    const name = (c.name || '—') + (c.status && c.status !== 'active' ? ` (${c.status})` : '');
+                    gSel.appendChild(new Option(name, c.id));
+                    fSel.appendChild(new Option(name, c.id));
                 });
+                if ([...gSel.options].some(o => o.value === keepG)) gSel.value = keepG;
+                if ([...fSel.options].some(o => o.value === keepF)) fSel.value = keepF;
             } catch (e) { /* companies optional */ }
+        }
+
+        /** Modal company dropdown → same filter as top bar + refresh list */
+        function syncCompanyFilterFromModal() {
+            const cid = document.getElementById('gCompany').value;
+            const f = document.getElementById('companyFilter');
+            f.value = cid ? cid : '__platform__';
+            loadGames(1);
         }
 
         // ── Load & render games ─────────────────────────────────────
@@ -269,7 +289,10 @@ Join SHAMO now. Test your knowledge. Spin. Win. Enjoy the game.`;
             try {
                 const search = document.getElementById('searchG').value;
                 const status = document.getElementById('statusFilter').value;
-                const r = await apiGet(`/games?page=${page}&per_page=15&search=${encodeURIComponent(search)}&status=${status}`);
+                const companyId = document.getElementById('companyFilter').value;
+                let q = `/games?page=${page}&per_page=15&search=${encodeURIComponent(search)}&status=${encodeURIComponent(status)}`;
+                if (companyId) q += `&company_id=${encodeURIComponent(companyId)}`;
+                const r = await apiGet(q);
                 const games = r.data || [];
 
                 // Update stat chips
@@ -346,13 +369,26 @@ Join SHAMO now. Test your knowledge. Spin. Win. Enjoy the game.`;
             if (qrContent) qrContent.innerHTML = '⏳ Loading QR codes…';
 
             try {
-                const [qs, qrList] = await Promise.all([
-                    apiGet(`/games/${gid}/questions`),
-                    apiGet(`/qr?game_id=${gid}`)
-                ]);
+                let qs = [];
+                let qrList = [];
+                try {
+                    qs = await apiGet(`/games/${gid}/questions`);
+                } catch (e1) {
+                    throw new Error('Questions: ' + (e1.message || e1));
+                }
+                try {
+                    qrList = await apiGet(`/qr?game_id=${encodeURIComponent(gid)}`);
+                } catch (e2) {
+                    console.warn('QR list failed (non-fatal):', e2);
+                    qrList = [];
+                }
                 const qCount = Array.isArray(qs) ? qs.length : 0;
                 const qrs = Array.isArray(qrList) ? qrList : (qrList?.data || qrList || []);
-                const qrCount = qrs.filter(q => (q.status || 'active') === 'active').length;
+                const qrCount = qrs.filter(q => {
+                    if (q.status != null && q.status !== '') return String(q.status).toLowerCase() === 'active';
+                    if (q.is_active != null) return q.is_active === true;
+                    return true;
+                }).length;
                 const ready = qCount > 0 && qrCount > 0;
                 const readyHtml = `<div style="margin-bottom:14px;padding:10px 14px;border-radius:8px;background:${ready ? 'rgba(34,197,94,.1)' : 'rgba(249,115,22,.1)'};border:1px solid ${ready ? 'var(--green)' : 'var(--orange)'};font-size:.82rem;">
                   ${ready ? '✓ Ready to go live' : '⚠ To go live'}: ${qCount} question(s), ${qrCount} active QR code(s). ${ready ? 'You can click "▶ Go Live" in the row above.' : 'Add at least one question and generate at least one QR code (QR Manager or create below).'}
@@ -392,7 +428,7 @@ Join SHAMO now. Test your knowledge. Spin. Win. Enjoy the game.`;
           <div style="display:flex;flex-wrap:wrap;gap:10px;">
             ${qrs.map(qr => `
               <div style="background:rgba(0,0,0,.2);border:1px solid var(--border);border-radius:8px;padding:10px 14px;font-size:.75rem;">
-                <div style="color:var(--muted);margin-bottom:4px">${qr.label || 'QR'} · ${qr.status || 'active'} · ${qr.scan_count ?? 0} scans</div>
+                <div style="color:var(--muted);margin-bottom:4px">${qr.label || 'QR'} · ${qr.status != null ? qr.status : (qr.is_active ? 'active' : 'inactive')} · ${qr.scan_count ?? 0} scans</div>
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
                   <code style="background:var(--p2);padding:4px 8px;border-radius:4px;word-break:break-all;max-width:220px">${qr.token || qr.id}</code>
                   <button type="button" class="btn btn-ghost btn-sm" onclick="navigator.clipboard.writeText('${(qr.token || qr.id || '').replace(/'/g, "\\'")}');showToast('Copied!')">Copy</button>
@@ -445,6 +481,8 @@ Join SHAMO now. Test your knowledge. Spin. Win. Enjoy the game.`;
             document.getElementById('gMaxPay').value = '1000';
             document.getElementById('gStatus').value = 'draft';
             document.getElementById('gCompany').value = '';
+            document.getElementById('companyFilter').value = '__platform__';
+            loadGames(1);
 
             // Default date/time = today in Ethiopian time (GMT+3)
             const todayEt = nowEtInput();                        // "YYYY-MM-DDTHH:MM"
@@ -472,6 +510,8 @@ Join SHAMO now. Test your knowledge. Spin. Win. Enjoy the game.`;
                 document.getElementById('gPool').value = g.prize_pool_etb ?? 500;
                 document.getElementById('gMaxPay').value = g.max_prize_etb ?? 1000;
                 document.getElementById('gCompany').value = g.company_id || '';
+                document.getElementById('companyFilter').value = g.company_id ? g.company_id : '__platform__';
+                loadGames(1);
                 openModal('modalGame');
             } catch (e) { showToast(e.message, 'error'); }
         }

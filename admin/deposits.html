@@ -98,6 +98,18 @@
                 const search = document.getElementById('searchD').value;
                 const status = document.getElementById('dStatus').value;
                 const r = await apiGet(`/deposits?page=${page}&per_page=15&search=${encodeURIComponent(search)}&status=${status}`);
+                if (r.deposits_table_missing) {
+                    dData = [];
+                    document.getElementById('stTotal').textContent = '0';
+                    document.getElementById('stPending').textContent = '0';
+                    document.getElementById('stConfirmed').textContent = '0';
+                    document.getElementById('stAmount').textContent = '0 ETB';
+                    document.getElementById('pendingAlert').innerHTML =
+                        `<div style="background:rgba(249,115,22,.1);border:1px solid rgba(249,115,22,.35);border-radius:12px;padding:1rem;margin-bottom:1rem;font-size:.85rem">${(r.hint || 'Run migrations/016_company_deposits.sql').replace(/</g, '&lt;')}</div>`;
+                    document.getElementById('dBody').innerHTML = `<tr><td colspan="6" style="text-align:center;padding:2rem;color:var(--muted)">Deposits table not installed yet.</td></tr>`;
+                    document.getElementById('dPagination').innerHTML = '';
+                    return;
+                }
                 dData = r.data || [];
 
                 // Stats strip

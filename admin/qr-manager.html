@@ -531,6 +531,31 @@
     }
 
     // ── BUILD QR URL ────────────────────────────────────────────────
+    /** Admin list/detail: status column or is_active (shamo). */
+    function effectiveQrStatus(qr) {
+      if (qr && qr.status) return qr.status;
+      if (qr && qr.is_active === false) return 'revoked';
+      return 'active';
+    }
+
+    /** Token may only live inside target_url (?qr= / ?startapp=). */
+    function tokenFromQr(qr) {
+      if (!qr) return '—';
+      if (qr.token) return qr.token;
+      const u = qr.qr_url || qr.target_url || '';
+      if (!u) return '—';
+      try {
+        const sp = new URL(u, 'https://dummy.local').searchParams;
+        return sp.get('qr') || sp.get('startapp') || '—';
+      } catch {
+        return '—';
+      }
+    }
+
+    function displayQrUrl(qr) {
+      return (qr && (qr.qr_url || qr.target_url)) || '—';
+    }
+
     function buildQRUrl(token, gameId, companyId, baseUrl) {
       const url = new URL(baseUrl);
       url.searchParams.set('qr', token);
@@ -668,9 +693,9 @@
 
       // Stats
       document.getElementById('stTotal').textContent = list.length;
-      document.getElementById('stActive').textContent = list.filter(q => q.status === 'active').length;
+      document.getElementById('stActive').textContent = list.filter(q => effectiveQrStatus(q) === 'active').length;
       document.getElementById('stScans').textContent = list.reduce((a, q) => a + (q.scan_count || 0), 0);
-      document.getElementById('stRevoked').textContent = list.filter(q => q.status === 'revoked').length;
+      document.getElementById('stRevoked').textContent = list.filter(q => effectiveQrStatus(q) === 'revoked').length;
 
       if (!list.length) {
         document.getElementById('qrGrid').innerHTML = `<div class="empty-state">NO QR CODES YET — GENERATE ONE ABOVE</div>`;
@@ -680,21 +705,21 @@
       document.getElementById('qrGrid').innerHTML = list.map(qr => `
   <div class="qr-card" id="qrc_${qr.id}">
     <div class="qr-canvas-wrap" onclick="openDetail(${JSON.stringify(qr).replace(/"/g, '&quot;')})">
-      <img src="${(qr.qr_image_url || ('/api/qr/' + qr.id + '/image'))}" width="160" height="160" alt="QR ${qr.id}" onerror="this.src='https://api.qrserver.com/v1/create-qr-code/?size=160x160&data='+encodeURIComponent(qr.qr_url||'')"/>
+      <img src="${(qr.qr_image_url || ('/api/qr/' + qr.id + '/image'))}" width="160" height="160" alt="QR ${qr.id}" onerror="this.src='https://api.qrserver.com/v1/create-qr-code/?size=160x160&data='+encodeURIComponent(qr.qr_url||qr.target_url||'')"/>
       <div class="qr-scan-overlay">👁 View / Download</div>
     </div>
     <div class="qr-card-body">
       <div class="qr-game-name">${qr.label || 'Unnamed'}</div>
       <div class="qr-company">${qr.games?.title || '—'} · ${qr.companies?.name || 'Platform'}</div>
       <div class="qr-meta">
-        ${statusBadge(qr.status)}
+        ${statusBadge(effectiveQrStatus(qr))}
         <span class="qr-scans">${qr.scan_count || 0} scans${qr.max_scans ? '/' + qr.max_scans : ''}</span>
         ${qr.expires_at ? `<span class="qr-scans">⏰ ${new Date(qr.expires_at).toLocaleDateString('en-GB')}</span>` : ''}
       </div>
     </div>
     <div class="qr-actions">
       <button class="btn btn-primary btn-sm" style="flex:1;font-size:.72rem;" onclick="openDetail(${JSON.stringify(qr).replace(/"/g, '&quot;')})">⬇ Download</button>
-      ${qr.status === 'active'
+      ${effectiveQrStatus(qr) === 'active'
           ? `<button class="btn btn-danger btn-sm" style="font-size:.72rem; padding: 4px 8px;" title="Revoke" onclick="revokeQR('${qr.id}')">🚫</button>`
           : `<span class="badge badge-muted" style="font-size:.65rem; display:flex; align-items:center;">Revoked</span>`}
       <button class="btn btn-delete btn-sm" style="font-size:.72rem; padding: 4px 8px;" title="Permanently delete this QR code" onclick="deleteQR('${String(qr.id || '').replace(/'/g, "\\'")}')">🗑️</button>
@@ -717,8 +742,8 @@
       _detailQR = qr;
       document.getElementById('detailTitle').textContent = qr.label || 'QR Code';
       document.getElementById('detailLabel').textContent = qr.label || '—';
-      document.getElementById('detailToken').textContent = qr.token;
-      document.getElementById('detailUrl').textContent = qr.qr_url;
+      document.getElementById('detailToken').textContent = tokenFromQr(qr);
+      document.getElementById('detailUrl').textContent = displayQrUrl(qr);
 
       const img = document.getElementById('detailImage');
       const fallbackUrl = `/api/qr/${qr.id}/image`;
@@ -730,7 +755,12 @@
       openModal('detailModal');
     }
 
-    function copyDetailToken() { navigator.clipboard?.writeText(_detailQR?.token || '').then(() => showToast('Token copied!', 'success')); }
+    function copyDetailToken() {
+      const t = tokenFromQr(_detailQR);
+      const s = (t === '—') ? '' : t;
+      if (!s) { showToast('No token to copy', 'error'); return; }
+      navigator.clipboard?.writeText(s).then(() => showToast('Token copied!', 'success'));
+    }
     function copyToken() { navigator.clipboard?.writeText(currentToken || '').then(() => showToast('Token copied!', 'success')); }
 
     // ── DOWNLOAD QR PNG ─────────────────────────────────────────────
@@ -763,7 +793,8 @@
         ctx.font = '13px monospace'; ctx.fillStyle = '#444';
         ctx.fillText(_detailQR?.label || 'Game Entry', 200, 350);
         ctx.font = '9px monospace'; ctx.fillStyle = '#999';
-        ctx.fillText(_detailQR?.token || '', 200, 374);
+        const _tkDl = tokenFromQr(_detailQR);
+        ctx.fillText(_tkDl === '—' ? '' : _tkDl, 200, 374);
         ctx.font = '11px monospace'; ctx.fillStyle = '#C8860A';
         ctx.fillText("Scan to enter tonight's game →", 200, 398);
         ctx.font = '9px monospace'; ctx.fillStyle = '#bbb';

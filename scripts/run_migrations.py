@@ -1,5 +1,8 @@
 """
 Run SHAMO SQL migrations from migrations/shamo-schema-full.sql using DATABASE_URL.
+Creates/uses schema **shamo**. For a **public**-schema install, run
+migrations/shamo_one_click_install_public.sql in psql/Supabase SQL editor instead.
+
 Usage: python scripts/run_migrations.py
 Requires: psycopg2 installed in the active environment.
 """

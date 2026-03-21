@@ -129,6 +129,9 @@
       el.innerHTML = `<div style="text-align:center;padding:4rem;color:var(--muted)">⏳ Loading analytics…</div>`;
       try {
         const d = await apiGet(`/analytics?days=${days}`);
+        if (d.analytics_degraded) {
+          showToast('Analytics incomplete: ' + String(d.analytics_error || 'unknown').slice(0, 200), 'error', 6000);
+        }
         const h = d.health || {};
         const ls = d.level_stats || {};
         const total_sessions = ls.total_sessions || 1;
@@ -144,6 +147,7 @@
         const maxAccPct = 100;
 
         el.innerHTML = `
+      ${d.analytics_degraded ? `<div style="padding:.85rem 1rem;margin-bottom:1rem;background:rgba(249,115,22,.12);border:1px solid rgba(249,115,22,.35);border-radius:10px;font-size:.82rem;color:#fdba74">⚠️ Some analytics queries failed. ${String(d.analytics_error || '').replace(/</g, '&lt;')}</div>` : ''}
       <!-- KPIs -->
       <div class="kpi-row">
         ${[

@@ -1,7 +1,9 @@
 # Python / Virtualenv
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
+.venv/
 venv/
 .env
 .env.*
@@ -35,9 +37,15 @@ build/
 *.min.js
 *.map
 
-# Database & migrations temp
+# ── Do not push (local / SQL / scripts) ──────────────────────
+.claude/
+README.md
+ENV_SELF_HOSTED.sample
 migrations/
-migrations/__pycache__/
+scripts/
+start_services.ps1
+
+# Database files (local)
 *.sqlite3
 *.db
 *.db-journal
@@ -48,7 +56,6 @@ supabase/
 
 # PM2 / deployment
 .pm2/
-start_services.ps1
 pm2.log
 dump.pm2
 *.pid
@@ -69,6 +76,5 @@ desktop.ini
 
 # Keep these (examples are safe)
 !.gitignore
-!README.md
 !requirements.txt
 !ecosystem.config.js

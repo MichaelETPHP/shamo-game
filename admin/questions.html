@@ -181,7 +181,7 @@
         <div id="bulkBar" class="bulk-bar" style="display:none">
           <span id="bulkCount">0</span> selected
           <button type="button" class="btn btn-red btn-sm" onclick="bulkDelete()">🗑 Delete selected</button>
-          <select id="bulkGame" style="max-width:200px">
+          <select id="bulkGame" style="max-width:200px" title="Each question keeps its difficulty; game rounds use Easy/Medium/Hard from the question">
             <option value="">— Assign to game —</option>
           </select>
           <button type="button" class="btn btn-primary btn-sm" onclick="bulkAssignGame()">Assign to game</button>
@@ -259,6 +259,14 @@
           <div class="form-group" style="max-width:80px">
             <label>Icon</label>
             <input id="aIcon" type="text" value="🇪🇹" />
+          </div>
+          <div class="form-group" style="max-width:130px">
+            <label>Difficulty</label>
+            <select id="aLevel" title="Used when linking to a game (Easy/Medium/Hard rounds)">
+              <option value="easy">Easy</option>
+              <option value="medium">Medium</option>
+              <option value="hard">Hard</option>
+            </select>
           </div>
         </div>
         <div class="form-group">
@@ -698,10 +706,13 @@
     }
 
     async function bulkAssignGame() {
-      const ids = Array.from(selectedQuestionIds);
-      const gameId = document.getElementById('bulkGame').value;
+      const ids = Array.from(selectedQuestionIds)
+        .map(id => String(id || '').trim())
+        .filter(id => /^[0-9a-fA-F-]{36}$/.test(id));
+      const gameId = (document.getElementById('bulkGame').value || '').trim();
       if (!ids.length) { showToast('Select at least one question', 'error'); return; }
       if (!gameId) { showToast('Select a game to assign to', 'error'); return; }
+      if (!/^[0-9a-fA-F-]{36}$/.test(gameId)) { showToast('Invalid game id', 'error'); return; }
       try {
         const r = await apiPost('/questions/bulk-assign-game', { question_ids: ids, game_id: gameId });
         showToast(r.message || 'Assigned to game', 'success');
@@ -717,6 +728,8 @@
       document.getElementById('aText').value = '';
       document.getElementById('aIcon').value = '🇪🇹';
       document.getElementById('aExplain').value = '';
+      const lv = document.getElementById('aLevel');
+      if (lv) lv.value = 'easy';
       document.getElementById('addQBtn').textContent = '✅ Add Question';
       const filterGame = document.getElementById('qGame').value;
       document.getElementById('aGame').value = filterGame || '';
@@ -735,6 +748,11 @@
         populateCatDropdown(q.category || '');
         document.getElementById('aIcon').value = q.icon || '🇪🇹';
         document.getElementById('aExplain').value = q.explanation || '';
+        const lvEl = document.getElementById('aLevel');
+        if (lvEl) {
+          const L = (q.level || 'easy').toString().toLowerCase();
+          lvEl.value = ['easy', 'medium', 'hard'].includes(L) ? L : 'easy';
+        }
         document.getElementById('addQBtn').textContent = '✅ Save changes';
         const opts = (q.options || []).sort((a, b) => (a.option_letter || '').localeCompare(b.option_letter || ''));
         const letters = opts.length ? opts.map(o => o.option_letter) : ['A', 'B'];
@@ -877,12 +895,15 @@
           }
         }
 
+        let impLevel = (item.level || item.difficulty || 'easy').toString().trim().toLowerCase();
+        if (!['easy', 'medium', 'hard'].includes(impLevel)) impLevel = 'easy';
         const payload = {
           question_text: text,
           game_id: gameId,
           category: item.category || defaultCat,
           icon: item.icon || '🇪🇹',
           explanation: item.explanation || null,
+          level: impLevel,
           options: opts,
         };
 
@@ -938,12 +959,14 @@
       btn.disabled = true; btn.textContent = 'Saving…';
       try {
         const category = getSelectedCategory();
+        const diffLevel = (document.getElementById('aLevel') && document.getElementById('aLevel').value) || 'easy';
         if (editId) {
           const payload = {
             question_text: text,
             category,
             icon: document.getElementById('aIcon').value || '🇪🇹',
             explanation: document.getElementById('aExplain').value || null,
+            level: diffLevel,
             options,
           };
           await apiPut('/questions/' + editId, payload);
@@ -955,6 +978,7 @@
             category,
             icon: document.getElementById('aIcon').value || '🇪🇹',
             explanation: document.getElementById('aExplain').value || null,
+            level: diffLevel,
             options,
           };
           await apiPost('/questions', payload);
