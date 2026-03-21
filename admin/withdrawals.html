@@ -112,9 +112,9 @@
 
   <!-- Approve confirmation -->
   <div class="modal-overlay" id="modalApprove">
-    <div class="modal" style="max-width:420px">
+    <div class="modal" style="max-width:480px">
       <div class="modal-header">
-        <h2>Release to Talabirr</h2><button class="btn btn-ghost btn-icon" onclick="closeModal('modalApprove')">✕</button>
+        <h2>Confirm release</h2><button class="btn btn-ghost btn-icon" onclick="closeModal('modalApprove')">✕</button>
       </div>
       <div class="modal-body" id="approveBody"></div>
       <div class="modal-footer">
@@ -184,8 +184,8 @@
           <div style="font-size:.72rem;color:var(--muted)">@${w.telegram_username || '—'}</div>
         </td>
         <td style="color:var(--muted)">${fmtN(w.amount_requested)} ETB</td>
-        <td style="color:var(--red)">-${fmtN(w.fee_etb)} <span style="font-size:.7rem;opacity:.8">(${w.fee_pct || 5}%)</span></td>
-        <td style="font-weight:700;color:var(--gold)">${fmtN(w.amount_paid)} ETB</td>
+        <td style="color:var(--muted)">${w.status === 'pending' ? '0 ETB' : ('−' + fmtN(w.fee_etb) + ' ETB')} <span style="font-size:.7rem;opacity:.8">(${w.status === 'pending' ? '0' : (w.fee_pct || 0)}%)</span></td>
+        <td style="font-weight:700;color:var(--gold)">${fmtN(w.status === 'pending' ? (w.amount_requested || w.amount_paid) : w.amount_paid)} ETB</td>
         <td>${badge(w.status)}</td>
         <td><span class="talabirr-badge">${phone}</span></td>
         <td style="font-size:.8rem">${w.full_name || '—'}</td>
@@ -214,8 +214,8 @@
         document.getElementById('procBody').innerHTML = `
       ${w.status === 'pending' ? `
       <div class="release-card">
-        <div style="font-size:.7rem;color:var(--muted);margin-bottom:.3rem">Release to Talabirr</div>
-        <div class="release-amount">${fmtN(w.amount_paid)} ETB</div>
+        <div style="font-size:.7rem;color:var(--muted);margin-bottom:.3rem">Release to TeleBirr (full amount)</div>
+        <div class="release-amount">${fmtN(w.amount_requested || w.amount_paid)} ETB</div>
         <div class="release-phone">${phone}</div>
       </div>` : ''}
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem">
@@ -224,8 +224,8 @@
             ['Full Name', w.full_name || '—'],
             ['Talabirr Phone', `<span class="talabirr-badge">${phone}</span>`],
             ['Requested', fmtN(w.amount_requested) + ' ETB'],
-            ['Commission', '-' + fmtN(w.fee_etb) + ' ETB (' + (w.fee_pct || 5) + '%)'],
-            ['Amount Paid', fmtN(w.amount_paid) + ' ETB'],
+            ['Commission', w.status === 'pending' ? '0 ETB (players pay none)' : ('−' + fmtN(w.fee_etb) + ' ETB (' + (w.fee_pct || 0) + '%)')],
+            ['Release / Paid', fmtN(w.status === 'pending' ? (w.amount_requested || w.amount_paid) : w.amount_paid) + ' ETB'],
             ['Status', badge(w.status)],
             ['Requested', fmtTime(w.requested_at)],
             ['Processed', fmtTime(w.processed_at) || '—'],
@@ -249,31 +249,52 @@
     let _approveWid = null;
     let _viewW = null; // last viewed withdrawal (for approve from modal)
     function showApproveConfirm(id, wOverride) {
-      const w = wOverride || wData.find(x => x.id === id) || {};
-      const phone = w.phone_number || w.user_phone || '—';
-      const amt = fmtN(w.amount_paid || 0);
       _approveWid = id;
-      document.getElementById('approveBody').innerHTML = `
-        <div class="release-card">
-          <p style="margin-bottom:.5rem;color:var(--muted);font-size:.85rem">This will deduct balance and mark as completed. Cash will be released to:</p>
-          <div class="release-amount">${amt} ETB</div>
-          <div class="release-phone">${phone}</div>
-          <p style="margin-top:.75rem;font-size:.75rem;color:var(--muted)">${w.full_name ? 'Telebirr: ' + w.full_name + ' · ' : ''}${w.user_name || '—'}</p>
-        </div>`;
+      document.getElementById('approveBody').innerHTML = '<p style="text-align:center;color:var(--muted);padding:1rem">⏳ Loading preview…</p>';
+      openModal('modalApprove');
+      apiGet('/api/admin/withdrawals/' + encodeURIComponent(id) + '/release-preview').then(function (p) {
+        const rel = fmtN(p.release_amount_etb);
+        const req = fmtN(p.requested_etb);
+        const comm = fmtN(p.player_commission_etb != null ? p.player_commission_etb : 0);
+        const phone = p.phone_number || '—';
+        const player = p.player_name || '—';
+        let coHtml = '';
+        if (p.company_credit_before != null && p.company_credit_after != null) {
+          coHtml = `<div style="margin-top:.85rem;padding-top:.85rem;border-top:1px solid var(--border)">
+            <div style="font-size:.72rem;color:var(--muted);margin-bottom:.25rem">Company balance after release</div>
+            <div style="font-weight:700">${fmtN(p.company_credit_before)} ETB → ${fmtN(p.company_credit_after)} ETB</div>
+            ${p.company_name ? `<div style="font-size:.7rem;color:var(--muted)">${p.company_name}</div>` : ''}
+          </div>`;
+        }
+        document.getElementById('approveBody').innerHTML = `
+          <div style="font-size:1.05rem;font-weight:800;margin-bottom:.65rem">💸 Confirm Withdrawal Release</div>
+          <div style="font-size:.86rem;line-height:1.55">
+            <div><span style="color:var(--muted)">Player:</span> <b>${player}</b></div>
+            <div><span style="color:var(--muted)">Requested:</span> ${req} ETB</div>
+            <div><span style="color:var(--muted)">Commission:</span> − ${comm} ETB <span style="font-size:.72rem">(players pay no commission)</span></div>
+            <div style="margin:.55rem 0;padding:.55rem .75rem;background:rgba(34,197,94,.08);border-radius:10px;border:1px solid rgba(34,197,94,.22)">
+              <div style="font-size:.72rem;color:var(--muted)">Release amount</div>
+              <div style="font-size:1.35rem;font-weight:900;color:var(--gold)">${rel} ETB ✅</div>
+            </div>
+            <div><span style="color:var(--muted)">TeleBirr:</span> <span class="talabirr-badge">${phone}</span></div>
+            ${coHtml}
+          </div>`;
+      }).catch(function (e) {
+        document.getElementById('approveBody').innerHTML = '<p style="color:var(--red);padding:.5rem">' + (e.message || e) + '</p>';
+      });
       const btn = document.getElementById('approveConfirmBtn');
       btn.onclick = async () => {
         if (!_approveWid) return;
         try {
-          await apiPost(`/withdrawals/${_approveWid}/approve`);
+          await apiPatch('/api/admin/withdrawals/' + encodeURIComponent(_approveWid) + '/approve', {});
           closeModal('modalApprove');
           _approveWid = null;
-          showToast('Released to Talabirr ✅', 'success');
+          showToast('Released to TeleBirr ✅', 'success');
           loadW();
         } catch (e) {
           showToast(e.message, 'error');
         }
       };
-      openModal('modalApprove');
     }
 
     async function denyW(id) {

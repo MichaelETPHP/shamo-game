@@ -2294,6 +2294,95 @@
       box-shadow: 0 0 6px var(--gold)
     }
 
+    /* Accumulator meter + cash-out spin */
+    .acc-strip {
+      margin-bottom: 14px;
+      width: 100%;
+      position: relative;
+    }
+    .acc-stats {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 8px;
+      text-align: center;
+      line-height: 1.5;
+    }
+    .acc-meter-wrap {
+      position: relative;
+      margin: 0 4px;
+    }
+    .acc-meter-track {
+      height: 12px;
+      border-radius: 6px;
+      background: var(--p3);
+      overflow: hidden;
+    }
+    .acc-meter-fill {
+      height: 100%;
+      width: 0%;
+      border-radius: 6px;
+      transition: width 0.5s ease, background 0.35s ease;
+      background: linear-gradient(90deg, var(--green2), var(--gold));
+    }
+    .acc-meter-fill.acc-shrink {
+      background: linear-gradient(90deg, var(--orange), var(--red2));
+    }
+    .acc-meter-val {
+      text-align: center;
+      font-size: 21px;
+      font-weight: 700;
+      color: var(--gold);
+      margin-top: 6px;
+      font-family: 'Playfair Display', serif;
+    }
+    .acc-meter-delta {
+      text-align: center;
+      font-size: 13px;
+      min-height: 22px;
+      font-weight: 700;
+    }
+    .acc-meter-delta.up { color: var(--green); }
+    .acc-meter-delta.down { color: var(--red); }
+    .acc-spin-btn {
+      width: 100%;
+      margin-top: 12px;
+      padding: 13px 12px;
+      border: none;
+      border-radius: 14px;
+      background: linear-gradient(135deg, #9a7209, var(--gold));
+      color: #0A0800;
+      font-weight: 800;
+      font-size: 14px;
+      letter-spacing: 0.04em;
+      cursor: pointer;
+      display: none;
+      font-family: 'DM Mono', monospace;
+    }
+    .acc-spin-btn.show { display: block; }
+    .acc-spin-btn.pulse { animation: accSpinPulse 1.4s ease-in-out infinite; }
+    .acc-spin-btn:disabled { opacity: 0.4; animation: none; }
+    @keyframes accSpinPulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(232, 184, 75, 0.45); }
+      50% { box-shadow: 0 0 22px 6px rgba(232, 184, 75, 0.28); }
+    }
+    .acc-float-num {
+      position: absolute;
+      left: 50%;
+      top: -6px;
+      transform: translateX(-50%);
+      font-weight: 800;
+      font-size: 15px;
+      pointer-events: none;
+      animation: accFloatUp 0.85s ease-out forwards;
+      z-index: 2;
+    }
+    .acc-float-num.up { color: var(--green); }
+    .acc-float-num.down { color: var(--orange); }
+    @keyframes accFloatUp {
+      from { opacity: 1; transform: translateX(-50%) translateY(0); }
+      to { opacity: 0; transform: translateX(-50%) translateY(-36px); }
+    }
+
     .q-sponsor-row {
       display: flex;
       align-items: center;
@@ -3870,6 +3959,17 @@
         <div class="q-pill" id="qPill">Q1 / 10</div>
         <div class="q-timer" id="qTimer" title="Countdown from Admin Settings (Seconds per question)">0</div>
       </div>
+      <div class="acc-strip" id="accStrip" style="display:none" aria-hidden="true">
+        <div class="acc-stats" id="accStats"></div>
+        <div class="acc-meter-wrap">
+          <div class="acc-meter-track">
+            <div class="acc-meter-fill" id="accMeterFill"></div>
+          </div>
+          <div class="acc-meter-val" id="accMeterVal">0 ETB</div>
+          <div class="acc-meter-delta" id="accMeterDelta"></div>
+        </div>
+        <button type="button" class="acc-spin-btn" id="btnAccSpin" onclick="openAccumulatorWheel()">🎰 SPIN — 0 ETB</button>
+      </div>
       <div class="q-ic" id="qIc">🇪🇹</div>
       <div class="q-text" id="qText">Loading...</div>
       <div class="q-opts" id="qOpts"></div>
@@ -3884,19 +3984,29 @@
       <div class="wh-ptr">🔺</div>
       <div class="wh-countdown" id="wheelCountdown" aria-hidden="true"></div>
     </div>
-    <button class="spin-btn" id="spinBtn" onclick="doSpin()">SPIN !</button>
+    <button class="spin-btn" id="spinBtn" onclick="spinBtnClick()">SPIN !</button>
   </div>
 
   <!-- ═══ WIN POPUP ═══ -->
   <div class="ov" id="winPop">
     <div class="win-card">
       <div class="win-trophy" id="winTrophy">🏆</div>
-      <div class="win-title">Correct!</div>
-      <div class="win-sub" id="winName">You earned</div>
-      <div class="win-amt" id="winAmt">0 ETB</div>
-      <div class="win-tot">Total so far: <span id="winTotal">0 ETB</span></div>
-      <div class="win-bal">💰 Balance: <span id="winBal">0 ETB</span></div>
+      <div class="win-title" id="winTitleMain">Correct!</div>
+      <div id="winAccDual" style="display:none;text-align:center;padding:.2rem 0 .6rem">
+        <div style="font-size:.72rem;color:var(--muted);letter-spacing:.06em;text-transform:uppercase">You won this game</div>
+        <div class="win-amt" id="winAccPrize" style="margin:.25rem 0">0 ETB</div>
+        <div style="font-size:.72rem;color:var(--muted);margin-top:.5rem;letter-spacing:.06em;text-transform:uppercase">Your wallet balance</div>
+        <div style="font-size:1.15rem;font-weight:800;color:var(--gold);margin:.2rem 0" id="winAccWallet">0 ETB</div>
+        <div style="font-size:.65rem;color:var(--muted)">(includes previous winnings)</div>
+      </div>
+      <div id="winClassicBlock">
+        <div class="win-sub" id="winName">You earned</div>
+        <div class="win-amt" id="winAmt">0 ETB</div>
+        <div class="win-tot">Total so far: <span id="winTotal">0 ETB</span></div>
+        <div class="win-bal">💰 Balance: <span id="winBal">0 ETB</span></div>
+      </div>
       <button class="win-next-btn" id="winNextBtn" onclick="nextQ()">Next Question →</button>
+      <button type="button" class="win-next-btn" id="winWithdrawBtn" style="display:none;margin-top:8px;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.35)">💸 Withdraw now</button>
     </div>
   </div>
 
@@ -4052,6 +4162,7 @@
         if (!r.ok) return;
         const user = await r.json();
         dbUser = user;
+        if (user.balance != null) { S.balance = parseFloat(user.balance) || 0; }
         localStorage.setItem('shamo_player', JSON.stringify(dbUser));
         if (user.games_played != null) { S.gamesPlayed = parseInt(user.games_played, 10) || 0; localStorage.setItem('shamo_gp', S.gamesPlayed); }
         if (user.games_won != null) { S.gamesWon = parseInt(user.games_won, 10) || 0; localStorage.setItem('shamo_gw', S.gamesWon); }
@@ -4110,7 +4221,7 @@
       qrToken: null, qrData: null, scanStream: null, scanning: false,
       wrongCount: 0,
       answeredIds: [],   // question IDs answered this session (no-repeat rule)
-      gameConfig: { seconds_per_question: 4, max_wrong_answers: 3, questions_per_game: 10 }
+      gameConfig: { seconds_per_question: 4, max_wrong_answers: 3, questions_per_game: 10, accumulator: null }
     };
 
     // ═══ PARTICLES ═══
@@ -4244,8 +4355,9 @@
         } catch (e) { shamoWarn('game-config fetch', e); }
         S.gameConfig = {
           seconds_per_question: gameConfigResp.seconds_per_question ?? 4,
-          max_wrong_answers: gameConfigResp.max_wrong_answers ?? 3,
-          questions_per_game: gameConfigResp.questions_per_game ?? 10
+          max_wrong_answers: Math.max(1, Math.min(10, gameConfigResp.max_wrong_answers ?? 3)),
+          questions_per_game: gameConfigResp.questions_per_game ?? 10,
+          accumulator: null
         };
         var isMaintenance = gameConfigResp.maintenance_mode === true || gameConfigResp.maintenance_mode === 'true';
         if (isMaintenance) {
@@ -4560,29 +4672,121 @@
           const cfg = await r.json();
           S.gameConfig = {
             seconds_per_question: cfg.seconds_per_question ?? 4,
-            max_wrong_answers: cfg.max_wrong_answers ?? 3,
-            questions_per_game: cfg.questions_per_game ?? 10
+            max_wrong_answers: Math.max(1, Math.min(10, cfg.max_wrong_answers ?? 3)),
+            questions_per_game: cfg.questions_per_game ?? 10,
+            accumulator: null
           };
           applyGameConfigToDOM();
         }
       } catch (e) { shamoWarn('loadGameConfig', e); }
     }
 
+    function mergeGameConfigFromApi(gc) {
+      if (!gc) return;
+      S.gameConfig = S.gameConfig || {};
+      S.gameConfig.seconds_per_question = Math.max(3, Math.min(30, gc.seconds_per_question ?? S.gameConfig.seconds_per_question ?? 4));
+      const mw = gc.max_wrong_answers != null ? gc.max_wrong_answers : S.gameConfig.max_wrong_answers;
+      S.gameConfig.max_wrong_answers = Math.max(1, Math.min(999, mw ?? 3));
+      S.gameConfig.questions_per_game = gc.questions_per_game ?? S.gameConfig.questions_per_game ?? 10;
+      S.gameConfig.accumulator = gc.accumulator || null;
+      applyGameConfigToDOM();
+    }
+
+    function isAccGame() {
+      return !!(S.gameConfig && S.gameConfig.accumulator && S.gameConfig.accumulator.enabled);
+    }
+
     function applyGameConfigToDOM() {
-      if (!S.gameConfig) S.gameConfig = { seconds_per_question: 4, max_wrong_answers: 3, questions_per_game: 10 };
+      if (!S.gameConfig) S.gameConfig = { seconds_per_question: 4, max_wrong_answers: 3, questions_per_game: 10, accumulator: null };
       const c = S.gameConfig;
       const sec = Math.max(3, Math.min(30, c.seconds_per_question ?? 4));
-      const wrong = c.max_wrong_answers ?? 3;
+      const wrongRaw = Math.max(1, Math.min(999, c.max_wrong_answers ?? 3));
+      const accOn = c.accumulator && c.accumulator.enabled;
+      const wrongDisp = accOn ? '—' : Math.min(10, wrongRaw);
+      S.gameConfig.max_wrong_answers = wrongRaw;
       const qs = c.questions_per_game ?? 10;
       const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
       set('homeSecVal', sec);
       set('homeQuestionsVal', qs);
-      set('homeWrongVal', wrong);
-      set('homeWrongTitle', wrong);
+      set('homeWrongVal', wrongDisp);
+      set('homeWrongTitle', wrongDisp);
       set('joinSecVal', sec);
-      set('joinWrongVal', wrong);
-      set('blockedWrongVal', wrong);
-      set('blockedWrongRule', wrong);
+      set('joinWrongVal', wrongDisp);
+      set('blockedWrongVal', wrongDisp);
+      set('blockedWrongRule', wrongDisp);
+      const jrw = document.getElementById('joinRuleWrong');
+      if (jrw) {
+        if (accOn) {
+          const a = c.accumulator;
+          jrw.innerHTML = '<b>Meter mode</b> — skill builds your prize; wrong answers lower it. Spin after <b>' + (a.min_cashout_questions || 5) + '</b> questions.';
+        } else {
+          jrw.innerHTML = '<b><span>' + wrongDisp + '</span> wrong answers = Game Over</b> — Keep your earnings';
+        }
+      }
+    }
+
+    function accMeterPercent(meter, acc) {
+      const lo = Math.max(0, parseFloat(acc.min_prize_etb) || 0);
+      const hi = Math.max(lo + 0.01, parseFloat(acc.meter_ceiling_etb) || 500);
+      const m = Math.max(lo, Math.min(hi, parseFloat(meter) || 0));
+      return Math.round(((m - lo) / (hi - lo)) * 100);
+    }
+
+    function updateAccStrip(meterDeltaFlash) {
+      const strip = document.getElementById('accStrip');
+      const fill = document.getElementById('accMeterFill');
+      const valEl = document.getElementById('accMeterVal');
+      const deltaEl = document.getElementById('accMeterDelta');
+      const btn = document.getElementById('btnAccSpin');
+      const stats = document.getElementById('accStats');
+      if (!strip || !isAccGame()) {
+        if (strip) { strip.style.display = 'none'; strip.setAttribute('aria-hidden', 'true'); }
+        return;
+      }
+      const acc = S.gameConfig.accumulator;
+      const qa = Number(S.session && S.session.questions_answered) || 0;
+      const cc = Number(S.session && S.session.correct_count) || 0;
+      const wc = Number(S.session && S.session.wrong_count) || 0;
+      const meter = parseFloat(S.session && S.session.prize_meter_etb) || 0;
+      const total = parseInt(acc.total_questions, 10) || 20;
+      const minSpin = parseInt(acc.min_cashout_questions, 10) || 5;
+      const allowMid = acc.allow_cashout_mid_game !== false;
+      const canSpin = qa >= minSpin && (allowMid || qa >= total);
+
+      strip.style.display = 'block';
+      strip.setAttribute('aria-hidden', 'false');
+      if (stats) stats.innerHTML = 'Question <b>' + Math.min(total, qa + 1) + '</b> of <b>' + total + '</b> &nbsp;·&nbsp; ✅ ' + cc + ' correct &nbsp; ❌ ' + wc + ' wrong';
+      const pct = accMeterPercent(meter, acc);
+      if (fill) {
+        fill.style.width = pct + '%';
+        fill.classList.toggle('acc-shrink', meterDeltaFlash < 0);
+        if (meterDeltaFlash > 0) setTimeout(function() { fill.classList.remove('acc-shrink'); }, 400);
+      }
+      if (valEl) valEl.textContent = (Math.round(meter * 100) / 100) + ' ETB';
+      if (deltaEl) {
+        if (meterDeltaFlash && meterDeltaFlash !== 0) {
+          deltaEl.textContent = (meterDeltaFlash > 0 ? '+' : '') + meterDeltaFlash + ' ETB';
+          deltaEl.className = 'acc-meter-delta ' + (meterDeltaFlash > 0 ? 'up' : 'down');
+        } else {
+          deltaEl.textContent = '';
+          deltaEl.className = 'acc-meter-delta';
+        }
+      }
+      if (btn) {
+        btn.textContent = '🎰 SPIN — ' + (Math.round(meter * 100) / 100) + ' ETB';
+        btn.classList.toggle('show', canSpin);
+        btn.classList.toggle('pulse', canSpin && meter > 0);
+        btn.disabled = !canSpin || meter <= 0;
+      }
+    }
+
+    function accFloatingDelta(parentEl, delta) {
+      if (!parentEl || !delta) return;
+      const span = document.createElement('span');
+      span.className = 'acc-float-num ' + (delta > 0 ? 'up' : 'down');
+      span.textContent = (delta > 0 ? '+' : '') + delta + ' ETB';
+      parentEl.appendChild(span);
+      setTimeout(function() { try { span.remove(); } catch (e) {} }, 900);
     }
 
     function showShell() {
@@ -4691,9 +4895,13 @@
     }
 
     function getAvailableBalance() {
+      if (dbUser && dbUser.balance != null && dbUser.balance !== '') {
+        var x = parseFloat(dbUser.balance);
+        if (!Number.isNaN(x)) return x;
+      }
       var _bs = S.balanceSummary;
-      var bal = (_bs && _bs.available_balance != null) ? _bs.available_balance : 0;
-      return bal;
+      var bal = (_bs && _bs.available_balance != null) ? parseFloat(_bs.available_balance) : 0;
+      return Number.isNaN(bal) ? 0 : bal;
     }
     function updateBalanceDisplay() {
       var bal = getAvailableBalance();
@@ -4767,6 +4975,11 @@
           if (data.games_played != null) { S.gamesPlayed = parseInt(data.games_played, 10) || 0; localStorage.setItem('shamo_gp', S.gamesPlayed); }
           if (data.games_won != null) { S.gamesWon = parseInt(data.games_won, 10) || 0; localStorage.setItem('shamo_gw', S.gamesWon); }
           if (data.current_streak != null) { S.streak = parseInt(data.current_streak, 10) || 0; localStorage.setItem('shamo_sk', S.streak); }
+          var wb = data.wallet_balance != null ? data.wallet_balance : data.available_balance;
+          if (wb != null && dbUser) {
+            dbUser.balance = parseFloat(wb);
+            try { localStorage.setItem('shamo_player', JSON.stringify(dbUser)); } catch (e) {}
+          }
         }
         shamoLog('loadBalanceSummary ok', S.balanceSummary);
       } catch (e) { shamoErr('loadBalanceSummary', e); S.balanceSummary = null; }
@@ -5063,7 +5276,10 @@
           var opts = (q.options || []).sort(function(a, b) { return (a.sort_order || 0) - (b.sort_order || 0); });
           return Object.assign({}, q, { options: opts });
         });
-        S.questions = shuffleArray(S.questions);
+        var g0 = S.activeGame;
+        if (!(g0 && g0.acc_total_questions != null && parseInt(g0.acc_total_questions, 10) >= 5)) {
+          S.questions = shuffleArray(S.questions);
+        }
       }).catch(function(qe) { shamoWarn('Q preload', qe); S.questions = S.questions || []; });
     }
 
@@ -5446,7 +5662,8 @@
       // Game info
       document.getElementById('joinGameTitle').textContent = game.title || 'SHAMO Game';
       document.getElementById('joinPool').textContent = (game.prize_pool_remaining || game.prize_pool_etb || 0).toFixed(0) + ' ETB';
-      document.getElementById('joinQCount').textContent = (S.questions && S.questions.length) ? S.questions.length : ((S.gameConfig && S.gameConfig.questions_per_game) || 10);
+      var accN = game && game.acc_total_questions;
+      document.getElementById('joinQCount').textContent = (accN != null && parseInt(accN, 10) >= 5) ? String(parseInt(accN, 10)) : ((S.questions && S.questions.length) ? S.questions.length : ((S.gameConfig && S.gameConfig.questions_per_game) || 10));
       document.getElementById('joinPlayers').textContent = game.total_players || 0;
       const jsv = document.getElementById('joinSecVal'); if (jsv) jsv.textContent = (S.gameConfig && S.gameConfig.seconds_per_question) || 4;
       const jwv = document.getElementById('joinWrongVal'); if (jwv) jwv.textContent = (S.gameConfig && S.gameConfig.max_wrong_answers) || 3;
@@ -5486,10 +5703,7 @@
         });
         const data = await r.json().catch(() => ({}));
         if (data.already_played || data.cooldown) {
-          if (data.game_config) {
-            S.gameConfig = { seconds_per_question: data.game_config.seconds_per_question ?? 4, max_wrong_answers: data.game_config.max_wrong_answers ?? 3, questions_per_game: data.game_config.questions_per_game ?? 10 };
-            applyGameConfigToDOM();
-          }
+          if (data.game_config) mergeGameConfigFromApi(data.game_config);
           if (data.cooldown && !data.reason) data.reason = 'Game over — ' + ((S.gameConfig && S.gameConfig.max_wrong_answers) || 3) + ' wrong answers';
           nav('pgScan', 'fnScan');
           document.getElementById('scanIdle').style.display = 'none';
@@ -5500,10 +5714,8 @@
           return;
         }
         S.session = data.session;
-        if (data.game_config) {
-          S.gameConfig = { seconds_per_question: data.game_config.seconds_per_question ?? 4, max_wrong_answers: data.game_config.max_wrong_answers ?? 3, questions_per_game: data.game_config.questions_per_game ?? 10 };
-          applyGameConfigToDOM();
-        }
+        if (data.session && typeof data.session.wrong_count === 'number') S.wrongCount = data.session.wrong_count;
+        if (data.game_config) mergeGameConfigFromApi(data.game_config);
         S.qrData = { game: game };
         S.qrToken = null;
         S.questions = await loadQuestionsForGame(game.id, data.session?.id);
@@ -5511,7 +5723,7 @@
           ...q,
           options: (q.options || []).sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0))
         }));
-        S.questions = shuffleArray(S.questions);
+        if (!isAccGame()) S.questions = shuffleArray(S.questions);
         if (!S.questions.length) { toast('No questions for this game', 'error'); return; }
         S.answeredIds = data.answered_question_ids || [];
         startGameWithoutScan();
@@ -5541,7 +5753,9 @@
           ...q,
           options: (q.options || []).sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0))
         }));
-        S.questions = shuffleArray(S.questions);
+        if (!(game && game.acc_total_questions != null && parseInt(game.acc_total_questions, 10) >= 5)) {
+          S.questions = shuffleArray(S.questions);
+        }
       } catch (e) { console.warn('Q load:', e); S.questions = []; }
       if (!S.questions.length) { hideLoading(); toast('No questions found for this game', 'error'); return; }
 
@@ -5590,17 +5804,24 @@
           })
         });
         const sessData = await sessRes.json().catch(() => ({}));
+        if (sessData.already_played || sessData.cooldown) {
+          if (sessData.game_config) mergeGameConfigFromApi(sessData.game_config);
+          const mw = (S.gameConfig && S.gameConfig.max_wrong_answers) || 3;
+          if (sessData.cooldown && !sessData.reason) sessData.reason = 'Game over — ' + mw + ' wrong answers';
+          hideLoading();
+          nav('pgScan', 'fnScan');
+          document.getElementById('scanIdle').style.display = 'none';
+          document.getElementById('scanActive').style.display = 'none';
+          document.getElementById('scanAttend').style.display = 'none';
+          document.getElementById('scanBlocked').style.display = 'flex';
+          toast(sessData.reason || 'You cannot play this game again', 'info');
+          return;
+        }
         if (sessData.session) {
           S.session = sessData.session;
           S.answeredIds = sessData.answered_question_ids || [];
-          if (sessData.game_config) {
-            S.gameConfig = {
-              seconds_per_question: sessData.game_config.seconds_per_question ?? 4,
-              max_wrong_answers: sessData.game_config.max_wrong_answers ?? 3,
-              questions_per_game: sessData.game_config.questions_per_game ?? 10
-            };
-            applyGameConfigToDOM();
-          }
+          if (typeof sessData.session.wrong_count === 'number') S.wrongCount = sessData.session.wrong_count;
+          if (sessData.game_config) mergeGameConfigFromApi(sessData.game_config);
         } else {
           hideLoading();
           toast(sessData.reason || sessData.detail || 'Could not start game session — try again or rescan QR', 'error', 5000);
@@ -5619,7 +5840,8 @@
 
     // ═══ GAME ═══
     async function startGame() {
-      S.totalEarned = 0; S.currentQIndex = 0; S.wrongCount = 0;
+      S.totalEarned = 0; S.currentQIndex = 0;
+      S.wrongCount = (S.session && typeof S.session.wrong_count === 'number') ? S.session.wrong_count : 0;
       if (!S.answeredIds || !S.answeredIds.length) S.answeredIds = getAnsweredQuestions(S.session?.id || '');
       if (tg) tg.HapticFeedback?.impactOccurred('medium');
 
@@ -5639,10 +5861,8 @@
           if (d.session) {
             S.session = d.session;
             S.answeredIds = d.answered_question_ids || [];
-            if (d.game_config) {
-              S.gameConfig = { seconds_per_question: d.game_config.seconds_per_question ?? 4, max_wrong_answers: d.game_config.max_wrong_answers ?? 3, questions_per_game: d.game_config.questions_per_game ?? 10 };
-              applyGameConfigToDOM();
-            }
+            if (typeof d.session.wrong_count === 'number') S.wrongCount = d.session.wrong_count;
+            if (d.game_config) mergeGameConfigFromApi(d.game_config);
           }
         } catch (e) { console.warn('Session:', e); }
       }
@@ -5653,27 +5873,77 @@
       }
 
       S.questions = S.questions.filter(q => !S.answeredIds.includes(q.id));
-      if (!S.questions.length) { showCollect(); return; }
+      if (!S.questions.length) {
+        if (isAccGame()) { maybeAccEndQuestions(); return; }
+        showCollect();
+        return;
+      }
+      const maxW = Math.max(1, Math.min(10, (S.gameConfig && S.gameConfig.max_wrong_answers) || 3));
+      const wcStart = (S.session && typeof S.session.wrong_count === 'number') ? S.session.wrong_count : (S.wrongCount || 0);
+      if (!isAccGame() && wcStart >= maxW) {
+        showGameOver('wrong', true);
+        return;
+      }
       loadQ();
+    }
+
+    function maybeAccEndQuestions() {
+      if (!S.session) { showCollect(); return; }
+      updateAccStrip(0);
+      var meter = parseFloat(S.session.prize_meter_etb) || 0;
+      var acc = S.gameConfig.accumulator;
+      var qa = S.session.questions_answered || 0;
+      var total = (acc && acc.total_questions) || 20;
+      var minSpin = (acc && acc.min_cashout_questions) || 5;
+      var allowMid = !acc || acc.allow_cashout_mid_game !== false;
+      var canSpin = qa >= minSpin && (allowMid || qa >= total);
+      if (canSpin && meter > 0) {
+        toast('All questions done — cash out with SPIN! 🎰', 'success', 2800);
+        openAccumulatorWheel();
+      } else {
+        showCollect();
+      }
     }
 
     function startGameWithoutScan() {
       document.getElementById('scanAttend').style.display = 'none';
       document.getElementById('joinOv').classList.remove('show');
-      S.totalEarned = 0; S.currentQIndex = 0; S.wrongCount = 0;
+      S.totalEarned = 0; S.currentQIndex = 0;
+      S.wrongCount = (S.session && typeof S.session.wrong_count === 'number') ? S.session.wrong_count : 0;
       S.questions = S.questions.filter(q => !S.answeredIds.includes(q.id));
-      if (!S.questions.length) { showCollect(); return; }
+      if (!S.questions.length) {
+        if (isAccGame()) { maybeAccEndQuestions(); return; }
+        showCollect();
+        return;
+      }
+      const maxW2 = Math.max(1, Math.min(10, (S.gameConfig && S.gameConfig.max_wrong_answers) || 3));
+      const wc2 = (S.session && typeof S.session.wrong_count === 'number') ? S.session.wrong_count : (S.wrongCount || 0);
+      if (!isAccGame() && wc2 >= maxW2) {
+        showGameOver('wrong', true);
+        return;
+      }
       if (tg) tg.HapticFeedback?.impactOccurred('medium');
       loadQ();
     }
 
     function loadQ() {
-      if (S.currentQIndex >= S.questions.length) { showCollect(); return; }
+      const maxWrong = Math.max(1, Math.min(10, (S.gameConfig && S.gameConfig.max_wrong_answers) || 3));
+      const wcNow = getWrongCountLive();
+      if (!isAccGame() && wcNow >= maxWrong) {
+        showGameOver('wrong', true);
+        return;
+      }
+      if (S.currentQIndex >= S.questions.length) {
+        if (isAccGame()) { maybeAccEndQuestions(); return; }
+        showCollect();
+        return;
+      }
       const q = S.questions[S.currentQIndex];
       // RULE 2: Skip if somehow already answered (double-safety)
       if (S.answeredIds.includes(q.id)) { S.currentQIndex++; loadQ(); return; }
-      const total = S.questions.length;
-      const cur = S.currentQIndex + 1;
+      const total = isAccGame() ? ((S.gameConfig.accumulator && S.gameConfig.accumulator.total_questions) || S.questions.length) : S.questions.length;
+      const qa0 = S.session ? (Number(S.session.questions_answered) || 0) : 0;
+      const cur = isAccGame() ? Math.min(total, qa0 + 1) : (S.currentQIndex + 1);
       // Progress bar
       document.getElementById('qProg').innerHTML = S.questions.map((_, i) => `<div class="q-prog-dot ${i < S.currentQIndex ? 'done' : i === S.currentQIndex ? 'cur' : ''}"></div>`).join('');
       document.getElementById('qPill').textContent = `Q${cur} / ${total}`;
@@ -5724,13 +5994,23 @@
                 session_id: S.session.id, user_id: dbUser.id, game_id: S.activeGame.id,
                 question_id: q.id, question_number: cur, time_taken_ms: QUESTION_SEC * 1000
               })
-            }).then(r => r.json()).then(d => { if (d.session) S.session = d.session; if (typeof d.wrong_count === 'number') S.wrongCount = d.wrong_count; }).catch(() => {});
+            }).then(r => r.json()).then(function(d) {
+              if (d.session) S.session = d.session;
+              if (typeof d.wrong_count === 'number') S.wrongCount = d.wrong_count;
+              else if (d.session && typeof d.session.wrong_count === 'number') S.wrongCount = d.session.wrong_count;
+              if (isAccGame()) {
+                var mw = document.querySelector('.acc-meter-wrap');
+                if (d.meter_change != null && mw) accFloatingDelta(mw, d.meter_change);
+                updateAccStrip(typeof d.meter_change === 'number' ? d.meter_change : 0);
+              }
+            }).catch(() => {});
           }
           playWrongSound();
           setTimeout(() => { qOv.classList.remove('show'); onWrong('timeout'); }, 700);
         }
       }, 1000);
       qOv.classList.add('show');
+      updateAccStrip(0);
     }
 
     async function answerQ(chosen, optId, optLetter) {
@@ -5776,6 +6056,11 @@
           correctOptionId = ansData.correct_option_id || null;
           if (ansData.session) S.session = ansData.session;
           if (typeof ansData.wrong_count === 'number') S.wrongCount = ansData.wrong_count;
+          if (isAccGame()) {
+            var mw2 = document.querySelector('.acc-meter-wrap');
+            if (ansData.meter_change != null && mw2) accFloatingDelta(mw2, ansData.meter_change);
+            updateAccStrip(typeof ansData.meter_change === 'number' ? ansData.meter_change : 0);
+          }
         } catch (e) { console.warn('Answer submit:', e); }
       } else if (dbUser?.id && !S.session?.id) {
         toast('No session — cannot save answer. Rescan QR.', 'error', 4000);
@@ -5790,21 +6075,44 @@
       }
       if (tg) tg.HapticFeedback?.notificationOccurred(isCorrect ? 'success' : 'error');
 
-      if (isCorrect) {
-        setTimeout(() => { qOv.classList.remove('show'); showWheel(); }, 600);
+          if (isCorrect) {
+        setTimeout(function() {
+          qOv.classList.remove('show');
+          if (isAccGame()) {
+            S.currentQIndex++;
+            loadQ();
+          } else {
+            showWheel();
+          }
+        }, 600);
       } else {
         setTimeout(() => { qOv.classList.remove('show'); onWrong('wrong'); }, 1000);
       }
     }
 
+    /** Server updates wrong_count via /game/answer — never double-increment client-side. */
+    function getWrongCountLive() {
+      if (typeof S.wrongCount === 'number') return S.wrongCount;
+      if (S.session && typeof S.session.wrong_count === 'number') return S.session.wrong_count;
+      return 0;
+    }
+
     function onWrong(reason) {
-      const maxWrong = (S.gameConfig && S.gameConfig.max_wrong_answers) || 3;
-      S.wrongCount = (S.wrongCount || 0) + 1;
-      if (S.wrongCount >= maxWrong) {
+      if (isAccGame()) {
+        if (S.session && typeof S.session.wrong_count === 'number') S.wrongCount = S.session.wrong_count;
+        toast(reason === 'timeout' ? 'Time\'s up — meter dropped' : 'Wrong — meter dropped', 'info', 2000);
+        S.currentQIndex++;
+        setTimeout(() => { document.getElementById('qOv').classList.remove('show'); loadQ(); }, 1200);
+        return;
+      }
+      const maxWrong = Math.max(1, Math.min(10, (S.gameConfig && S.gameConfig.max_wrong_answers) || 3));
+      if (S.session && typeof S.session.wrong_count === 'number') S.wrongCount = S.session.wrong_count;
+      const wc = getWrongCountLive();
+      if (wc >= maxWrong) {
         showGameOver(reason, true);
       } else {
-        const left = maxWrong - S.wrongCount;
-        toast(left === 2 ? '2 chances left' : '1 chance left', 'info', 2000);
+        const left = maxWrong - wc;
+        toast(left === 1 ? '1 chance left' : left + ' chances left', 'info', 2000);
         S.currentQIndex++;
         setTimeout(() => { document.getElementById('qOv').classList.remove('show'); loadQ(); }, 1200);
       }
@@ -5847,7 +6155,43 @@
       ctx.fillStyle = 'var(--cream)'; ctx.font = 'bold 14px Playfair Display,serif';
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('ሻ', cx, cy + 1);
     }
+    function openAccumulatorWheel() {
+      S._accSpinMode = true;
+      var meter = parseFloat(S.session && S.session.prize_meter_etb) || 0;
+      var acc = S.gameConfig.accumulator;
+      var qa = S.session ? (S.session.questions_answered || 0) : 0;
+      var total = (acc && acc.total_questions) || 20;
+      var minSpin = (acc && acc.min_cashout_questions) || 5;
+      var allowMid = !acc || acc.allow_cashout_mid_game !== false;
+      if (qa < minSpin) {
+        toast('Answer at least ' + minSpin + ' questions first', 'info');
+        S._accSpinMode = false;
+        return;
+      }
+      if (!allowMid && qa < total) {
+        toast('Finish all ' + total + ' questions before spin', 'info');
+        S._accSpinMode = false;
+        return;
+      }
+      if (meter <= 0) {
+        toast('Nothing to cash out', 'info');
+        S._accSpinMode = false;
+        return;
+      }
+      S.spinning = false;
+      S.wheelSegs = [{ a: meter, l: (Math.round(meter * 100) / 100) + ' ETB', tc: '#D4A017' }];
+      drawWheel(S.wheelAngle);
+      document.getElementById('spinBtn').disabled = false;
+      document.getElementById('wheelOv').classList.add('show');
+    }
+
+    function spinBtnClick() {
+      if (S._accSpinMode) doAccumulatorSpin();
+      else doSpin();
+    }
+
     function showWheel() {
+      S._accSpinMode = false;
       S.spinning = false;
       S.wheelSegs = _shuffleSegs(_buildBaseSegs());
       drawWheel(S.wheelAngle);
@@ -5924,8 +6268,144 @@
       });
     }
 
+    function doAccumulatorSpin() {
+      if (S.spinning) return;
+      var meter = parseFloat(S.session && S.session.prize_meter_etb) || 0;
+      if (meter <= 0) { toast('Nothing to cash out', 'info'); return; }
+      S.spinning = true;
+      document.getElementById('spinBtn').disabled = true;
+      playSpinSound();
+      if (tg) tg.HapticFeedback?.impactOccurred('heavy');
+      runWheelCountdown();
+      var segs = S.wheelSegs || [{ a: meter, l: (Math.round(meter * 100) / 100) + ' ETB', tc: '#D4A017' }];
+      S.wheelSegs = segs;
+      var N = segs.length;
+      var arc = 2 * Math.PI / N;
+      var chosen = 0;
+      S.wonSeg = segs[chosen];
+      var mid = chosen * arc + arc / 2;
+      var targetAngle = -Math.PI / 2 - mid;
+      var sa = S.wheelAngle;
+      var normalizedSa = ((sa % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+      var baseRot = targetAngle - normalizedSa;
+      var fullSpins = 2 * Math.PI * (7 + Math.floor(Math.random() * 3));
+      var totalRot = baseRot + fullSpins;
+      var t0 = null;
+      var dur = 2800;
+      var ease = function(t) { return 1 - Math.pow(1 - t, 3.5); };
+      requestAnimationFrame(function frame(ts) {
+        if (!t0) t0 = ts;
+        var t = Math.min((ts - t0) / dur, 1);
+        S.wheelAngle = sa + totalRot * ease(t);
+        drawWheel(S.wheelAngle);
+        if (t < 1) requestAnimationFrame(frame);
+        else {
+          S.spinning = false;
+          S._accSpinMode = false;
+          if (tg) tg.HapticFeedback?.notificationOccurred('success');
+          var prize = S.wonSeg.a;
+          flashFx('#E8B84B');
+          confetti('#E8B84B', 55);
+          if (dbUser && dbUser.id && S.session && S.session.id) {
+            fetch(API_BASE + '/shamo/api/game/spin', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                session_id: S.session.id,
+                user_id: dbUser.id,
+                game_id: S.activeGame.id,
+                question_number: 10,
+                segment_label: 'Accumulator cashout',
+                amount_etb: prize,
+                accumulator_cashout: true
+              })
+            }).then(function(r) { return r.json().then(function(j) { return { ok: r.ok, j: j }; }); })
+              .then(function(res) {
+                var data = res.j || {};
+                var credited = parseFloat(data.prize_amount != null ? data.prize_amount : data.amount_credited);
+                if (Number.isNaN(credited)) credited = prize;
+                var nb = parseFloat(data.new_balance);
+                if (data.user && data.user.balance != null) nb = parseFloat(data.user.balance);
+                if (!Number.isNaN(nb)) {
+                  S.balance = nb;
+                  if (dbUser) {
+                    dbUser.balance = nb;
+                    try { localStorage.setItem('shamo_player', JSON.stringify(dbUser)); } catch (e) {}
+                  }
+                }
+                S.totalEarned = credited;
+                S.wonSeg = { a: credited, l: (Math.round(credited * 100) / 100) + ' ETB', tc: '#E8B84B' };
+                if (data.message) toast(String(data.message), 'success', 3500);
+                loadBalanceSummary();
+                loadSpins();
+                var walletShow = !Number.isNaN(nb) ? nb : getAvailableBalance();
+                setTimeout(function() {
+                  document.getElementById('wheelOv').classList.remove('show');
+                  showWinAccCashout(credited, walletShow);
+                }, 700);
+              }).catch(function() {
+                S.totalEarned = prize;
+                setTimeout(function() {
+                  document.getElementById('wheelOv').classList.remove('show');
+                  showWinAccCashout(prize, getAvailableBalance());
+                }, 700);
+              });
+          } else {
+            setTimeout(function() {
+              document.getElementById('wheelOv').classList.remove('show');
+              S.totalEarned = prize;
+              showWinAccCashout(prize, getAvailableBalance());
+            }, 700);
+          }
+        }
+      });
+    }
+
+    function showWinAccCashout(prizeAmt, walletBal) {
+      var seg = S.wonSeg || { a: 0 };
+      var p = prizeAmt != null ? parseFloat(prizeAmt) : parseFloat(seg.a) || 0;
+      var w = walletBal != null ? parseFloat(walletBal) : getAvailableBalance();
+      document.getElementById('winTrophy').textContent = '🎉';
+      var tm = document.getElementById('winTitleMain');
+      if (tm) tm.textContent = 'Congratulations!';
+      var dual = document.getElementById('winAccDual');
+      var classic = document.getElementById('winClassicBlock');
+      if (dual && classic) {
+        dual.style.display = 'block';
+        classic.style.display = 'none';
+        document.getElementById('winAccPrize').textContent = (Math.round(p * 100) / 100) + ' ETB 🏆';
+        document.getElementById('winAccWallet').textContent = (Math.round(w * 100) / 100) + ' ETB 💰';
+      }
+      var nb = document.getElementById('winNextBtn');
+      nb.textContent = '🎮 View games';
+      nb.onclick = function() {
+        document.getElementById('winPop').classList.remove('show');
+        showCollect();
+      };
+      var wb = document.getElementById('winWithdrawBtn');
+      if (wb) {
+        wb.style.display = 'block';
+        wb.onclick = function() {
+          document.getElementById('winPop').classList.remove('show');
+          nav('pgProfile', 'fnProfile');
+          refetchMe().then(function() { loadBalanceSummary(); updateUI(); }).catch(function() { loadBalanceSummary(); updateUI(); });
+        };
+      }
+      saveState();
+      loadBalanceSummary().then(updateUI).catch(function() { updateUI(); });
+      document.getElementById('winPop').classList.add('show');
+    }
+
     // ═══ WIN SCREEN ═══
     function showWin() {
+      var dual = document.getElementById('winAccDual');
+      var classic = document.getElementById('winClassicBlock');
+      var tm = document.getElementById('winTitleMain');
+      if (dual) dual.style.display = 'none';
+      if (classic) classic.style.display = 'block';
+      if (tm) tm.textContent = 'Correct!';
+      var wb = document.getElementById('winWithdrawBtn');
+      if (wb) wb.style.display = 'none';
       const seg = S.wonSeg;
       document.getElementById('winTrophy').textContent = seg.a >= 500 ? '🏆' : seg.a >= 200 ? '🎉' : '⭐';
       document.getElementById('winName').textContent = S.playerName + ' earned';
@@ -5948,12 +6428,14 @@
 
     // ═══ GAME OVER ═══
     function showGameOver(reason, locked) {
+      const mw = Math.max(1, Math.min(10, (S.gameConfig && S.gameConfig.max_wrong_answers) || 3));
       const subs = {
         'timeout': '⏱ Time ran out — game over!',
         'wrong':   '❌ Wrong answer — game over!',
         'cooldown':'Game over — you can no longer play this game'
       };
-      document.getElementById('goSub').textContent = (subs[reason] || 'Game over') + (S.totalEarned > 0 ? '\nYou keep your earnings! 💰' : '');
+      const capHint = '\n(' + mw + ' wrong / time-out' + (mw === 1 ? '' : 's') + ' allowed — from Game Settings)';
+      document.getElementById('goSub').textContent = (subs[reason] || 'Game over') + capHint + (S.totalEarned > 0 ? '\nYou keep your earnings! 💰' : '');
       document.getElementById('goEarned').textContent = S.totalEarned > 0 ? 'You keep ' + S.totalEarned.toFixed(0) + ' ETB 💰' : 'Better luck next time!';
       // One strike indicator (Option B)
       const wc = document.getElementById('goWrongCount');

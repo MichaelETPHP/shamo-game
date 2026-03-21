@@ -135,6 +135,11 @@ async function apiPut(path, body) {
   try { return await apiFetch(path, { method: 'PUT', body }); }
   finally { hideSpinner(); }
 }
+async function apiPatch(path, body) {
+  showSpinner('Updating…');
+  try { return await apiFetch(path, { method: 'PATCH', body: body ?? {} }); }
+  finally { hideSpinner(); }
+}
 async function apiDelete(path) {
   showSpinner('Deleting…');
   try { return await apiFetch(path, { method: 'DELETE' }); }

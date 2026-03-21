@@ -30,6 +30,27 @@
             </div>
             <div class="content">
                 <div id="pendingAlert"></div>
+                <div style="display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+                    <label style="font-size:.75rem;color:var(--muted);white-space:nowrap">Company snapshot</label>
+                    <select id="companyBalanceSelect" style="flex:1;min-width:200px;padding:8px 10px;border-radius:8px;background:var(--surface);color:var(--text);border:1px solid var(--border)"></select>
+                    <button type="button" class="btn btn-ghost btn-sm" onclick="refreshCompanyFinance()">🔄 Refresh</button>
+                </div>
+                <div id="companyFinanceCard" style="display:none;margin-bottom:18px;padding:16px 18px;background:var(--surface);border:1px solid var(--border);border-radius:14px;max-width:520px">
+                    <div style="font-size:1.05rem;font-weight:800;margin-bottom:12px">🏢 <span id="cfName">—</span></div>
+                    <div style="display:grid;gap:8px;font-size:.88rem">
+                        <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">Total deposited</span><span id="cfDep">—</span></div>
+                        <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">Commission (15%)</span><span id="cfComm">—</span></div>
+                        <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">Original pool</span><span id="cfPool">—</span></div>
+                        <div style="border-top:1px solid var(--border);margin:4px 0"></div>
+                        <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">Paid to players</span><span style="color:#F87171" id="cfPaid">—</span></div>
+                        <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">Remaining pool</span><span style="color:#4ADE80" id="cfRem">—</span></div>
+                        <div style="border-top:1px solid var(--border);margin:4px 0"></div>
+                        <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">Pending withdrawals</span><span id="cfPend">—</span></div>
+                        <div style="display:flex;justify-content:space-between;font-weight:800"><span>Available (pool − pending)</span><span id="cfAvail">—</span></div>
+                        <div style="display:flex;justify-content:space-between;font-size:.78rem;color:var(--muted)"><span>Company credit (DB)</span><span id="cfCredit">—</span></div>
+                    </div>
+                    <div id="cfErr" style="color:var(--red);font-size:.8rem;margin-top:8px"></div>
+                </div>
                 <!-- Stats strip -->
                 <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px">
                     <div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 16px">
@@ -89,7 +110,43 @@
         requireAuth();
         let dPage = 1;
         let dData = [];
+        let companyBalTimer = null;
         buildSidebar('deposits');
+
+        async function loadCompaniesForBalance() {
+            const sel = document.getElementById('companyBalanceSelect');
+            if (!sel) return;
+            try {
+                const r = await apiGet('/api/companies?per_page=200');
+                const rows = r.data || [];
+                sel.innerHTML = '<option value="">— Select company —</option>' +
+                    rows.map(c => `<option value="${c.id}">${String(c.name || '—').replace(/</g, '&lt;')}</option>`).join('');
+                sel.onchange = () => { refreshCompanyFinance(); };
+            } catch (e) { console.warn(e); }
+        }
+
+        async function refreshCompanyFinance() {
+            const sel = document.getElementById('companyBalanceSelect');
+            const card = document.getElementById('companyFinanceCard');
+            const errEl = document.getElementById('cfErr');
+            if (errEl) errEl.textContent = '';
+            if (!sel || !card || !sel.value) { if (card) card.style.display = 'none'; return; }
+            try {
+                const b = await apiGet('/api/admin/companies/' + encodeURIComponent(sel.value) + '/balance');
+                card.style.display = 'block';
+                document.getElementById('cfName').textContent = b.company_name || 'Company';
+                document.getElementById('cfDep').textContent = fmtN(b.total_deposited) + ' ETB';
+                document.getElementById('cfComm').textContent = '−' + fmtN(b.commission) + ' ETB';
+                document.getElementById('cfPool').textContent = fmtN(b.original_pool) + ' ETB';
+                document.getElementById('cfPaid').textContent = '−' + fmtN(b.paid_to_players) + ' ETB';
+                document.getElementById('cfRem').textContent = fmtN(b.remaining_pool) + ' ETB';
+                document.getElementById('cfPend').textContent = fmtN(b.pending_withdrawals) + ' ETB';
+                document.getElementById('cfAvail').textContent = fmtN(b.available_balance) + ' ETB';
+                document.getElementById('cfCredit').textContent = fmtN(b.company_credit_balance) + ' ETB';
+            } catch (e) {
+                if (errEl) errEl.textContent = e.message || String(e);
+            }
+        }
 
         async function loadD(page = dPage) {
             dPage = page;
@@ -216,6 +273,13 @@
 
         let debT;
         function debouncedLoad() { clearTimeout(debT); debT = setTimeout(() => loadD(1), 350); }
+
+        loadCompaniesForBalance();
+        if (companyBalTimer) clearInterval(companyBalTimer);
+        companyBalTimer = setInterval(() => {
+            var s = document.getElementById('companyBalanceSelect');
+            if (s && s.value) refreshCompanyFinance();
+        }, 30000);
 
         loadD(1);
     </script>

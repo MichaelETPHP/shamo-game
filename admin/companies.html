@@ -404,8 +404,18 @@
     }
 
     async function deleteC(id) {
-      if (!confirm('⚠️ Delete this company permanently? All QR codes, deposits, and games linked to it will be affected. This cannot be undone.')) return;
-      try { await apiDelete(`/companies/${id}`); showToast('Company deleted', 'info'); loadC(); }
+      if (!confirm('⚠️ Delete this company permanently?\n\n• All deposit history for this company will be removed.\n• Games keep existing data but lose company link (SET NULL).\n• Related QR/questions may be removed per database rules.\n\nThis cannot be undone.')) return;
+      try {
+        const r = await apiDelete(`/companies/${id}`);
+        const n = r.company_deposits_removed;
+        showToast(
+          n != null && n > 0
+            ? `Company deleted — removed ${n} deposit record(s)`
+            : (r.message || 'Company deleted'),
+          'info'
+        );
+        loadC();
+      }
       catch (e) { showToast(e.message, 'error'); }
     }
 

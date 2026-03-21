@@ -317,6 +317,7 @@ _GAMES_INSERT_KEYS = frozenset({
     "platform_fee_pct",
     "player_cap_pct",
     "prize_pool_remaining",
+    "commission_amount",
     # legacy USD (some DBs still expect these on insert)
     "prize_pool_usd",
     "max_payout_usd",
@@ -326,6 +327,16 @@ _GAMES_INSERT_KEYS = frozenset({
     "share_link",
     "platform_fee_etb",
     "usd_to_etb_rate",
+    # Dynamic accumulator spin (migration 034)
+    "acc_total_questions",
+    "acc_question_seconds",
+    "acc_start_etb",
+    "acc_correct_bonus_etb",
+    "acc_wrong_penalty_etb",
+    "acc_meter_floor_etb",
+    "acc_meter_ceiling_etb",
+    "acc_min_questions_spin",
+    "acc_allow_mid_spin",
 })
 
 
@@ -606,9 +617,19 @@ class BalanceAdjust(BaseModel):
 class GameCreate(BaseModel):
     title: str = "Tonight's SHAMO"; description: Optional[str] = None
     status: str = "draft"; starts_at: str; ends_at: str; game_date: str
-    prize_pool_etb: float = 0.0; max_prize_etb: float = 5700.0
+    prize_pool_etb: float = 0.0; max_prize_etb: float = 500.0
     platform_fee_pct: float = 15.0; player_cap_pct: float = 30.0
     company_id: Optional[str] = None; deposit_id: Optional[str] = None
+    # Accumulator mode: set acc_total_questions 5–50 to enable (NULL = legacy wheel-per-correct)
+    acc_total_questions: Optional[int] = None
+    acc_question_seconds: Optional[int] = None
+    acc_start_etb: Optional[float] = None
+    acc_correct_bonus_etb: Optional[float] = None
+    acc_wrong_penalty_etb: Optional[float] = None
+    acc_meter_floor_etb: Optional[float] = None
+    acc_meter_ceiling_etb: Optional[float] = None
+    acc_min_questions_spin: Optional[int] = None
+    acc_allow_mid_spin: Optional[bool] = None
 
 class GameUpdate(BaseModel):
     title: Optional[str] = None; description: Optional[str] = None
@@ -617,6 +638,15 @@ class GameUpdate(BaseModel):
     prize_pool_etb: Optional[float] = None; max_prize_etb: Optional[float] = None
     platform_fee_pct: Optional[float] = None; player_cap_pct: Optional[float] = None
     company_id: Optional[str] = None; deposit_id: Optional[str] = None
+    acc_total_questions: Optional[int] = None
+    acc_question_seconds: Optional[int] = None
+    acc_start_etb: Optional[float] = None
+    acc_correct_bonus_etb: Optional[float] = None
+    acc_wrong_penalty_etb: Optional[float] = None
+    acc_meter_floor_etb: Optional[float] = None
+    acc_meter_ceiling_etb: Optional[float] = None
+    acc_min_questions_spin: Optional[int] = None
+    acc_allow_mid_spin: Optional[bool] = None
 
 class GamesBulkDeleteBody(BaseModel):
     game_ids: List[str]
@@ -722,8 +752,13 @@ class AnswerReq(BaseModel):
     question_number: int; time_taken_ms: Optional[int] = None
 
 class SpinReq(BaseModel):
-    session_id: str; user_id: str; game_id: str
-    question_number: int; segment_label: str; amount_etb: float
+    session_id: str = ""  # optional for accumulator: resolved from user_id + game_id
+    user_id: str
+    game_id: str
+    question_number: int = 1
+    segment_label: str = "Spin"
+    amount_etb: float = 0.0
+    accumulator_cashout: bool = False
 
 class DepositApproveReq(BaseModel):
     notes: Optional[str] = None
@@ -736,6 +771,8 @@ class WithdrawReq(BaseModel):
     phone_number: str  # Must match registered phone
     full_name: str     # Telebirr registered name
     bank_account: Optional[str] = None
+    game_id: Optional[str] = None
+    company_id: Optional[str] = None
 
 class PlayerLoginReq(BaseModel):
     telegram_id:       int
@@ -1223,20 +1260,29 @@ async def player_balance_summary(uid: str, telegram_id: Optional[int] = None):
     """
     sb = get_sb()
     user_res = await run(lambda: sb.table("users").select(
-        "id,telegram_id,phone_number,first_name,last_name,games_played,games_won,current_streak"
+        "id,telegram_id,phone_number,first_name,last_name,games_played,games_won,current_streak,balance,total_earned,total_withdrawn"
     ).eq("id", uid).limit(1).execute())
     if not user_res.data:
         raise HTTPException(404, "User not found")
     user = user_res.data[0]
 
-    # 1) Available balance = SUM(amount_etb) from spin_results WHERE w-status='active' (no withdrawal subtraction)
+    # 1) Wallet = users.balance (authoritative; matches spin / withdrawals ledger)
+    wallet_balance = float(user.get("balance") or 0)
+    available_balance = wallet_balance
+
+    # 2) Legacy spin-sum (for breakdown / older UIs) — may differ from wallet if schema uses w-status filters
     total_earned = await _get_active_spin_balance(sb, uid)
-    available_balance = total_earned
 
-    # 2) Total withdrawn (completed only, for display)
-    total_withdrawn = await _sum_completed_withdrawals(sb, uid)
+    # 3) Total withdrawn — prefer users.total_withdrawn when present
+    if user.get("total_withdrawn") is not None:
+        try:
+            total_withdrawn = float(user.get("total_withdrawn") or 0)
+        except (TypeError, ValueError):
+            total_withdrawn = await _sum_completed_withdrawals(sb, uid)
+    else:
+        total_withdrawn = await _sum_completed_withdrawals(sb, uid)
 
-    # 3) Spin rows for breakdown (extended: w-status + amount_etb + question_number; base: amount_won + level)
+    # 4) Spin rows for breakdown (extended: w-status + amount_etb + question_number; base: amount_won + level)
     active_rows: list = []
     _spin_selects = (
         (
@@ -1295,6 +1341,7 @@ async def player_balance_summary(uid: str, telegram_id: Optional[int] = None):
             "current_streak": int(user.get("current_streak") or 0),
         },
         "total_earned_from_spins": round(total_earned, 2),
+        "wallet_balance": round(wallet_balance, 2),
         "total_withdrawn": round(total_withdrawn, 2),
         "available_balance": round(available_balance, 2),
         "active_spins": active_spins,
@@ -2161,9 +2208,51 @@ async def create_game(body: GameCreate, _=Depends(require_admin)):
     payload = body.dict()
     payload["created_by"] = created_by
     payload["company_id"] = payload["company_id"] or None
-    payload["prize_pool_remaining"] = payload["prize_pool_etb"]
-
     deposit_id = payload.get("deposit_id") or None
+
+    # Company-sponsored games: one confirmed deposit = one game (pool from deposit; link deposit.game_id after insert).
+    if payload["company_id"]:
+        explicit_did = (str(deposit_id).strip() if deposit_id else "") or None
+        dep = await _fetch_unlinked_confirmed_deposit(sb, str(payload["company_id"]), explicit_did)
+        if not dep:
+            if explicit_did:
+                raise HTTPException(
+                    400,
+                    "Invalid deposit: must be confirmed, belong to this company, and not already linked to a game",
+                )
+            raise HTTPException(
+                400,
+                "No approved deposit available for this company. Confirm a deposit first (one deposit = one game).",
+            )
+        prize_net = float(dep.get("prize_pool_etb") or 0)
+        if prize_net <= 0:
+            raise HTTPException(400, "Deposit has no prize pool ETB; re-approve the deposit.")
+        commission_etb = float(dep.get("commission_etb") or 0)
+        if commission_etb <= 0:
+            amt_dep = float(dep.get("amount_etb") or 0)
+            commission_etb = round(amt_dep * 0.15, 2)
+        max_p = float(payload.get("max_prize_etb") or 0)
+        if max_p <= 0:
+            raise HTTPException(
+                400,
+                "max_prize_etb is required and must be greater than 0 for company games",
+            )
+        if max_p > prize_net + 1e-6:
+            raise HTTPException(
+                400,
+                f"max_prize_etb ({max_p}) cannot exceed prize pool ({prize_net} ETB)",
+            )
+        payload["prize_pool_etb"] = prize_net
+        payload["prize_pool_remaining"] = prize_net
+        payload["platform_fee_pct"] = float(dep.get("commission_pct") or 15.0)
+        payload["commission_amount"] = commission_etb
+        deposit_id = str(dep["id"])
+    else:
+        payload["prize_pool_remaining"] = payload.get("prize_pool_etb")
+        pp = float(payload.get("prize_pool_etb") or 0)
+        mx = float(payload.get("max_prize_etb") or 0)
+        if pp > 0 and mx > pp + 1e-6:
+            raise HTTPException(400, f"max_prize_etb cannot exceed prize pool ({pp} ETB)")
 
     # Company games: title must differ from other draft / scheduled / active games (case-insensitive).
     cid = payload["company_id"]
@@ -2239,83 +2328,6 @@ async def create_game(body: GameCreate, _=Depends(require_admin)):
             "Game insert appeared to succeed but the row could not be read — check RLS, schema, and service key.",
         )
 
-    # 2) Auto deposit + credit only after the game row exists (rollback game if this fails).
-    if payload["company_id"] and payload["prize_pool_etb"] and not deposit_id:
-        prize = float(payload["prize_pool_etb"])
-        commission_pct = float(payload.get("platform_fee_pct") or 15.0)
-        commission_etb = round(prize * commission_pct / 100, 2)
-        dep_uuid = str(uuid.uuid4())
-        dep_payload = {
-            "id": dep_uuid,
-            "company_id": payload["company_id"],
-            "amount_etb": prize,
-            "commission_pct": commission_pct,
-            "commission_etb": commission_etb,
-            "prize_pool_etb": round(prize - commission_etb, 2),
-            "status": "confirmed",
-        }
-        try:
-
-            def _dep_ins():
-                pl = dict(dep_payload)
-                _supabase_insert_execute_only(sb, "company_deposits", pl)
-
-            await run(_dep_ins)
-            dep_one = await run(
-                lambda did=dep_uuid: sb.table("company_deposits")
-                .select("id")
-                .eq("id", did)
-                .limit(1)
-                .execute()
-            )
-            if dep_one.data:
-                deposit_id = str(dep_one.data[0].get("id"))
-            if not deposit_id:
-                dep_res = await run(
-                    lambda: sb.table("company_deposits")
-                    .select("id")
-                    .eq("company_id", payload["company_id"])
-                    .eq("status", "confirmed")
-                    .order("created_at", desc=True)
-                    .limit(1)
-                    .execute()
-                )
-                if dep_res.data:
-                    deposit_id = str(dep_res.data[0].get("id"))
-            if not deposit_id:
-                raise RuntimeError("company_deposits insert did not return an id")
-
-            co_res = await run(
-                lambda: sb.table("companies")
-                .select("credit_balance")
-                .eq("id", payload["company_id"])
-                .single()
-                .execute()
-            )
-            current = float((co_res.data or {}).get("credit_balance") or 0)
-            new_bal = max(0.0, current - prize)
-            await run(
-                lambda: sb.table("companies")
-                .update({"credit_balance": new_bal})
-                .eq("id", payload["company_id"])
-                .execute()
-            )
-        except Exception as e:
-            logger.exception("create_game: deposit/balance failed after game insert; rolling back game %s", game_id)
-            try:
-                await run(lambda g=game_id: _delete_game_cascade_sync(sb, g))
-            except Exception as e2:
-                logger.error("create_game: rollback failed for game %s: %s", game_id, e2)
-            if _is_missing_relation_error(e, "company_deposits"):
-                raise HTTPException(
-                    503,
-                    "company_deposits table missing or unreachable — game was not kept. Run deposits migration.",
-                ) from e
-            raise HTTPException(
-                500,
-                f"Could not record deposit or update company balance; game was not created. ({e})",
-            ) from e
-
     if deposit_id:
         try:
             gid, did = game_id, deposit_id
@@ -2338,6 +2350,23 @@ async def create_game(body: GameCreate, _=Depends(require_admin)):
         if fres.data:
             game_row = fres.data[0]
 
+        if payload.get("company_id"):
+            try:
+                gid_link, did_link = game_id, deposit_id
+                await run(
+                    lambda: sb.table("company_deposits")
+                    .update({"game_id": gid_link})
+                    .eq("id", did_link)
+                    .execute()
+                )
+            except Exception as e:
+                if _is_missing_column_pgrst(e, "game_id"):
+                    logger.warning(
+                        "company_deposits.game_id not in schema — run migrations/035_money_flow_columns.sql"
+                    )
+                else:
+                    logger.exception("create_game: company_deposits.game_id link failed gid=%s", game_id)
+
     game_data = normalize_game_prize_fields(game_row)
     if deposit_id:
         game_data["deposit_id"] = deposit_id
@@ -2346,8 +2375,10 @@ async def create_game(body: GameCreate, _=Depends(require_admin)):
 
 @app.put("/api/games/{gid}")
 async def update_game(gid: str, body: GameUpdate, _=Depends(require_admin)):
-    updates = body.dict(exclude_none=True)
-    if not updates: raise HTTPException(400, "Nothing to update")
+    # exclude_none=False so acc_total_questions=null can disable accumulator mode
+    updates = body.dict(exclude_unset=True, exclude_none=False)
+    if not updates:
+        raise HTTPException(400, "Nothing to update")
     sb = get_sb()
     if "title" in updates:
         new_title = (updates.get("title") or "").strip()
@@ -2428,10 +2459,60 @@ async def activate_game(gid: str, _=Depends(require_admin)):
     return {"status": "active", "questions": gq_count, "qr_codes": qr_count}
 
 @app.post("/api/games/{gid}/end")
+@app.patch("/api/admin/games/{gid}/close")
 async def end_game(gid: str, _=Depends(require_admin)):
+    """End game manually: status ended, closed_reason manual, revoke QR codes for this game."""
     sb = get_sb()
-    await run(lambda: sb.table("games").update({"status": "ended"}).eq("id", gid).execute())
-    return {"status": "ended"}
+    g_res = await run(
+        lambda: sb.table("games")
+        .select("prize_pool_remaining,prize_pool_etb")
+        .eq("id", gid)
+        .limit(1)
+        .execute()
+    )
+    grow = (g_res.data or [{}])[0] if g_res.data else {}
+    rem = grow.get("prize_pool_remaining")
+    if rem is None:
+        rem = grow.get("prize_pool_etb")
+    now = datetime.now(timezone.utc).isoformat()
+    upd: Dict[str, Any] = {"status": "ended", "updated_at": now, "closed_reason": "manual"}
+    for _attempt in range(8):
+        try:
+            await run(lambda u=dict(upd): sb.table("games").update(u).eq("id", gid).execute())
+            break
+        except Exception as e:
+            col = _pgrst204_missing_column_name(e)
+            if col == "closed_reason":
+                upd.pop("closed_reason", None)
+                await run(lambda u=dict(upd): sb.table("games").update(u).eq("id", gid).execute())
+                break
+            raise
+    try:
+        await run(
+            lambda: _pg_table(sb, "qr_codes")
+            .update({"status": "revoked", "updated_at": now})
+            .eq("game_id", gid)
+            .execute()
+        )
+    except Exception as e:
+        logger.warning("end_game: qr_codes revoke skipped: %s", e)
+    try:
+        admin_res = await run(lambda: sb.table("users").select("id").eq("role", "admin").limit(1).execute())
+        aid = (admin_res.data or [{}])[0].get("id")
+        await run(
+            lambda: sb.table("audit_log").insert(
+                {
+                    "actor_id": aid,
+                    "action": "game_close_manual",
+                    "table_name": "games",
+                    "record_id": gid,
+                    "new_data": {"status": "ended", "closed_reason": "manual"},
+                }
+            ).execute()
+        )
+    except Exception as e:
+        logger.warning("end_game: audit_log skipped: %s", e)
+    return {"status": "ended", "closed_reason": "manual", "prize_pool_remaining": rem}
 
 
 @app.post("/api/admin/broadcast-game/{game_id}")
@@ -3191,9 +3272,58 @@ async def update_withdrawal(wid: str, body: WithdrawalUpdate, _=Depends(require_
         await run(lambda: sb.table("withdrawals").update({"notes": body.notes}).eq("id", wid).execute())
     return await get_withdrawal(wid, _)
 
+@app.get("/api/admin/withdrawals/{wid}/release-preview")
+async def withdrawal_release_preview(wid: str, _=Depends(require_admin)):
+    """Data for admin confirm modal: full release amount (no player fee), optional company balance impact."""
+    sb = get_sb()
+    w_res = await run(lambda: sb.table("withdrawals").select("*").eq("id", wid).eq("status", "pending").single().execute())
+    if not w_res.data:
+        raise HTTPException(404, "Withdrawal not found or not pending")
+    w = w_res.data
+    release_amt = float(w.get("amount_requested") or w.get("amount") or 0)
+    user_id = w["user_id"]
+    ures = await run(
+        lambda: sb.table("users").select("first_name,last_name,phone_number").eq("id", user_id).single().execute()
+    )
+    u = ures.data or {}
+    player_name = " ".join(x for x in [u.get("first_name"), u.get("last_name")] if x).strip() or "Player"
+    phone = w.get("phone_number") or u.get("phone_number") or ""
+    cid = w.get("company_id")
+    company_name = None
+    credit_before = None
+    credit_after = None
+    if cid:
+        try:
+            co = await run(
+                lambda: sb.table("companies").select("name,credit_balance").eq("id", cid).single().execute()
+            )
+            if co.data:
+                company_name = co.data.get("name")
+                credit_before = float(co.data.get("credit_balance") or 0)
+                credit_after = round(credit_before - release_amt, 2)
+        except Exception as e:
+            logger.warning("release-preview company: %s", e)
+    return {
+        "withdrawal_id": wid,
+        "player_name": player_name,
+        "requested_etb": release_amt,
+        "player_commission_etb": 0.0,
+        "release_amount_etb": release_amt,
+        "phone_number": phone,
+        "company_id": cid,
+        "company_name": company_name,
+        "company_credit_before": credit_before,
+        "company_credit_after": credit_after,
+    }
+
+
 @app.post("/api/withdrawals/{wid}/approve")
+@app.patch("/api/admin/withdrawals/{wid}/approve")
 async def approve_withdrawal(wid: str, _=Depends(require_admin)):
-    """Approve: Admin manually sent money to Talabirr. Mark complete, update total_withdrawn."""
+    """
+    Release full requested amount to TeleBirr (no extra player commission — platform fee was on deposit).
+    Deducts sponsor company credit_balance when withdrawals.company_id is set.
+    """
     sb = get_sb()
     now = datetime.now(timezone.utc).isoformat()
     try:
@@ -3202,27 +3332,128 @@ async def approve_withdrawal(wid: str, _=Depends(require_admin)):
             raise HTTPException(404, "Withdrawal not found or not pending")
         w = w_res.data
         user_id = w["user_id"]
-        amount_paid = float(w.get("amount_paid") or 0)
+        release_amt = float(w.get("amount_requested") or w.get("amount") or 0)
+        if release_amt <= 0:
+            raise HTTPException(400, "Invalid withdrawal amount")
 
-        # Update total_withdrawn
-        u2 = await run(lambda: sb.table("users").select("total_withdrawn").eq("id", user_id).single().execute())
-        tw = float((u2.data or {}).get("total_withdrawn") or 0)
-        await run(lambda: sb.table("users").update({
-            "total_withdrawn": round(tw + amount_paid, 2),
-            "updated_at": now
-        }).eq("id", user_id).execute())
+        cid = w.get("company_id")
+        if cid:
+            co = await run(lambda: sb.table("companies").select("credit_balance").eq("id", cid).single().execute())
+            cb = float((co.data or {}).get("credit_balance") or 0)
+            if cb + 1e-6 < release_amt:
+                raise HTTPException(
+                    409,
+                    f"Company credit balance ({cb:.2f} ETB) is less than release amount ({release_amt:.2f} ETB)",
+                )
+            await run(
+                lambda: sb.table("companies")
+                .update({"credit_balance": round(cb - release_amt, 2), "updated_at": now})
+                .eq("id", cid)
+                .execute()
+            )
+
+        urow = await run(lambda: sb.table("users").select("balance,total_withdrawn").eq("id", user_id).single().execute())
+        u = urow.data or {}
+        bal = float(u.get("balance") or 0)
+        tw = float(u.get("total_withdrawn") or 0)
+        await run(
+            lambda: sb.table("users")
+            .update(
+                {
+                    "total_withdrawn": round(tw + release_amt, 2),
+                    "updated_at": now,
+                }
+            )
+            .eq("id", user_id)
+            .execute()
+        )
+
+        try:
+            await run(
+                lambda: sb.table("transactions")
+                .insert(
+                    {
+                        "user_id": user_id,
+                        "type": "withdrawal_complete",
+                        "amount": -release_amt,
+                        "balance_before": bal,
+                        "balance_after": bal,
+                        "reference_id": wid,
+                        "reference_type": "withdrawal",
+                        "description": f"Withdrawal released — {release_amt:.2f} ETB to TeleBirr",
+                    }
+                )
+                .execute()
+            )
+        except Exception as e:
+            logger.warning("approve_withdrawal transaction insert skipped: %s", e)
 
         admin_res = await run(lambda: sb.table("users").select("id").eq("role", "admin").limit(1).execute())
         aid = (admin_res.data or [{}])[0].get("id") if admin_res.data else None
-        upd = {"status": "completed", "processed_at": now}
+        upd: Dict[str, Any] = {
+            "status": "completed",
+            "processed_at": now,
+            "amount_paid": release_amt,
+            "fee_etb": 0,
+            "fee_pct": 0,
+        }
         if aid:
             upd["processed_by"] = aid
-        r_upd = await run(lambda: sb.table("withdrawals").update(upd).eq("id", wid).eq("status", "pending").execute())
-        if not (getattr(r_upd, "data", None) and len(r_upd.data) > 0):
+        r_upd = None
+        for _attempt in range(6):
+            try:
+                r_upd = await run(
+                    lambda u=dict(upd): sb.table("withdrawals").update(u).eq("id", wid).eq("status", "pending").execute()
+                )
+                break
+            except Exception as e:
+                col = _pgrst204_missing_column_name(e)
+                if col and col in upd:
+                    upd.pop(col, None)
+                    continue
+                raise
+        if not r_upd or not (getattr(r_upd, "data", None) and len(r_upd.data) > 0):
             raise HTTPException(409, "Withdrawal was already processed by another admin")
-        # DB trigger on_withdrawal_status_change marks spin_results.w-status='deactive' atomically
 
-        return {"status": "completed", "message": "Released to Talabirr"}
+        tg_msg = f"✅ {release_amt:.0f} ETB has been sent to your TeleBirr!"
+        await _telegram_send_player_text(sb, str(user_id), tg_msg)
+
+        try:
+            nbody = {
+                "user_id": user_id,
+                "type": "withdrawal_approved",
+                "title": "✅ Withdrawal completed",
+                "body": tg_msg,
+                "telegram_sent": True,
+                "telegram_sent_at": now,
+            }
+            await run(lambda: sb.table("notifications").insert(nbody).execute())
+        except Exception as e:
+            col = _pgrst204_missing_column_name(e)
+            if col in ("telegram_sent", "telegram_sent_at"):
+                try:
+                    nb2 = {k: v for k, v in nbody.items() if k not in ("telegram_sent", "telegram_sent_at")}
+                    await run(lambda: sb.table("notifications").insert(nb2).execute())
+                except Exception as e2:
+                    logger.warning("approve_withdrawal notification skipped: %s", e2)
+            else:
+                logger.warning("approve_withdrawal notification skipped: %s", e)
+
+        u2 = await run(lambda: sb.table("users").select("balance").eq("id", user_id).single().execute())
+        new_bal = float((u2.data or {}).get("balance") or bal)
+        co_after = None
+        if cid:
+            cr = await run(lambda: sb.table("companies").select("credit_balance").eq("id", cid).single().execute())
+            co_after = float((cr.data or {}).get("credit_balance") or 0)
+
+        return {
+            "success": True,
+            "amount_paid": release_amt,
+            "player_new_balance": round(new_bal, 2),
+            "company_credit_balance": round(co_after, 2) if co_after is not None else None,
+            "status": "completed",
+            "message": "Released to TeleBirr",
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -3256,6 +3487,7 @@ async def complete_withdrawal(wid: str, _=Depends(require_admin)):
         raise HTTPException(500, f"Withdrawal complete failed: {str(e)}")
 
 @app.post("/api/withdrawals/{wid}/deny")
+@app.patch("/api/admin/withdrawals/{wid}/reject")
 async def deny_withdrawal(wid: str, body: Optional[DenyReq] = Body(default=None), _=Depends(require_admin)):
     """Deny: Refund reserved balance to user. Works for pending or processing."""
     sb = get_sb()
@@ -3268,10 +3500,29 @@ async def deny_withdrawal(wid: str, body: Optional[DenyReq] = Body(default=None)
         user_id = w["user_id"]
 
         # Trigger on_withdrawal_status_change refunds when status→failed (migration 010)
-        r = await run(lambda: sb.table("withdrawals").update({
-            "status": "failed", "failure_reason": reason
-        }).eq("id", wid).in_("status", ["pending", "processing"]).execute())
-        if not (getattr(r, "data", None) or len(r.data) > 0):
+        upd_w: Dict[str, Any] = {
+            "status": "failed",
+            "failure_reason": reason,
+            "rejection_reason": reason,
+        }
+        r = None
+        for _attempt in range(4):
+            try:
+                r = await run(
+                    lambda u=dict(upd_w): sb.table("withdrawals")
+                    .update(u)
+                    .eq("id", wid)
+                    .in_("status", ["pending", "processing"])
+                    .execute()
+                )
+                break
+            except Exception as e:
+                col = _pgrst204_missing_column_name(e)
+                if col == "rejection_reason" and "rejection_reason" in upd_w:
+                    upd_w.pop("rejection_reason", None)
+                    continue
+                raise
+        if not r or not getattr(r, "data", None):
             raise HTTPException(404, "Withdrawal not found or not pending/processing")
         return {"status": "failed"}
     except HTTPException:
@@ -3292,7 +3543,7 @@ async def withdraw_config():
     cfg_map = {r["key"]: r["value"] for r in (cfg.data or [])}
     return {
         "min_withdrawal_etb": float(cfg_map.get("min_withdrawal_etb", 50)),
-        "withdrawal_fee_pct": float(cfg_map.get("withdrawal_fee_pct", 5)),
+        "withdrawal_fee_pct": 0.0,
     }
 
 def _normalize_phone(raw: str) -> str:
@@ -3313,7 +3564,7 @@ async def player_withdraw(body: WithdrawReq):
     cfg = await run(lambda: sb.table("platform_config").select("key,value")
         .in_("key", ["withdrawal_fee_pct","min_withdrawal_etb"]).execute())
     cfg_map = {r["key"]: r["value"] for r in (cfg.data or [])}
-    fee_pct = float(cfg_map.get("withdrawal_fee_pct", 5))
+    fee_pct = 0.0  # No withdrawal fee for players (sponsor commission is on company deposit).
     min_etb = float(cfg_map.get("min_withdrawal_etb", 50))
 
     if body.amount_requested < min_etb:
@@ -3342,9 +3593,9 @@ async def player_withdraw(body: WithdrawReq):
     if pend.data:
         raise HTTPException(400, "You already have a withdrawal in progress. Wait until it is completed.")
 
-    # 5% fee, rest sent to user. e.g. 138 requested → 7 fee → 131 paid
-    fee_etb    = round(body.amount_requested * fee_pct / 100, 0)
-    amount_paid = round(body.amount_requested - fee_etb, 2)
+    # No player commission on withdrawal (15% platform fee is on company deposit).
+    fee_etb = 0.0
+    amount_paid = round(body.amount_requested, 2)
 
     # Reserve balance immediately (deduct)
     bal_after = balance - body.amount_requested
@@ -3354,12 +3605,35 @@ async def player_withdraw(body: WithdrawReq):
     }).eq("id", body.user_id).execute())
 
     payload = {
-        "user_id": body.user_id, "amount_requested": body.amount_requested,
-        "fee_pct": fee_pct, "fee_etb": fee_etb, "amount_paid": amount_paid,
-        "phone_number": req_phone, "full_name": (body.full_name or "").strip(),
-        "bank_account": body.bank_account, "status": "pending"
+        "user_id": body.user_id,
+        "amount": body.amount_requested,
+        "amount_requested": body.amount_requested,
+        "fee_pct": fee_pct,
+        "fee_etb": fee_etb,
+        "amount_paid": amount_paid,
+        "phone_number": req_phone,
+        "full_name": (body.full_name or "").strip(),
+        "bank_account": body.bank_account,
+        "status": "pending",
     }
-    res = await run(lambda: sb.table("withdrawals").insert(payload).execute())
+    if body.game_id and str(body.game_id).strip():
+        payload["game_id"] = str(body.game_id).strip()
+    if body.company_id and str(body.company_id).strip():
+        payload["company_id"] = str(body.company_id).strip()
+    plw = dict(payload)
+    res = None
+    for _attempt in range(8):
+        try:
+            res = await run(lambda p=dict(plw): sb.table("withdrawals").insert(p).execute())
+            break
+        except Exception as e:
+            col = _pgrst204_missing_column_name(e)
+            if col and col in plw:
+                plw.pop(col, None)
+                continue
+            raise
+    else:
+        raise HTTPException(500, "Could not record withdrawal (schema mismatch).")
     return (res.data or [{}])[0]
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3386,6 +3660,352 @@ async def get_company(cid: str, _=Depends(require_admin)):
     res = await run(lambda: sb.table("companies").select("*").eq("id", cid).single().execute())
     if not res.data: raise HTTPException(404, "Company not found")
     return res.data
+
+
+async def _company_balance_payload(sb: Client, cid: str) -> dict:
+    """total_deposited = SUM confirmed deposits; available_balance = companies.credit_balance."""
+    co_res = await run(
+        lambda: sb.table("companies").select("id,name,credit_balance").eq("id", cid).single().execute()
+    )
+    if not co_res.data:
+        raise HTTPException(404, "Company not found")
+    row = co_res.data
+    total_dep = 0.0
+    try:
+        dep_res = await run(
+            lambda: sb.table("company_deposits")
+            .select("amount_etb")
+            .eq("company_id", cid)
+            .eq("status", "confirmed")
+            .execute()
+        )
+        for r in dep_res.data or []:
+            total_dep += float(r.get("amount_etb") or 0)
+    except Exception as e:
+        if _is_missing_relation_error(e, "company_deposits"):
+            total_dep = 0.0
+        else:
+            raise
+    avail = float(row.get("credit_balance") or 0)
+    return {
+        "company_id": cid,
+        "company_name": row.get("name"),
+        "total_deposited": round(total_dep, 2),
+        "available_balance": round(avail, 2),
+    }
+
+
+async def _company_finance_detail(sb: Client, cid: str) -> dict:
+    """Extended company wallet view for admin deposits page (pool, paid out, pending withdrawals)."""
+    base = await _company_balance_payload(sb, cid)
+    commission = 0.0
+    original_pool = 0.0
+    try:
+        dep_res = await run(
+            lambda: sb.table("company_deposits")
+            .select("amount_etb,commission_etb,prize_pool_etb")
+            .eq("company_id", cid)
+            .eq("status", "confirmed")
+            .execute()
+        )
+        for r in dep_res.data or []:
+            commission += float(r.get("commission_etb") or 0)
+            original_pool += float(r.get("prize_pool_etb") or 0)
+        td = float(base.get("total_deposited") or 0)
+        if commission <= 0 and td > 0:
+            commission = round(td * 0.15, 2)
+        if original_pool <= 0 and td > 0:
+            original_pool = round(td - commission, 2)
+    except Exception as e:
+        if not _is_missing_relation_error(e, "company_deposits"):
+            logger.warning("_company_finance_detail deposits: %s", e)
+
+    games_res = await run(
+        lambda: sb.table("games").select("id,prize_pool_remaining").eq("company_id", cid).execute()
+    )
+    grows = games_res.data or []
+    gids = [r["id"] for r in grows if r.get("id")]
+    remaining_pool = sum(float(r.get("prize_pool_remaining") or 0) for r in grows)
+
+    paid_to_players = 0.0
+    if gids:
+        for i in range(0, len(gids), 80):
+            chunk = gids[i : i + 80]
+            try:
+                sp = await run(
+                    lambda ch=chunk: sb.table("spin_results")
+                    .select("amount_won,amount_etb")
+                    .in_("game_id", ch)
+                    .execute()
+                )
+                for r in sp.data or []:
+                    paid_to_players += float(
+                        r.get("amount_etb") if r.get("amount_etb") is not None else r.get("amount_won") or 0
+                    )
+            except Exception as e:
+                logger.warning("_company_finance_detail spins: %s", e)
+
+    pending_wd = 0.0
+    try:
+        wd = await run(
+            lambda: sb.table("withdrawals")
+            .select("amount_requested,amount")
+            .eq("company_id", cid)
+            .in_("status", ["pending", "processing"])
+            .execute()
+        )
+        for r in wd.data or []:
+            pending_wd += float(r.get("amount_requested") or r.get("amount") or 0)
+    except Exception as e:
+        if not _is_missing_column_pgrst(e, "company_id"):
+            logger.warning("_company_finance_detail pending withdrawals: %s", e)
+
+    credit_bal = float(base.get("available_balance") or 0)
+    # Pool liquidity across existing games (deposits page). NOT the company wallet.
+    pool_liquidity = round(max(0.0, remaining_pool - pending_wd), 2)
+    # Next company-sponsored game uses one unlinked confirmed deposit (see create_game).
+    next_dep = await _fetch_unlinked_confirmed_deposit(sb, cid, None)
+    next_game_prize_pool = (
+        round(float(next_dep.get("prize_pool_etb") or 0), 2) if next_dep else 0.0
+    )
+    next_deposit_amount_etb = (
+        round(float(next_dep.get("amount_etb") or 0), 2) if next_dep else None
+    )
+    next_deposit_commission_etb = (
+        round(float(next_dep.get("commission_etb") or 0), 2) if next_dep else None
+    )
+    return {
+        **base,
+        "commission": round(commission, 2),
+        "original_pool": round(original_pool, 2),
+        "paid_to_players": round(paid_to_players, 2),
+        "remaining_pool": round(remaining_pool, 2),
+        "pending_withdrawals": round(pending_wd, 2),
+        # Liquidity tied to active game pools (remaining − pending withdrawals).
+        "available_balance": pool_liquidity,
+        "pool_liquidity": pool_liquidity,
+        # Wallet on companies row (credited on deposit confirm; debited on wins / withdrawals).
+        "company_credit_balance": round(credit_bal, 2),
+        # Budget for the next create_game() when company_id is set (one deposit → one game).
+        "next_game_prize_pool": next_game_prize_pool,
+        "next_deposit_amount_etb": next_deposit_amount_etb,
+        "next_deposit_commission_etb": next_deposit_commission_etb,
+    }
+
+
+async def _telegram_send_player_text(sb: Client, user_id: str, text: str) -> None:
+    if not BOT_TOKEN:
+        return
+    try:
+        ur = await run(
+            lambda uid=str(user_id).strip(): sb.table("users")
+            .select("telegram_id")
+            .eq("id", uid)
+            .single()
+            .execute()
+        )
+        tid = (ur.data or {}).get("telegram_id")
+        if tid is None:
+            return
+        async with _httpx.AsyncClient(timeout=15) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={"chat_id": int(tid), "text": text},
+            )
+    except Exception as e:
+        logger.warning("telegram send player: %s", e)
+
+
+async def _fetch_unlinked_confirmed_deposit(
+    sb: Client, company_id: str, deposit_id: Optional[str] = None
+) -> Optional[dict]:
+    """
+    One deposit = one game: return a confirmed company_deposit with no game_id yet,
+    or a specific deposit_id if it is confirmed, belongs to company, and unlinked.
+    """
+    cid = str(company_id).strip()
+    if not cid:
+        return None
+    try:
+        if deposit_id and str(deposit_id).strip():
+            did = str(deposit_id).strip()
+            res = await run(
+                lambda: sb.table("company_deposits")
+                .select("*")
+                .eq("id", did)
+                .eq("company_id", cid)
+                .limit(1)
+                .execute()
+            )
+            row = (res.data or [None])[0]
+            if not row or str(row.get("status") or "") != "confirmed":
+                return None
+            if row.get("game_id"):
+                return None
+            return row
+        res = await run(
+            lambda: sb.table("company_deposits")
+            .select("*")
+            .eq("company_id", cid)
+            .eq("status", "confirmed")
+            .is_("game_id", "null")
+            .order("created_at")
+            .limit(1)
+            .execute()
+        )
+        return (res.data or [None])[0]
+    except Exception as e:
+        col = _pgrst204_missing_column_name(e)
+        if col == "game_id" or _is_missing_column_pgrst(e, "game_id"):
+            logger.warning(
+                "company_deposits.game_id missing — run migrations/035_money_flow_columns.sql; "
+                "using oldest confirmed deposit (cannot enforce one-deposit-one-game)."
+            )
+            res2 = await run(
+                lambda: sb.table("company_deposits")
+                .select("*")
+                .eq("company_id", cid)
+                .eq("status", "confirmed")
+                .order("created_at")
+                .limit(1)
+                .execute()
+            )
+            return (res2.data or [None])[0]
+        if _is_missing_relation_error(e, "company_deposits"):
+            return None
+        raise
+
+
+async def _spin_post_bookkeeping(sb: Client, game_id: str, user_id: str, amount: float) -> dict:
+    """
+    After spin_results INSERT (DB trigger already updated pool, user balance, session total_earned, game_win tx).
+    Bumps games.total_players / total_winners / total_paid_out, optional auto-end, company wallet, games_played/won.
+    """
+    gid = str(game_id).strip()
+    uid = str(user_id).strip()
+    amt = round(float(amount), 2)
+    if amt <= 0 or not gid or not uid:
+        g0 = await run(lambda: sb.table("games").select("status").eq("id", gid).single().execute())
+        return {"game_status": (g0.data or {}).get("status")}
+
+    g_res = await run(
+        lambda: sb.table("games")
+        .select("id,company_id,status,prize_pool_remaining,total_players,total_winners,total_paid_out")
+        .eq("id", gid)
+        .single()
+        .execute()
+    )
+    g = g_res.data or {}
+    tp = int(g.get("total_players") or 0) + 1
+    tw = int(g.get("total_winners") or 0) + 1
+    tpo = float(g.get("total_paid_out") or 0) + amt
+    rem = g.get("prize_pool_remaining")
+    rem_f = float(rem) if rem is not None else None
+    now = datetime.now(timezone.utc).isoformat()
+    gupd: Dict[str, Any] = {
+        "total_players": tp,
+        "total_winners": tw,
+        "total_paid_out": round(tpo, 2),
+        "updated_at": now,
+    }
+    if rem_f is not None and rem_f <= 0 and str(g.get("status") or "") == "active":
+        gupd["status"] = "ended"
+        gupd["closed_reason"] = "pool_exhausted"
+
+    for _attempt in range(12):
+        try:
+            await run(lambda u=dict(gupd): sb.table("games").update(u).eq("id", gid).execute())
+            break
+        except Exception as e:
+            col = _pgrst204_missing_column_name(e)
+            if col == "closed_reason" and "closed_reason" in gupd:
+                gupd.pop("closed_reason", None)
+                if str(g.get("status") or "") == "active" and rem_f is not None and rem_f <= 0:
+                    gupd["status"] = "ended"
+                continue
+            logger.warning("_spin_post_bookkeeping games update: %s", e)
+            break
+
+    cid = g.get("company_id")
+    if cid:
+        try:
+            co_res = await run(
+                lambda: sb.table("companies")
+                .select("credit_balance,total_spent")
+                .eq("id", cid)
+                .single()
+                .execute()
+            )
+            co = co_res.data or {}
+            cb = float(co.get("credit_balance") or 0)
+            ts = float(co.get("total_spent") or 0)
+            await run(
+                lambda: sb.table("companies")
+                .update(
+                    {
+                        "credit_balance": max(0.0, round(cb - amt, 2)),
+                        "total_spent": round(ts + amt, 2),
+                    }
+                )
+                .eq("id", cid)
+                .execute()
+            )
+        except Exception as e:
+            logger.warning("_spin_post_bookkeeping company update: %s", e)
+
+    try:
+        u_res = await run(
+            lambda: sb.table("users").select("games_played,games_won").eq("id", uid).single().execute()
+        )
+        u = u_res.data or {}
+        await run(
+            lambda: sb.table("users")
+            .update(
+                {
+                    "games_played": int(u.get("games_played") or 0) + 1,
+                    "games_won": int(u.get("games_won") or 0) + 1,
+                    "updated_at": now,
+                }
+            )
+            .eq("id", uid)
+            .execute()
+        )
+    except Exception as e:
+        col = _pgrst204_missing_column_name(e)
+        if col in ("games_played", "games_won"):
+            logger.warning("_spin_post_bookkeeping user counters skipped: %s", e)
+        else:
+            logger.warning("_spin_post_bookkeeping user update: %s", e)
+
+    g2 = await run(lambda: sb.table("games").select("status,prize_pool_remaining,closed_reason").eq("id", gid).single().execute())
+    gr = g2.data or {}
+    return {
+        "game_status": gr.get("status"),
+        "prize_pool_remaining": gr.get("prize_pool_remaining"),
+        "closed_reason": gr.get("closed_reason"),
+    }
+
+
+@app.get("/api/admin/companies/{cid}/balance")
+async def admin_company_balance(cid: str, _=Depends(require_admin)):
+    """
+    Admin — company finance snapshot for deposits UI.
+    Includes pool, paid_to_players (spin_results), pending withdrawals, and company_credit_balance.
+    """
+    sb = get_sb()
+    return await _company_finance_detail(sb, cid)
+
+
+@app.get("/api/companies/{cid}/available-deposit")
+@app.get("/api/admin/companies/{cid}/available-deposit")
+async def get_available_deposit_for_game(cid: str, _=Depends(require_admin)):
+    """Next confirmed deposit not yet linked to a game (one deposit = one game)."""
+    sb = get_sb()
+    dep = await _fetch_unlinked_confirmed_deposit(sb, cid, None)
+    if not dep:
+        return {"deposit": None, "message": "No approved deposit available for this company"}
+    return {"deposit": dep}
+
 
 @app.post("/api/companies")
 async def create_company(body: CompanyCreate, _=Depends(require_admin)):
@@ -3426,9 +4046,34 @@ async def update_company(cid: str, body: CompanyUpdate, request: Request, _=Depe
 
 @app.delete("/api/companies/{cid}")
 async def delete_company(cid: str, _=Depends(require_admin)):
+    """
+    Remove company. company_deposits uses ON DELETE RESTRICT — delete all deposit rows first
+    so Postgres allows the company row to be removed (clears deposit history for this company).
+    """
     sb = get_sb()
+    ex = await run(lambda: sb.table("companies").select("id").eq("id", cid).limit(1).execute())
+    if not ex.data:
+        raise HTTPException(404, "Company not found")
+
+    dep_removed = 0
+    try:
+        listed = await run(
+            lambda: sb.table("company_deposits").select("id").eq("company_id", cid).execute()
+        )
+        dep_removed = len(listed.data or [])
+        if dep_removed:
+            await run(lambda: sb.table("company_deposits").delete().eq("company_id", cid).execute())
+    except Exception as e:
+        if _is_missing_relation_error(e, "company_deposits"):
+            logger.warning("delete_company: company_deposits missing — skipping. %s", e)
+        else:
+            raise
+
     await run(lambda: sb.table("companies").delete().eq("id", cid).execute())
-    return {"message": "Company deleted"}
+    return {
+        "message": "Company deleted",
+        "company_deposits_removed": dep_removed,
+    }
 
 @app.post("/api/companies/{cid}/verify")
 async def verify_company(cid: str, _=Depends(require_admin)):
@@ -4414,6 +5059,12 @@ async def start_session(body: SessionStartReq):
     sb = get_sb()
     game_config = await _get_game_config(sb)
 
+    game_res = await run(lambda: sb.table("games").select("*").eq("id", body.game_id).limit(1).execute())
+    if not game_res.data:
+        raise HTTPException(404, "Game not found")
+    game = normalize_game_prize_fields(game_res.data[0]) or {}
+    merged_config = _merge_session_game_config(game_config, game)
+
     # Check existing session (prefer active one — new QR can create new session)
     existing = await run(lambda: sb.table("game_sessions")
         .select("*").eq("user_id", body.user_id).eq("game_id", body.game_id)
@@ -4425,26 +5076,30 @@ async def start_session(body: SessionStartReq):
         # SECURITY: Once game is over (any path), never allow re-entry
         if sess.get("is_completed"):
             return {"session": sess, "cooldown": False, "already_played": True,
-                    "reason": "You already finished this game", "game_config": game_config}
+                    "reason": "You already finished this game", "game_config": merged_config}
 
         if sess.get("is_active") is False:
             return {"session": sess, "cooldown": False, "already_played": True,
-                    "reason": "Game over — you cannot re-enter", "game_config": game_config}
+                    "reason": "Game over — you cannot re-enter", "game_config": merged_config}
 
-        max_wrong = game_config.get("max_wrong_answers", 3)
-        if sess.get("wrong_count", 0) >= max_wrong:
+        if _accumulator_enabled(game) and _coerce_pg_bool(sess.get("cashed_out")):
             return {"session": sess, "cooldown": False, "already_played": True,
-                    "reason": "Game over — %d wrong answers" % max_wrong, "game_config": game_config}
+                    "reason": "You already cashed out this game", "game_config": merged_config}
+
+        max_wrong = merged_config.get("max_wrong_answers", 3)
+        if (not _accumulator_enabled(game)) and sess.get("wrong_count", 0) >= max_wrong:
+            return {"session": sess, "cooldown": False, "already_played": True,
+                    "reason": "Game over — %d wrong answers" % max_wrong, "game_config": merged_config}
 
         if sess.get("cooldown_until"):
             cd = datetime.fromisoformat(sess["cooldown_until"].replace("Z", "+00:00"))
             if cd > datetime.now(timezone.utc):
                 return {"session": sess, "cooldown": True,
                         "cooldown_until": sess["cooldown_until"],
-                        "already_played": True, "reason": "Game over — %d wrong answers" % max_wrong, "game_config": game_config}
+                        "already_played": True, "reason": "Game over — %d wrong answers" % max_wrong, "game_config": merged_config}
             # Cooldown expired = game was over (3 wrong), still block re-entry
             return {"session": sess, "cooldown": False, "already_played": True,
-                    "reason": "Game over — you cannot re-enter", "game_config": game_config}
+                    "reason": "Game over — you cannot re-enter", "game_config": merged_config}
 
         # FIX 8: return already-answered question IDs so mini-app skips them
         answered_res = await run(lambda: sb.table("round_answers")
@@ -4452,7 +5107,7 @@ async def start_session(body: SessionStartReq):
         answered_ids = [r["question_id"] for r in (answered_res.data or [])]
 
         return {"session": sess, "cooldown": False, "already_played": False,
-                "answered_question_ids": answered_ids, "game_config": game_config}
+                "answered_question_ids": answered_ids, "game_config": merged_config}
 
     # Resolve qr_code_id (only when joining via QR)
     qr_code_id = None
@@ -4471,24 +5126,56 @@ async def start_session(body: SessionStartReq):
             raise HTTPException(400, "user_id or telegram_id required to attend")
         scan_res = await run(lambda: scan_check.limit(1).execute())
         if not scan_res.data:
-            return {"session": None, "already_played": True, "reason": "Scan the game QR once first to join", "game_config": game_config}
+            return {"session": None, "already_played": True, "reason": "Scan the game QR once first to join", "game_config": merged_config}
 
-    # Get game config
-    game_r = await run(lambda: sb.table("games").select("*").eq("id", body.game_id).single().execute())
-    game = normalize_game_prize_fields(game_r.data or {}) or {}
-    remaining  = float(game.get("prize_pool_remaining") or 0)
-    cap_pct    = float(game.get("player_cap_pct") or 30)
-    player_cap = round(remaining * cap_pct / 100, 2)
+    # Prize model: sponsor budget = prize_pool_* ; per-player max = max_prize_etb
+    # (capped by ETB left in pool when session starts). Legacy: if max_prize_etb unset, use % of pool.
+    rem_raw = game.get("prize_pool_remaining")
+    if rem_raw is None:
+        rem_raw = game.get("prize_pool_etb")
+    remaining: Optional[float] = float(rem_raw) if rem_raw is not None else None
 
-    sess_payload = {
+    if remaining is not None and remaining <= 0:
+        return {
+            "session": None,
+            "already_played": True,
+            "reason": "Prize pool for this game is exhausted",
+            "game_config": merged_config,
+        }
+
+    max_pp = float(game.get("max_prize_etb") or 0)
+    cap_pct = float(game.get("player_cap_pct") or 30)
+    if max_pp > 0:
+        player_cap = min(max_pp, remaining) if remaining is not None else max_pp
+    else:
+        base = remaining if remaining is not None else float(game.get("prize_pool_etb") or 0)
+        player_cap = round(base * cap_pct / 100, 2)
+
+    sess_payload: Dict[str, Any] = {
         "game_id": body.game_id, "user_id": body.user_id,
         "qr_code_id": qr_code_id, "player_cap_etb": player_cap,
         "current_question": 1, "questions_answered": 0,
-        "wrong_count": 0, "is_active": True
+        "wrong_count": 0, "is_active": True,
+        "prize_meter_etb": 0, "correct_count": 0, "cashed_out": False,
     }
-    res = await run(lambda: sb.table("game_sessions").insert(sess_payload).execute())
+    res = None
+    insert_row = dict(sess_payload)
+    for _attempt in range(12):
+        try:
+            res = await run(lambda pl=dict(insert_row): sb.table("game_sessions").insert(pl).execute())
+            break
+        except Exception as e:
+            col = _pgrst204_missing_column_name(e)
+            if col and col in insert_row:
+                logger.warning("session/start: omitting missing column %r", col)
+                insert_row = _games_payload_drop_keys(insert_row, {col})
+                continue
+            logger.exception("session/start: insert failed")
+            raise HTTPException(500, _postgrest_error_detail(e) or str(e)) from e
+    if res is None:
+        raise HTTPException(500, "Could not create game session")
     return {"session": (res.data or [{}])[0], "cooldown": False,
-            "already_played": False, "answered_question_ids": [], "game_config": game_config}
+            "already_played": False, "answered_question_ids": [], "game_config": merged_config}
 
 @app.get("/api/game/{game_id}/questions")
 async def get_game_questions_public(game_id: str, session_id: str = ""):
@@ -4515,8 +5202,22 @@ async def get_game_questions_public(game_id: str, session_id: str = ""):
         "sort_order, questions(id, icon, question_text, category, explanation, status)"
     ).eq("game_id", game_id).order("sort_order").execute())
 
+    game_cap_res = await run(
+        lambda: sb.table("games").select("acc_total_questions").eq("id", game_id).limit(1).execute()
+    )
+    acc_cap = _acc_total_q((game_cap_res.data or [{}])[0] or {}) if game_cap_res.data else None
+
     rows = gq_res.data or []
-    q_ids = [r["questions"]["id"] for r in rows if r.get("questions") and r["questions"].get("status") == "approved"]
+    capped_rows: List[dict] = []
+    for r in rows:
+        q = r.get("questions")
+        if not q or q.get("status") != "approved":
+            continue
+        capped_rows.append(r)
+        if acc_cap is not None and len(capped_rows) >= acc_cap:
+            break
+
+    q_ids = [r["questions"]["id"] for r in capped_rows]
 
     if not q_ids:
         return []
@@ -4531,7 +5232,7 @@ async def get_game_questions_public(game_id: str, session_id: str = ""):
         opts_map.setdefault(o["question_id"], []).append(o)
 
     questions = []
-    for r in rows:
+    for r in capped_rows:
         q = r.get("questions")
         if not q or q.get("status") != "approved":
             continue
@@ -4554,6 +5255,58 @@ def _coerce_pg_bool(val: Any) -> bool:
     if isinstance(val, str):
         return val.strip().lower() in ("true", "t", "1", "yes")
     return bool(val)
+
+
+# Accumulator spin: one cash-out spin per session uses spin_results.level = 10 (legacy wheel uses 1–3).
+ACCUMULATOR_SPIN_LEVEL = 10
+
+
+def _acc_total_q(game: dict) -> Optional[int]:
+    """If 5–50, game runs in accumulator mode. None = legacy."""
+    v = (game or {}).get("acc_total_questions")
+    if v is None:
+        return None
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return None
+    if n < 5 or n > 50:
+        return None
+    return n
+
+
+def _accumulator_enabled(game: dict) -> bool:
+    return _acc_total_q(game) is not None
+
+
+def _merge_session_game_config(global_cfg: dict, game: dict) -> dict:
+    """Merge platform_config defaults with per-game accumulator settings for mini-app."""
+    out = dict(global_cfg or {})
+    g = normalize_game_prize_fields(dict(game or {}))
+    if not _accumulator_enabled(g):
+        return out
+    tq = int(_acc_total_q(g) or 20)
+    sec = g.get("acc_question_seconds")
+    try:
+        if sec is not None:
+            out["seconds_per_question"] = max(5, min(30, int(sec)))
+    except (TypeError, ValueError):
+        pass
+    out["max_wrong_answers"] = 999
+    out["questions_per_game"] = tq
+    out["accumulator"] = {
+        "enabled": True,
+        "total_questions": tq,
+        "seconds_per_question": int(out.get("seconds_per_question") or 8),
+        "start_etb": float(g.get("acc_start_etb") or 5),
+        "correct_bonus_etb": float(g.get("acc_correct_bonus_etb") or 2),
+        "wrong_penalty_etb": float(g.get("acc_wrong_penalty_etb") or 2),
+        "min_prize_etb": float(g.get("acc_meter_floor_etb") or 1),
+        "meter_ceiling_etb": float(g.get("acc_meter_ceiling_etb") or 500),
+        "min_cashout_questions": max(1, min(tq, int(g.get("acc_min_questions_spin") or 5))),
+        "allow_cashout_mid_game": _coerce_pg_bool(g.get("acc_allow_mid_spin", True)),
+    }
+    return out
 
 
 def _norm_uuid_str(val: Any) -> str:
@@ -4607,6 +5360,31 @@ async def submit_answer(body: AnswerReq):
 
     qid = str(body.question_id).strip()
     gid = str(body.game_id).strip()
+    sid = str(body.session_id).strip()
+    uid = str(body.user_id).strip()
+
+    pre_sess_res = await run(lambda: sb.table("game_sessions").select("*").eq("id", sid).limit(1).execute())
+    pre_sess = (pre_sess_res.data or [{}])[0] if pre_sess_res.data else {}
+    if not pre_sess.get("id"):
+        raise HTTPException(404, "Session not found")
+    if str(pre_sess.get("user_id")) != uid:
+        raise HTTPException(403, "Session does not belong to this user")
+    if str(pre_sess.get("game_id")) != gid:
+        raise HTTPException(400, "Session game mismatch")
+    if pre_sess.get("is_active") is False or pre_sess.get("is_completed"):
+        raise HTTPException(400, "Session is not active")
+    if _coerce_pg_bool(pre_sess.get("cashed_out")):
+        raise HTTPException(400, "Already cashed out")
+
+    game_ans = await run(lambda: sb.table("games").select("*").eq("id", gid).limit(1).execute())
+    game_row = (game_ans.data or [{}])[0] if game_ans.data else {}
+    game_for_acc = normalize_game_prize_fields(dict(game_row)) or {}
+    is_acc = _accumulator_enabled(game_for_acc)
+    if is_acc:
+        tq_lim = int(_acc_total_q(game_for_acc) or 0)
+        if int(pre_sess.get("questions_answered") or 0) >= tq_lim:
+            raise HTTPException(400, "All questions answered for this session")
+
     is_correct = False
     status_val = "timeout"
     opt_id = str(body.selected_option_id).strip() if body.selected_option_id else ""
@@ -4686,10 +5464,21 @@ async def submit_answer(body: AnswerReq):
 
     q_level = await _resolve_round_answer_level(sb, gid, qid)
 
+    dup_chk = await run(
+        lambda: sb.table("round_answers")
+        .select("id")
+        .eq("session_id", sid)
+        .eq("question_id", qid)
+        .limit(1)
+        .execute()
+    )
+    if dup_chk.data:
+        raise HTTPException(409, "This question was already answered in this session")
+
     # Schema: round_answers requires `level` (enum).
     ans_payload: Dict[str, Any] = {
-        "session_id": str(body.session_id).strip(),
-        "user_id": str(body.user_id).strip(),
+        "session_id": sid,
+        "user_id": uid,
         "game_id": gid,
         "question_id": qid,
         "level": q_level,
@@ -4721,7 +5510,79 @@ async def submit_answer(body: AnswerReq):
     )
     correct_option_id = ((correct_opt_res.data or [{}])[0]).get("id")
 
-    return {
+    correct_opt_txt_res = await run(
+        lambda: sb.table("answer_options")
+        .select("option_text")
+        .eq("question_id", qid)
+        .eq("is_correct", True)
+        .limit(1)
+        .execute()
+    )
+    correct_answer_text = ((correct_opt_txt_res.data or [{}])[0]).get("option_text") or ""
+
+    acc_payload: Dict[str, Any] = {}
+    if is_acc:
+        pre_meter = float(pre_sess.get("prize_meter_etb") or 0)
+        pre_cc = int(pre_sess.get("correct_count") or 0)
+        start_etb = float(game_for_acc.get("acc_start_etb") or 5)
+        bonus = float(game_for_acc.get("acc_correct_bonus_etb") or 2)
+        pen = float(game_for_acc.get("acc_wrong_penalty_etb") or 2)
+        floor_m = float(game_for_acc.get("acc_meter_floor_etb") or 1)
+        ceil_m = float(game_for_acc.get("acc_meter_ceiling_etb") or 500)
+        rem_raw = game_for_acc.get("prize_pool_remaining")
+        if rem_raw is None:
+            rem_raw = game_for_acc.get("prize_pool_etb")
+        pool_cap = float(rem_raw) if rem_raw is not None else ceil_m
+
+        if is_correct:
+            delta = start_etb if pre_cc == 0 else bonus
+        else:
+            delta = -pen
+        raw_meter = pre_meter + delta
+        new_meter = max(floor_m, min(ceil_m, min(pool_cap, raw_meter)))
+        meter_change = round(new_meter - pre_meter, 2)
+        new_cc = pre_cc + (1 if is_correct else 0)
+
+        upd_acc: Dict[str, Any] = {
+            "prize_meter_etb": round(new_meter, 2),
+            "correct_count": new_cc,
+            "current_question": int(pre_sess.get("current_question") or 1) + 1,
+        }
+        for _attempt in range(8):
+            try:
+                await run(lambda u=dict(upd_acc): sb.table("game_sessions").update(u).eq("id", sid).execute())
+                break
+            except Exception as e:
+                col = _pgrst204_missing_column_name(e)
+                if col and col in upd_acc:
+                    upd_acc = _games_payload_drop_keys(upd_acc, {col})
+                    if not upd_acc:
+                        break
+                    continue
+                logger.warning("submit_answer: meter update failed: %s", e)
+                break
+
+        sess_res2 = await run(lambda: sb.table("game_sessions").select("*").eq("id", sid).single().execute())
+        sess = sess_res2.data or sess
+
+        tq_acc = int(_acc_total_q(game_for_acc) or 20)
+        qa_now = int(sess.get("questions_answered") or 0)
+        min_spin = max(1, min(tq_acc, int(game_for_acc.get("acc_min_questions_spin") or 5)))
+        allow_mid = _coerce_pg_bool(game_for_acc.get("acc_allow_mid_spin", True))
+        can_cash = qa_now >= min_spin and (allow_mid or qa_now >= tq_acc)
+
+        acc_payload = {
+            "correct": is_correct,
+            "correct_answer": correct_answer_text,
+            "new_meter": round(float(sess.get("prize_meter_etb") or new_meter), 2),
+            "meter_change": meter_change,
+            "questions_answered": qa_now,
+            "questions_remaining": max(0, tq_acc - qa_now),
+            "can_cash_out": can_cash,
+            "is_final_question": qa_now >= tq_acc,
+        }
+
+    out: Dict[str, Any] = {
         "is_correct":        is_correct,
         "status":            status_val,
         "correct_option_id": correct_option_id,
@@ -4729,6 +5590,249 @@ async def submit_answer(body: AnswerReq):
         "wrong_count":       sess.get("wrong_count", 0),
         "cooldown_until":    sess.get("cooldown_until"),
     }
+    if acc_payload:
+        out["accumulator"] = acc_payload
+        out["correct"] = is_correct
+        out["correct_answer"] = correct_answer_text
+        out["new_meter"] = acc_payload["new_meter"]
+        out["meter_change"] = acc_payload["meter_change"]
+        out["questions_answered"] = acc_payload["questions_answered"]
+        out["questions_remaining"] = acc_payload["questions_remaining"]
+        out["can_cash_out"] = acc_payload["can_cash_out"]
+        out["is_final_question"] = acc_payload["is_final_question"]
+    return out
+
+
+def _rpc_jsonb_to_dict(data: Any) -> Optional[dict]:
+    """Normalize Supabase RPC / Postgres jsonb return value to a dict."""
+    if data is None:
+        return None
+    if isinstance(data, dict):
+        if "success" in data or "error" in data:
+            return data
+        for v in data.values():
+            if isinstance(v, dict) and ("success" in v or "error" in v):
+                return v
+        return None
+    if isinstance(data, list) and data:
+        return _rpc_jsonb_to_dict(data[0])
+    if isinstance(data, str):
+        try:
+            return _rpc_jsonb_to_dict(json.loads(data))
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return None
+
+
+async def _accumulator_cashout_atomic(sb: Client, session_id: str, user_id: str, game_id: str) -> dict:
+    """
+    Single DB transaction via shamo_accumulator_cashout() (migration 036).
+    Tries PostgREST RPC, then direct Postgres if DATABASE_URL is set.
+    """
+    sid, uid, gid = str(session_id).strip(), str(user_id).strip(), str(game_id).strip()
+    last_err: Optional[Any] = None
+    try:
+        res = await run(
+            lambda: sb.rpc(
+                "shamo_accumulator_cashout",
+                {"p_session_id": sid, "p_user_id": uid, "p_game_id": gid},
+            ).execute()
+        )
+        p = _rpc_jsonb_to_dict(res.data)
+        if p and isinstance(p, dict):
+            return p
+    except Exception as e:
+        last_err = e
+        logger.warning("shamo_accumulator_cashout RPC: %s", e)
+
+    if DATABASE_URL:
+        try:
+            from db import execute as pg_execute
+
+            def _pg() -> Any:
+                row = pg_execute(
+                    "SELECT public.shamo_accumulator_cashout(%s::uuid, %s::uuid, %s::uuid) AS r",
+                    (sid, uid, gid),
+                    fetch="one",
+                    commit=True,
+                )
+                return row.get("r") if row else None
+
+            raw = await asyncio.to_thread(_pg)
+            p = _rpc_jsonb_to_dict(raw)
+            if p and isinstance(p, dict):
+                return p
+        except Exception as e:
+            last_err = e
+            logger.warning("shamo_accumulator_cashout direct PG: %s", e)
+
+    return {
+        "success": False,
+        "error": "atomic_unavailable",
+        "detail": str(last_err) if last_err else None,
+    }
+
+
+def _accumulator_cashout_http_error(pay: dict) -> Optional[HTTPException]:
+    if pay.get("success") is True:
+        return None
+    err = str(pay.get("error") or "cashout_failed")
+    detail = str(pay.get("detail") or "")
+    mp: Dict[str, tuple[int, str]] = {
+        "atomic_unavailable": (503, "Cash-out unavailable. Run migrations/036_accumulator_cashout_atomic.sql on the database."),
+        "session_not_found": (404, "Session not found"),
+        "session_mismatch": (400, "Session does not match user/game"),
+        "session_inactive": (400, "Session is not active"),
+        "game_not_found": (404, "Game not found"),
+        "game_not_active": (400, "Game is not active"),
+        "not_accumulator_game": (400, "This game is not in accumulator mode"),
+        "not_enough_answers": (400, "Answer more questions before cashing out"),
+        "finish_all_questions": (400, "Finish all questions before cashing out"),
+        "zero_prize": (400, "Nothing to cash out"),
+        "cap_blocked": (400, "Player cap prevents this cash-out"),
+        "pool_exhausted": (409, "Prize pool exhausted"),
+        "company_insufficient": (409, "Company wallet cannot cover this payout"),
+        "zero_after_cap": (400, "Nothing to cash out after caps"),
+    }
+    if err in mp:
+        code, msg = mp[err]
+        return HTTPException(code, msg)
+    if "pool_race" in detail or "shamo_cashout_pool_race" in detail:
+        return HTTPException(409, "Prize pool changed — try again")
+    return HTTPException(400, err.replace("_", " ") + (": " + detail if detail else ""))
+
+
+async def _record_accumulator_spin(sb: Client, body: SpinReq, game: dict) -> dict:
+    """Single cash-out spin: prize = session.prize_meter_etb (no randomness). Uses spin_results.level = 10."""
+    sid = str(body.session_id).strip()
+    uid = str(body.user_id).strip()
+    gid = str(body.game_id).strip()
+    if not sid:
+        lr = await run(
+            lambda: sb.table("game_sessions")
+            .select("id")
+            .eq("user_id", uid)
+            .eq("game_id", gid)
+            .eq("is_active", True)
+            .order("started_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if lr.data:
+            sid = str(lr.data[0]["id"])
+    if not sid:
+        raise HTTPException(400, "session_id is required (no active session found for this game)")
+
+    if str(game.get("status") or "") != "active":
+        raise HTTPException(400, "Game is not active")
+
+    sess_res = await run(lambda: sb.table("game_sessions").select("*").eq("id", sid).limit(1).execute())
+    sess = (sess_res.data or [{}])[0] if sess_res.data else {}
+    if not sess.get("id"):
+        raise HTTPException(404, "Session not found")
+    if str(sess.get("user_id")) != uid:
+        raise HTTPException(403, "Session does not belong to this user")
+    if str(sess.get("game_id")) != gid:
+        raise HTTPException(400, "Session game mismatch")
+    if _coerce_pg_bool(sess.get("cashed_out")):
+        raise HTTPException(400, "Already cashed out")
+    if sess.get("is_completed") or sess.get("is_active") is False:
+        raise HTTPException(400, "Session is not active")
+
+    tq = int(_acc_total_q(game) or 0)
+    qa = int(sess.get("questions_answered") or 0)
+    min_spin = max(1, min(tq, int(game.get("acc_min_questions_spin") or 5)))
+    allow_mid = _coerce_pg_bool(game.get("acc_allow_mid_spin", True))
+    if qa < min_spin:
+        raise HTTPException(400, "Answer at least %d questions before cashing out" % min_spin)
+    if not allow_mid and qa < tq:
+        raise HTTPException(400, "Finish all questions before you can cash out")
+
+    meter = float(sess.get("prize_meter_etb") or 0)
+    total_so_far = float(sess.get("total_earned") or 0)
+    cap = float(sess.get("player_cap_etb") or 0)
+
+    game_pool_res = await run(
+        lambda: sb.table("games").select("prize_pool_remaining,status").eq("id", gid).single().execute()
+    )
+    pool_row = game_pool_res.data or {}
+    pool_rem = pool_row.get("prize_pool_remaining")
+    if str(pool_row.get("status") or "") != "active":
+        raise HTTPException(400, "Game is not active")
+
+    amount = round(meter, 2)
+    if pool_rem is not None:
+        pool_left = float(pool_rem)
+        if pool_left <= 0:
+            user_res = await run(
+                lambda: sb.table("users").select("balance,total_earned").eq("id", uid).single().execute()
+            )
+            return {
+                "spin": None,
+                "user": user_res.data,
+                "cap_reached": True,
+                "pool_exhausted": True,
+                "amount_credited": 0,
+                "accumulator_cashout": True,
+                "message": "Prize pool exhausted",
+            }
+        amount = min(amount, pool_left)
+
+    if cap > 0 and (total_so_far + amount) > cap:
+        amount = max(0.0, round(cap - total_so_far, 2))
+    if amount <= 0:
+        user_res = await run(
+            lambda: sb.table("users").select("balance,total_earned").eq("id", uid).single().execute()
+        )
+        return {
+            "spin": None,
+            "user": user_res.data,
+            "cap_reached": True,
+            "amount_credited": 0,
+            "accumulator_cashout": True,
+            "prize_amount": 0,
+            "message": "Nothing to cash out (cap or zero meter)",
+        }
+
+    pay = await _accumulator_cashout_atomic(sb, sid, uid, gid)
+    exc = _accumulator_cashout_http_error(pay)
+    if exc:
+        raise exc
+
+    amt = round(float(pay.get("prize_amount") or 0), 2)
+    user_res = await run(lambda: sb.table("users").select("balance,total_earned").eq("id", uid).single().execute())
+    cc = int(sess.get("correct_count") or 0)
+    wc = int(sess.get("wrong_count") or 0)
+    urow = user_res.data or {}
+    nb = float(urow.get("balance") if urow.get("balance") is not None else pay.get("new_balance") or 0)
+    pr = pay.get("prize_pool_remaining")
+    cr = pay.get("closed_reason")
+    if cr is not None and not isinstance(cr, str):
+        cr = str(cr)
+    spin_row: Dict[str, Any] = {
+        "id": pay.get("spin_id"),
+        "amount_won": amt,
+        "amount_etb": amt,
+        "level": ACCUMULATOR_SPIN_LEVEL,
+    }
+    msg = pay.get("message") or ("You won %s ETB! 🎉" % (int(amt) if float(amt).is_integer() else round(float(amt), 2)))
+    return {
+        "spin": spin_row,
+        "user": urow,
+        "cap_reached": False,
+        "amount_credited": amt,
+        "prize_amount": amt,
+        "new_balance": nb,
+        "total_questions_answered": qa,
+        "correct_count": cc,
+        "wrong_count": wc,
+        "message": msg,
+        "accumulator_cashout": True,
+        "game_status": pay.get("game_status"),
+        "prize_pool_remaining": pr,
+        "closed_reason": cr,
+    }
+
 
 @app.post("/api/game/spin")
 async def record_spin(body: SpinReq):
@@ -4737,45 +5841,118 @@ async def record_spin(body: SpinReq):
 
     FIX 6: enforces player_cap_etb — rejects spin if user's session earnings
     would exceed their cap for this game.
+
+    Accumulator games: prize is always session.prize_meter_etb (client amount_etb ignored).
     """
     sb = get_sb()
 
-    # FIX 6: load current session to check player cap
+    game_spin_res = await run(lambda: sb.table("games").select("*").eq("id", body.game_id).limit(1).execute())
+    game_spin = normalize_game_prize_fields((game_spin_res.data or [{}])[0] or {}) or {}
+    if str(game_spin.get("status") or "") != "active":
+        raise HTTPException(400, "Game is not active")
+
+    resolved_sid = str(body.session_id).strip()
+    uid_spin = str(body.user_id).strip()
+    gid_spin = str(body.game_id).strip()
+    if _accumulator_enabled(game_spin):
+        if not resolved_sid:
+            lr = await run(
+                lambda: sb.table("game_sessions")
+                .select("id")
+                .eq("user_id", uid_spin)
+                .eq("game_id", gid_spin)
+                .eq("is_active", True)
+                .order("started_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            if lr.data:
+                resolved_sid = str(lr.data[0]["id"])
+        body_acc = body.model_copy(update={"session_id": resolved_sid})
+        return await _record_accumulator_spin(sb, body_acc, game_spin)
+
+    if not resolved_sid:
+        raise HTTPException(400, "session_id is required")
+
+    # FIX 6: per-player cap (player_cap_etb = min(max_prize_etb, pool left at session start))
     sess_res = await run(lambda: sb.table("game_sessions")
-        .select("total_earned,player_cap_etb").eq("id", body.session_id).single().execute())
+        .select("total_earned,player_cap_etb").eq("id", resolved_sid).single().execute())
     sess_data = sess_res.data or {}
     total_so_far = float(sess_data.get("total_earned") or 0)
-    cap          = float(sess_data.get("player_cap_etb") or 0)
+    cap = float(sess_data.get("player_cap_etb") or 0)
 
-    # If cap is set and this spin would exceed it, clamp the amount
-    amount = body.amount_etb
+    game_pool_res = await run(
+        lambda: sb.table("games").select("prize_pool_remaining").eq("id", body.game_id).single().execute()
+    )
+    pool_row = game_pool_res.data or {}
+    pool_rem = pool_row.get("prize_pool_remaining")
+
+    amount = float(body.amount_etb)
+    # Shared pool: cannot credit more than remaining (API pre-check; DB trigger also enforces — migration 030)
+    if pool_rem is not None:
+        pool_left = float(pool_rem)
+        if pool_left <= 0:
+            user_res = await run(
+                lambda: sb.table("users").select("balance,total_earned").eq("id", body.user_id).single().execute()
+            )
+            return {
+                "spin": None,
+                "user": user_res.data,
+                "cap_reached": True,
+                "pool_exhausted": True,
+                "amount_credited": 0,
+            }
+        amount = min(amount, pool_left)
+
     if cap > 0 and (total_so_far + amount) > cap:
-        amount = max(0, cap - total_so_far)
-        if amount <= 0:
-            # Cap already reached — return without crediting
-            user_res = await run(lambda: sb.table("users")
-                .select("balance,total_earned").eq("id", body.user_id).single().execute())
-            return {"spin": None, "user": user_res.data, "cap_reached": True, "amount_credited": 0}
+        amount = max(0.0, cap - total_so_far)
+    if amount <= 0:
+        user_res = await run(
+            lambda: sb.table("users").select("balance,total_earned").eq("id", body.user_id).single().execute()
+        )
+        return {"spin": None, "user": user_res.data, "cap_reached": True, "amount_credited": 0}
 
     # DB: one-click schema uses amount_won (NOT NULL); trigger on_spin_result_insert credits NEW.amount_won.
     # Optional column amount_etb (migration 029) is mirrored for clients that SELECT amount_etb.
     spin_level = max(1, min(3, int(body.question_number or 1)))
-    amt = round(float(amount), 2)
+    amt = round(amount, 2)
     spin_payload: Dict[str, Any] = {
-        "session_id":    str(body.session_id).strip(),
-        "user_id":       str(body.user_id).strip(),
-        "game_id":       str(body.game_id).strip(),
+        "session_id":    resolved_sid,
+        "user_id":       uid_spin,
+        "game_id":       gid_spin,
         "level":         spin_level,
         "segment_label": str(body.segment_label or "").strip() or "?",
         "amount_won":    amt,
+        "outcome":       "won",
     }
     try:
         res = await run(
             lambda pl={**spin_payload, "amount_etb": amt}: sb.table("spin_results").insert(pl).execute()
         )
     except Exception as e:
-        if _is_missing_column_pgrst(e, "amount_etb"):
+        if _is_missing_column_pgrst(e, "outcome"):
+            sp2 = {k: v for k, v in spin_payload.items() if k != "outcome"}
+            try:
+                res = await run(
+                    lambda pl={**sp2, "amount_etb": amt}: sb.table("spin_results").insert(pl).execute()
+                )
+            except Exception as e2:
+                if _is_missing_column_pgrst(e2, "amount_etb"):
+                    res = await run(lambda pl=dict(sp2): sb.table("spin_results").insert(pl).execute())
+                elif "prize_pool_insufficient" in str(e2).lower() or "prize pool" in str(e2).lower():
+                    raise HTTPException(
+                        409,
+                        "Not enough ETB left in this game's prize pool. Run migrations/030_prize_pool_decrement_on_spin.sql if the pool never decreases.",
+                    ) from e2
+                else:
+                    raise
+        elif _is_missing_column_pgrst(e, "amount_etb"):
             res = await run(lambda pl=dict(spin_payload): sb.table("spin_results").insert(pl).execute())
+        elif "prize_pool_insufficient" in str(e).lower() or "prize pool" in str(e).lower():
+            raise HTTPException(
+                409,
+                "Not enough ETB left in this game's prize pool. Run migrations/030_prize_pool_decrement_on_spin.sql if the pool never decreases.",
+            ) from e
         else:
             raise
 
@@ -4783,18 +5960,43 @@ async def record_spin(body: SpinReq):
     await run(lambda: sb.table("game_sessions").update({
         "current_question":   body.question_number + 1,
         "questions_answered": body.question_number,
-    }).eq("id", body.session_id).execute())
+    }).eq("id", resolved_sid).execute())
+
+    bk = await _spin_post_bookkeeping(sb, gid_spin, uid_spin, amt)
 
     # Get updated user balance (trigger already credited it)
     user_res = await run(lambda: sb.table("users")
-        .select("balance,total_earned").eq("id", body.user_id).single().execute())
+        .select("balance,total_earned").eq("id", uid_spin).single().execute())
 
+    urow = user_res.data or {}
     return {
-        "spin":           (res.data or [{}])[0],
-        "user":           user_res.data,
-        "cap_reached":    False,
-        "amount_credited": amount,
+        "spin":            (res.data or [{}])[0],
+        "user":            urow,
+        "cap_reached":     False,
+        "amount_credited": amt,
+        "prize_amount":    amt,
+        "new_balance":     float(urow.get("balance") or 0),
+        "game_status":     bk.get("game_status"),
+        "closed_reason":   bk.get("closed_reason"),
+        "prize_pool_remaining": bk.get("prize_pool_remaining"),
     }
+
+
+@app.post("/api/player/{user_id}/answer")
+async def player_submit_answer_path(user_id: str, body: AnswerReq):
+    """Alias for POST /api/game/answer (path must match body.user_id)."""
+    if str(body.user_id).strip() != str(user_id).strip():
+        raise HTTPException(403, "user_id mismatch")
+    return await submit_answer(body)
+
+
+@app.post("/api/player/{user_id}/spin")
+async def player_record_spin_path(user_id: str, body: SpinReq):
+    """Alias for POST /api/game/spin (path must match body.user_id)."""
+    if str(body.user_id).strip() != str(user_id).strip():
+        raise HTTPException(403, "user_id mismatch")
+    return await record_spin(body)
+
 
 @app.post("/api/game/session/{sid}/end")
 async def end_session(sid: str, user_id: str):
@@ -4867,6 +6069,7 @@ async def list_deposits(_=Depends(require_admin), status: str = "", company_id: 
     return {"data": rows, "total": total, "page": page, "per_page": per_page}
 
 @app.post("/api/deposits/{did}/approve")
+@app.patch("/api/admin/deposits/{did}/approve")
 async def approve_deposit(did: str, body: DepositApproveReq, _=Depends(require_admin)):
     sb = get_sb()
     admin = await run(lambda: sb.table("users").select("id").eq("role","admin").limit(1).execute())
@@ -4881,14 +6084,15 @@ async def approve_deposit(did: str, body: DepositApproveReq, _=Depends(require_a
         raise HTTPException(404, "Deposit not found or already processed")
     dep = dep_res.data
     amount = float(dep.get("amount_etb") or 0)
-    commission_pct = float(dep.get("commission_pct") or 15.0)
-    commission_etb = round(amount * commission_pct / 100, 2)
+    commission_pct = 15.0
+    commission_etb = round(amount * commission_pct / 100.0, 2)
     prize_pool_etb = round(amount - commission_etb, 2)
     # Confirm the deposit with calculated values
     update_data = {
         "status": "confirmed",
         "notes": body.notes,
         "confirmed_by": confirmed_by,
+        "commission_pct": commission_pct,
         "commission_etb": commission_etb,
         "prize_pool_etb": prize_pool_etb,
     }
@@ -4909,7 +6113,37 @@ async def approve_deposit(did: str, body: DepositApproveReq, _=Depends(require_a
     co_res = await run(lambda: sb.table("companies").select("credit_balance").eq("id", dep["company_id"]).single().execute())
     current_bal = float((co_res.data or {}).get("credit_balance") or 0)
     await run(lambda: sb.table("companies").update({"credit_balance": current_bal + prize_pool_etb}).eq("id", dep["company_id"]).execute())
-    return {"status": "confirmed", "prize_pool_etb": prize_pool_etb, "commission_etb": commission_etb}
+    if confirmed_by:
+        try:
+            ubal = await run(
+                lambda: sb.table("users").select("balance").eq("id", confirmed_by).single().execute()
+            )
+            bb = float((ubal.data or {}).get("balance") or 0)
+            await run(
+                lambda: sb.table("transactions")
+                .insert(
+                    {
+                        "user_id": confirmed_by,
+                        "type": "company_credit",
+                        "amount": prize_pool_etb,
+                        "balance_before": bb,
+                        "balance_after": bb,
+                        "reference_id": did,
+                        "reference_type": "company_deposit",
+                        "description": f"Company deposit confirmed — +{prize_pool_etb} ETB prize pool",
+                    }
+                )
+                .execute()
+            )
+        except Exception as e:
+            logger.warning("approve_deposit: company_credit transaction skipped: %s", e)
+    full = await run(lambda: sb.table("company_deposits").select("*").eq("id", did).single().execute())
+    return full.data or {
+        "status": "confirmed",
+        "prize_pool_etb": prize_pool_etb,
+        "commission_etb": commission_etb,
+        "commission_pct": commission_pct,
+    }
 
 @app.post("/api/deposits/{did}/reject")
 async def reject_deposit(did: str, body: DepositRejectReq, _=Depends(require_admin)):

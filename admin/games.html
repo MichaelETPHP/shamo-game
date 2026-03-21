@@ -115,6 +115,45 @@
             cursor: pointer;
             accent-color: var(--gold);
         }
+
+        /* Company fund auto-fill (SHAMO brand) */
+        .shamo-fund-block {
+            background: #08070A;
+            border: 1px solid rgba(212, 160, 23, 0.2);
+            border-radius: 10px;
+            padding: 14px 16px;
+            margin-bottom: 12px;
+        }
+
+        .shamo-locked-input {
+            width: 100%;
+            padding: 10px 12px;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            font-size: 0.95rem;
+            font-weight: 600;
+            background: #1A1825 !important;
+            cursor: not-allowed !important;
+        }
+
+        .shamo-locked-input.dep {
+            color: #D4A017 !important;
+        }
+
+        .shamo-locked-input.comm {
+            color: #9C96A8 !important;
+        }
+
+        .shamo-locked-input.prize {
+            color: #2ECC71 !important;
+        }
+
+        .max-prize-err {
+            color: #FF4444;
+            font-size: 0.78rem;
+            margin-top: 6px;
+            display: none;
+        }
     </style>
 </head>
 
@@ -245,23 +284,103 @@
                 </div>
 
                 <div class="form-row">
-                    <div class="form-group">
-                        <label>Prize Pool (ETB)</label>
-                        <input id="gPool" type="number" step="50" min="0" value="500" />
+                    <div class="form-group" style="flex:1">
+                        <label>Company (optional)</label>
+                        <select id="gCompany" onchange="onGameModalCompanyChange()"
+                            title="Sponsored game: balance auto-fills pool & commission (15%). Platform = manual pool.">
+                            <option value="">— Platform Game (no company) —</option>
+                        </select>
+                        <div style="font-size:.72rem;color:var(--muted);margin-top:4px">List updates: <b>Platform</b> → platform games only · <b>Company</b> → that company’s games + funded from credit balance</div>
+                    </div>
+                </div>
+
+                <div id="companyFundBlock" class="shamo-fund-block" style="display:none">
+                    <div style="font-size:.8rem;color:#9C96A8;margin-bottom:12px">🔒 Uses the next <strong style="color:#D4A017">confirmed, unlinked deposit</strong> (15% commission at deposit). Not the same as “pool liquidity” on the Deposits page.</div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>🔒 Deposit (gross ETB) <span style="font-weight:400;color:var(--muted);font-size:.7rem">(next game)</span></label>
+                            <input type="text" id="depositedAmount" readonly disabled class="shamo-locked-input dep"
+                                style="background:#1A1825;color:#D4A017;cursor:not-allowed" />
+                        </div>
+                        <div class="form-group">
+                            <label>🔒 Commission (15%)</label>
+                            <input type="text" id="commissionAmount" readonly disabled class="shamo-locked-input comm"
+                                style="background:#1A1825;color:#9C96A8;cursor:not-allowed" />
+                        </div>
                     </div>
                     <div class="form-group">
-                        <label>Max Prize (ETB)</label>
-                        <input id="gMaxPay" type="number" step="50" min="0" value="1000" />
+                        <label>🔒 Prize Pool (85%)</label>
+                        <input type="text" id="prizePool" readonly disabled class="shamo-locked-input prize"
+                            style="background:#1A1825;color:#2ECC71;cursor:not-allowed" />
+                    </div>
+                </div>
+
+                <div class="form-row" id="poolRowPlatform">
+                    <div class="form-group">
+                        <label>Prize Pool (ETB)</label>
+                        <small style="display:block;color:var(--muted);margin:-6px 0 6px 0;font-size:.72rem;">Platform games: total sponsor budget. Decreases as players win after migration 030.</small>
+                        <input id="gPool" type="number" step="50" min="0" value="10000" oninput="onMaxPayInput()" />
                     </div>
                 </div>
 
                 <div class="form-row">
+                    <div class="form-group" style="flex:1">
+                        <label>Max Prize (ETB) <span style="font-weight:400;color:var(--muted);font-size:.7rem">— per player, total</span></label>
+                        <small id="gMaxPayHint" style="display:block;color:var(--muted);margin:-6px 0 6px 0;font-size:.72rem;">Enter amount (sponsored: type manually; hint shows max pool)</small>
+                        <input id="gMaxPay" type="text" inputmode="decimal" placeholder="" autocomplete="off"
+                            oninput="onMaxPayInput()" />
+                        <div id="gMaxPayError" class="max-prize-err" role="alert"></div>
+                    </div>
+                </div>
+
+                <div style="margin-top:1.25rem;padding-top:1rem;border-top:1px solid var(--border)">
+                    <div style="font-size:.85rem;color:var(--gold);font-weight:600;margin-bottom:10px">🎯 Dynamic accumulator spin (optional)</div>
+                    <small style="display:block;color:var(--muted);margin:-4px 0 12px 0;font-size:.72rem;">Leave <b>Total questions</b> empty for legacy mode (spin wheel after each correct answer). Set 5–50 to enable skill-based meter + one cash-out spin.</small>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Total questions (5–50)</label>
+                            <input id="gAccTotalQ" type="number" min="5" max="50" step="1" placeholder="— legacy —" title="Empty = legacy wheel mode" />
+                        </div>
+                        <div class="form-group">
+                            <label>Seconds / question (5–30)</label>
+                            <input id="gAccSeconds" type="number" min="5" max="30" step="1" value="8" />
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Starting prize ETB (1st correct)</label>
+                            <input id="gAccStart" type="number" min="0" step="0.5" value="5" />
+                        </div>
+                        <div class="form-group">
+                            <label>Correct bonus ETB</label>
+                            <input id="gAccBonus" type="number" min="0" step="0.5" value="2" />
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Wrong penalty ETB</label>
+                            <input id="gAccPenalty" type="number" min="0" step="0.5" value="2" />
+                        </div>
+                        <div class="form-group">
+                            <label>Min meter ETB (floor)</label>
+                            <input id="gAccFloor" type="number" min="0" step="0.5" value="1" />
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Max meter ETB (ceiling)</label>
+                            <input id="gAccCeil" type="number" min="1" step="1" value="500" />
+                        </div>
+                        <div class="form-group">
+                            <label>Min questions before spin</label>
+                            <input id="gAccMinSpin" type="number" min="1" max="50" step="1" value="5" />
+                        </div>
+                    </div>
                     <div class="form-group">
-                        <label>Company (optional)</label>
-                        <select id="gCompany" onchange="syncCompanyFilterFromModal()" title="Choosing a company filters the list below to that company’s games. Platform = no sponsor.">
-                            <option value="">— Platform Game (no company) —</option>
-                        </select>
-                        <div style="font-size:.72rem;color:var(--muted);margin-top:4px">List updates: <b>Platform</b> → platform games only · <b>Company</b> → that company’s games</div>
+                        <label style="display:flex;align-items:center;gap:10px;cursor:pointer">
+                            <input type="checkbox" id="gAccAllowMid" checked />
+                            Allow cash-out mid-game (before all questions)
+                        </label>
                     </div>
                 </div>
 
@@ -386,8 +505,181 @@ Answer quickly. Avoid wrong answers. Reach the minimum and withdraw your winning
 
 Join SHAMO now. Test your knowledge. Spin. Win. Enjoy the game.`;
 
+        const COMMISSION_RATE = 0.15;
+        window.__companyCreatePrizePool = 0;
+        window.__companyBalanceLoaded = false;
+
+        function fmtETB(n) {
+            const x = Number(n || 0);
+            return x.toLocaleString(undefined, { maximumFractionDigits: 2 }) + ' ETB';
+        }
+
+        function updateGameSaveButtonState() {
+            const btn = document.getElementById('gameSaveBtn');
+            if (!btn) return;
+            const isCreate = !document.getElementById('gId').value.trim();
+            if (!isCreate) {
+                btn.disabled = false;
+                return;
+            }
+            const cid = document.getElementById('gCompany').value;
+            const title = (document.getElementById('gTitle').value || '').trim();
+            const gd = document.getElementById('gDate').value;
+            const st = document.getElementById('gStarts').value;
+            const en = document.getElementById('gEnds').value;
+            const baseOk = title && gd && st && en;
+            if (!baseOk) {
+                btn.disabled = true;
+                return;
+            }
+            const rawMax = String(document.getElementById('gMaxPay').value || '').replace(/,/g, '').trim();
+            const maxV = parseFloat(rawMax);
+            if (cid) {
+                const pool = window.__companyCreatePrizePool || 0;
+                const ok = window.__companyBalanceLoaded && pool > 0 && rawMax !== '' && !Number.isNaN(maxV) && maxV > 0 && maxV <= pool + 1e-6;
+                btn.disabled = !ok;
+            } else {
+                const pool = parseFloat(document.getElementById('gPool').value || '0') || 0;
+                const ok = pool > 0 && rawMax !== '' && !Number.isNaN(maxV) && maxV > 0 && maxV <= pool + 1e-6;
+                btn.disabled = !ok;
+            }
+        }
+
+        function onMaxPayInput() {
+            const err = document.getElementById('gMaxPayError');
+            const hint = document.getElementById('gMaxPayHint');
+            const isCreate = !document.getElementById('gId').value.trim();
+            const cid = document.getElementById('gCompany').value;
+            let pool = 0;
+            if (isCreate && cid) {
+                pool = window.__companyCreatePrizePool || 0;
+                if (hint) hint.textContent = pool > 0 ? `Max ${pool.toLocaleString(undefined, { maximumFractionDigits: 2 })} ETB` : 'Select a company with available balance';
+            } else {
+                pool = parseFloat(document.getElementById('gPool').value || '0') || 0;
+                if (hint) hint.textContent = pool > 0 ? `Max ${pool.toLocaleString(undefined, { maximumFractionDigits: 2 })} ETB` : 'Set prize pool first';
+            }
+            const raw = String(document.getElementById('gMaxPay').value || '').replace(/,/g, '').trim();
+            const maxV = parseFloat(raw);
+            if (!isCreate) {
+                err.textContent = '';
+                err.style.display = 'none';
+                updateGameSaveButtonState();
+                return;
+            }
+            if (cid && !window.__companyBalanceLoaded) {
+                err.textContent = '';
+                err.style.display = 'none';
+                updateGameSaveButtonState();
+                return;
+            }
+            if (raw === '' || Number.isNaN(maxV)) {
+                err.textContent = '';
+                err.style.display = 'none';
+                updateGameSaveButtonState();
+                return;
+            }
+            if (maxV > pool + 1e-6) {
+                err.textContent = `Cannot exceed ${pool.toLocaleString(undefined, { maximumFractionDigits: 2 })} ETB`;
+                err.style.display = 'block';
+            } else {
+                err.textContent = '';
+                err.style.display = 'none';
+            }
+            updateGameSaveButtonState();
+        }
+
+        async function fetchCompanyBalanceForCreate(cid) {
+            window.__companyBalanceLoaded = false;
+            window.__companyCreatePrizePool = 0;
+            updateGameSaveButtonState();
+            const depEl = document.getElementById('depositedAmount');
+            const comEl = document.getElementById('commissionAmount');
+            const priEl = document.getElementById('prizePool');
+            if (depEl) depEl.value = 'Loading…';
+            if (comEl) comEl.value = '—';
+            if (priEl) priEl.value = '—';
+            try {
+                const b = await apiGet(`/admin/companies/${encodeURIComponent(cid)}/balance`);
+                // Games page must NOT use b.available_balance — that is pool liquidity
+                // (sum of game prize_pool_remaining − pending withdrawals), which is 0 when no games exist.
+                const walletCredit = Number(
+                    b.company_credit_balance != null && b.company_credit_balance !== ''
+                        ? b.company_credit_balance
+                        : 0
+                );
+                const nextPool = Number(b.next_game_prize_pool || 0);
+                const nextGross = b.next_deposit_amount_etb != null ? Number(b.next_deposit_amount_etb) : null;
+                const nextComm = b.next_deposit_commission_etb != null ? Number(b.next_deposit_commission_etb) : null;
+                // Backend: one confirmed unlinked deposit funds one game; max_prize ≤ that deposit's prize_pool_etb.
+                window.__companyCreatePrizePool = nextPool;
+                if (nextPool > 0) {
+                    const grossOk = nextGross != null && !Number.isNaN(nextGross) && nextGross > 0;
+                    const comm = grossOk && nextComm != null && !Number.isNaN(nextComm)
+                        ? Math.round((nextComm + Number.EPSILON) * 100) / 100
+                        : grossOk
+                            ? Math.round((nextGross * COMMISSION_RATE + Number.EPSILON) * 100) / 100
+                            : 0;
+                    const pool = Math.round((nextPool + Number.EPSILON) * 100) / 100;
+                    if (depEl) depEl.value = grossOk ? fmtETB(nextGross) : '—';
+                    if (comEl) comEl.value = grossOk ? fmtETB(comm) : '—';
+                    if (priEl) priEl.value = fmtETB(pool);
+                    window.__companyBalanceLoaded = true;
+                } else {
+                    if (depEl) depEl.value = walletCredit > 0 ? fmtETB(walletCredit) + ' (wallet)' : '—';
+                    if (comEl) comEl.value = '—';
+                    if (priEl) priEl.value = '—';
+                    window.__companyBalanceLoaded = false;
+                    showToast(
+                        walletCredit > 0
+                            ? 'No unlinked confirmed deposit: approve a deposit in Deposits (each deposit = one game), or wait if one is still pending.'
+                            : 'Confirm a company deposit first — then you can create a sponsored game.',
+                        'warning'
+                    );
+                }
+            } catch (e) {
+                if (depEl) depEl.value = '';
+                if (comEl) comEl.value = '';
+                if (priEl) priEl.value = '';
+                showToast(e.message || 'Could not load company balance', 'error');
+            }
+            onMaxPayInput();
+            updateGameSaveButtonState();
+        }
+
+        function onGameModalCompanyChange() {
+            syncCompanyFilterFromModal();
+            const isCreate = !document.getElementById('gId').value.trim();
+            const cid = document.getElementById('gCompany').value;
+            const block = document.getElementById('companyFundBlock');
+            const plat = document.getElementById('poolRowPlatform');
+            if (!isCreate) return;
+            if (cid) {
+                if (block) block.style.display = 'block';
+                if (plat) plat.style.display = 'none';
+                document.getElementById('gMaxPay').value = '';
+                fetchCompanyBalanceForCreate(cid);
+            } else {
+                if (block) block.style.display = 'none';
+                if (plat) plat.style.display = '';
+                window.__companyBalanceLoaded = true;
+                window.__companyCreatePrizePool = 0;
+                ['depositedAmount', 'commissionAmount', 'prizePool'].forEach(id => {
+                    const el = document.getElementById(id);
+                    if (el) el.value = '';
+                });
+                onMaxPayInput();
+                updateGameSaveButtonState();
+            }
+        }
+
         buildSidebar('games');
         requireAuth();
+
+        ['gTitle', 'gDate', 'gStarts', 'gEnds'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.addEventListener('input', updateGameSaveButtonState);
+            if (el) el.addEventListener('change', updateGameSaveButtonState);
+        });
 
         // ── Load companies for modal + top filter (active + pending) ───────────
         async function loadCompanies() {
@@ -602,15 +894,30 @@ Join SHAMO now. Test your knowledge. Spin. Win. Enjoy the game.`;
             <div><strong>Date</strong><br>${fmtDate(g.game_date)}</div>
             <div><strong>Starts At</strong><br>${fmtTime(g.starts_at)}</div>
             <div><strong>Ends At</strong><br>${fmtTime(g.ends_at)}</div>
-            <div><strong>Prize Pool</strong><br><span style="color:var(--gold);font-weight:700">${fmtN(g.prize_pool_etb)} ETB</span></div>
-            <div><strong>Remaining</strong><br><span style="color:var(--green)">${fmtN(g.prize_pool_remaining)} ETB</span></div>
+            <div><strong>Prize Pool (budget)</strong><br><span style="color:var(--gold);font-weight:700">${fmtN(g.prize_pool_etb)} ETB</span></div>
+            <div><strong>Remaining (after wins)</strong><br><span style="color:var(--green)">${fmtN(g.prize_pool_remaining)} ETB</span></div>
+            <div><strong>Max per player</strong><br>${fmtN(g.max_prize_etb)} ETB total</div>
             <div><strong>Platform Fee</strong><br>${g.platform_fee_pct}%</div>
-            <div><strong>Player Cap</strong><br>${g.player_cap_pct}%</div>
+            <div><strong>Commission (ETB)</strong><br>${fmtN(g.commission_amount || 0)} ETB</div>
+            <div><strong>Fallback cap %</strong><br>${g.player_cap_pct}% <span style="color:var(--muted);font-weight:400">(only if Max Prize is 0)</span></div>
             <div><strong>Total Players</strong><br>${fmtN(g.total_players)}</div>
             <div><strong>Total Winners</strong><br>${fmtN(g.total_winners)}</div>
             <div><strong>Total Paid Out</strong><br>${fmtN(g.total_paid_out)} ETB</div>
-            <div><strong>Max Prize</strong><br>${fmtN(g.max_prize_etb)} ETB</div>
           </div>
+          ${g.acc_total_questions != null && g.acc_total_questions >= 5 ? `
+          <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
+            <strong style="color:var(--gold)">Accumulator mode</strong>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px;font-size:.82rem">
+              <div>Total questions<br><b>${g.acc_total_questions}</b></div>
+              <div>Sec / Q<br><b>${g.acc_question_seconds ?? '—'}</b></div>
+              <div>1st correct ETB<br><b>${fmtN(g.acc_start_etb)}</b></div>
+              <div>Correct +ETB<br><b>${fmtN(g.acc_correct_bonus_etb)}</b></div>
+              <div>Wrong −ETB<br><b>${fmtN(g.acc_wrong_penalty_etb)}</b></div>
+              <div>Min / max meter<br><b>${fmtN(g.acc_meter_floor_etb)} — ${fmtN(g.acc_meter_ceiling_etb)}</b></div>
+              <div>Min Q before spin<br><b>${g.acc_min_questions_spin ?? '—'}</b></div>
+              <div>Mid-game cash-out<br><b>${g.acc_allow_mid_spin !== false ? 'Yes' : 'No'}</b></div>
+            </div>
+          </div>` : '<div style="margin-top:10px;font-size:.82rem;color:var(--muted)">Mode: <b>Legacy</b> (wheel after each correct)</div>'}
           <div style="margin-top:12px;font-size:.82rem;color:var(--muted);white-space:pre-line">${SHAMO_GAME_DESCRIPTION}</div>
         `;
                 document.getElementById('viewEditBtn').onclick = () => { closeModal('modalGameView'); editGame(id); };
@@ -623,11 +930,30 @@ Join SHAMO now. Test your knowledge. Spin. Win. Enjoy the game.`;
             document.getElementById('gameModalTitle').textContent = '＋ New Game';
             document.getElementById('gId').value = '';
             document.getElementById('gTitle').value = '';
-            document.getElementById('gPool').value = '500';
-            document.getElementById('gMaxPay').value = '1000';
+            document.getElementById('gPool').value = '10000';
+            document.getElementById('gMaxPay').value = '500';
             document.getElementById('gStatus').value = 'draft';
             document.getElementById('gCompany').value = '';
             document.getElementById('companyFilter').value = '__platform__';
+            document.getElementById('companyFundBlock').style.display = 'none';
+            document.getElementById('poolRowPlatform').style.display = '';
+            document.getElementById('gMaxPayError').textContent = '';
+            document.getElementById('gMaxPayError').style.display = 'none';
+            document.getElementById('gAccTotalQ').value = '';
+            document.getElementById('gAccSeconds').value = '8';
+            document.getElementById('gAccStart').value = '5';
+            document.getElementById('gAccBonus').value = '2';
+            document.getElementById('gAccPenalty').value = '2';
+            document.getElementById('gAccFloor').value = '1';
+            document.getElementById('gAccCeil').value = '500';
+            document.getElementById('gAccMinSpin').value = '5';
+            document.getElementById('gAccAllowMid').checked = true;
+            window.__companyBalanceLoaded = true;
+            window.__companyCreatePrizePool = 0;
+            ['depositedAmount', 'commissionAmount', 'prizePool'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.value = '';
+            });
             loadGames(1);
 
             // Default date/time = today in Ethiopian time (GMT+3)
@@ -638,6 +964,8 @@ Join SHAMO now. Test your knowledge. Spin. Win. Enjoy the game.`;
             document.getElementById('gEnds').value   = `${todayDate}T23:59`; // midnight ET
 
             openModal('modalGame');
+            onMaxPayInput();
+            updateGameSaveButtonState();
         }
 
         // ── Open edit form ────────────────────────────────────────────
@@ -653,13 +981,58 @@ Join SHAMO now. Test your knowledge. Spin. Win. Enjoy the game.`;
                 // starts_at and ends_at are stored as UTC ISO — convert to Ethiopian time for the input
                 document.getElementById('gStarts').value = utcToEtInput(g.starts_at);
                 document.getElementById('gEnds').value   = utcToEtInput(g.ends_at);
-                document.getElementById('gPool').value = g.prize_pool_etb ?? 500;
-                document.getElementById('gMaxPay').value = g.max_prize_etb ?? 1000;
+                document.getElementById('gPool').value = g.prize_pool_etb ?? 10000;
+                document.getElementById('gMaxPay').value = g.max_prize_etb ?? 500;
                 document.getElementById('gCompany').value = g.company_id || '';
                 document.getElementById('companyFilter').value = g.company_id ? g.company_id : '__platform__';
+                document.getElementById('companyFundBlock').style.display = 'none';
+                document.getElementById('poolRowPlatform').style.display = '';
+                document.getElementById('gMaxPayError').textContent = '';
+                document.getElementById('gMaxPayError').style.display = 'none';
+                document.getElementById('gameSaveBtn').disabled = false;
+                const atq = g.acc_total_questions;
+                document.getElementById('gAccTotalQ').value = (atq != null && atq >= 5) ? String(atq) : '';
+                document.getElementById('gAccSeconds').value = String(g.acc_question_seconds != null ? g.acc_question_seconds : 8);
+                document.getElementById('gAccStart').value = String(g.acc_start_etb != null ? g.acc_start_etb : 5);
+                document.getElementById('gAccBonus').value = String(g.acc_correct_bonus_etb != null ? g.acc_correct_bonus_etb : 2);
+                document.getElementById('gAccPenalty').value = String(g.acc_wrong_penalty_etb != null ? g.acc_wrong_penalty_etb : 2);
+                document.getElementById('gAccFloor').value = String(g.acc_meter_floor_etb != null ? g.acc_meter_floor_etb : 1);
+                document.getElementById('gAccCeil').value = String(g.acc_meter_ceiling_etb != null ? g.acc_meter_ceiling_etb : 500);
+                document.getElementById('gAccMinSpin').value = String(g.acc_min_questions_spin != null ? g.acc_min_questions_spin : 5);
+                document.getElementById('gAccAllowMid').checked = g.acc_allow_mid_spin !== false;
                 loadGames(1);
                 openModal('modalGame');
+                onMaxPayInput();
             } catch (e) { showToast(e.message, 'error'); }
+        }
+
+        function readAccumulatorPayload() {
+            const raw = (document.getElementById('gAccTotalQ').value || '').trim();
+            if (!raw) {
+                return {
+                    acc_total_questions: null,
+                    acc_question_seconds: null,
+                    acc_start_etb: null,
+                    acc_correct_bonus_etb: null,
+                    acc_wrong_penalty_etb: null,
+                    acc_meter_floor_etb: null,
+                    acc_meter_ceiling_etb: null,
+                    acc_min_questions_spin: null,
+                    acc_allow_mid_spin: null,
+                };
+            }
+            const n = Math.max(5, Math.min(50, parseInt(raw, 10) || 5));
+            return {
+                acc_total_questions: n,
+                acc_question_seconds: Math.max(5, Math.min(30, parseInt(document.getElementById('gAccSeconds').value, 10) || 8)),
+                acc_start_etb: parseFloat(document.getElementById('gAccStart').value) || 5,
+                acc_correct_bonus_etb: parseFloat(document.getElementById('gAccBonus').value) || 2,
+                acc_wrong_penalty_etb: parseFloat(document.getElementById('gAccPenalty').value) || 2,
+                acc_meter_floor_etb: parseFloat(document.getElementById('gAccFloor').value) || 1,
+                acc_meter_ceiling_etb: parseFloat(document.getElementById('gAccCeil').value) || 500,
+                acc_min_questions_spin: Math.max(1, Math.min(n, parseInt(document.getElementById('gAccMinSpin').value, 10) || 5)),
+                acc_allow_mid_spin: !!document.getElementById('gAccAllowMid').checked,
+            };
         }
 
         // ── Save (create or update) ──────────────────────────────────
@@ -679,18 +1052,41 @@ Join SHAMO now. Test your knowledge. Spin. Win. Enjoy the game.`;
             const startsAt = etInputToUtc(startsAtLocal);
             const endsAt   = etInputToUtc(endsAtLocal);
 
+            const cid = document.getElementById('gCompany').value || null;
+            const rawMax = String(document.getElementById('gMaxPay').value || '').replace(/,/g, '').trim();
+            const maxPrize = parseFloat(rawMax);
+            const isCreate = !id;
+            const poolPlatform = parseFloat(document.getElementById('gPool').value) || 0;
+            if (Number.isNaN(maxPrize) || maxPrize <= 0) {
+                showToast('Enter a valid Max Prize (ETB) greater than 0', 'error');
+                return;
+            }
+            if (isCreate && cid) {
+                const pool = window.__companyCreatePrizePool || 0;
+                if (maxPrize > pool + 1e-6) {
+                    showToast(`Max prize cannot exceed prize pool (${pool.toLocaleString()} ETB)`, 'error');
+                    return;
+                }
+            } else if (isCreate && !cid) {
+                if (maxPrize > poolPlatform + 1e-6) {
+                    showToast(`Max prize cannot exceed prize pool (${poolPlatform.toLocaleString()} ETB)`, 'error');
+                    return;
+                }
+            }
+
             const payload = {
                 title,
                 status: document.getElementById('gStatus').value,
                 game_date: gameDate,
                 starts_at: startsAt,
                 ends_at: endsAt,
-                prize_pool_etb: parseFloat(document.getElementById('gPool').value) || 500,
-                max_prize_etb: parseFloat(document.getElementById('gMaxPay').value) || 1000,
+                prize_pool_etb: isCreate && cid ? 0 : (poolPlatform || 10000),
+                max_prize_etb: maxPrize,
                 platform_fee_pct: 15,
                 player_cap_pct: 30,
                 description: SHAMO_GAME_DESCRIPTION,
-                company_id: document.getElementById('gCompany').value || null,
+                company_id: cid,
+                ...readAccumulatorPayload(),
             };
 
             const btn = document.getElementById('gameSaveBtn');
@@ -709,6 +1105,7 @@ Join SHAMO now. Test your knowledge. Spin. Win. Enjoy the game.`;
                 showToast('Error: ' + e.message, 'error');
             } finally {
                 btn.disabled = false; btn.textContent = '💾 Save Game';
+                updateGameSaveButtonState();
             }
         }
 
