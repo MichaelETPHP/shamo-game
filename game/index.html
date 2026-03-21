@@ -5650,6 +5650,8 @@
       const letters = ['A', 'B', 'C', 'D'];
       // Shuffle options per question (different order per user — dynamic, hard to cheat)
       const opts = shuffleArray(q.options || []);
+      // Keep display order for answerQ() so correct-option highlight matches DOM indices
+      q._displayOpts = opts;
       document.getElementById('qOpts').innerHTML = opts.map((o, i) => `
     <div class="q-opt" id="opt${i}" onclick="answerQ(${i},'${o.id}')">
       <div class="q-opt-ltr">${letters[i]}</div>
@@ -5724,6 +5726,10 @@
             })
           });
           const ansData = await ansRes.json().catch(() => ({}));
+          if (!ansRes.ok) {
+            console.warn('Answer API error:', ansRes.status, ansData);
+            toast((ansData.detail || ansData.message || 'Could not save answer') + '', 'error', 4000);
+          }
           isCorrect = ansData.is_correct === true;
           correctOptionId = ansData.correct_option_id || null;
           if (ansData.session) S.session = ansData.session;
@@ -5731,11 +5737,12 @@
         } catch (e) { console.warn('Answer submit:', e); }
       }
 
-      // Visual feedback
+      // Visual feedback (use shuffled order stored on q — not raw q.options)
+      const disp = q._displayOpts || q.options || [];
       document.getElementById('opt' + chosen).classList.add(isCorrect ? 'correct' : 'wrong');
       if (!isCorrect) playWrongSound();
       if (!isCorrect && correctOptionId) {
-        const ci = (q.options || []).findIndex(o => o.id === correctOptionId);
+        const ci = disp.findIndex(function (o) { return o.id === correctOptionId; });
         if (ci >= 0) document.getElementById('opt' + ci)?.classList.add('correct');
       }
       if (tg) tg.HapticFeedback?.notificationOccurred(isCorrect ? 'success' : 'error');

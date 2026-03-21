@@ -191,3 +191,13 @@ def deduct_from_pool(pool_id, amount):
     except Exception as e:
         logger.debug("deduct_from_pool: %s", e)
         return None
+
+
+def clear_prize_pool_cache(pool_id: str) -> None:
+    """Remove cached prize pool countdown/value for a game (pool_id is usually game UUID)."""
+    if not _ok():
+        return
+    try:
+        r.delete(f"shamo:pool:{pool_id}")
+    except Exception as e:
+        logger.debug("clear_prize_pool_cache: %s", e)

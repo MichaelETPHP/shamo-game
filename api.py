@@ -54,6 +54,7 @@ from redis_client import (
     update_leaderboard,
     get_leaderboard,
     check_rate_limit,
+    clear_prize_pool_cache,
 )
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -548,6 +549,9 @@ class GameUpdate(BaseModel):
     prize_pool_etb: Optional[float] = None; max_prize_etb: Optional[float] = None
     platform_fee_pct: Optional[float] = None; player_cap_pct: Optional[float] = None
     company_id: Optional[str] = None; deposit_id: Optional[str] = None
+
+class GamesBulkDeleteBody(BaseModel):
+    game_ids: List[str]
 
 class QuestionCreate(BaseModel):
     question_text: str; category: Optional[str] = None
@@ -1812,6 +1816,51 @@ async def clear_user_game_test(uid: str, body: ClearGameTestReq = None, _=Depend
 # ═══════════════════════════════════════════════════════════════════════════════
 # GAMES
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _delete_game_cascade_sync(sb: Client, gid: str) -> None:
+    """
+    Remove all game-related rows (QR, scans, sessions, answers, spins, leaderboard, questions)
+    and Redis prize-pool cache, then the game row.
+
+    Order avoids FK issues on DBs where some constraints are NO ACTION / SET NULL.
+    """
+    # QR flow (qr_scans reference qr_codes + games)
+    try:
+        _pg_table(sb, "qr_scans").delete().eq("game_id", gid).execute()
+    except Exception as e:
+        logger.debug("delete game %s: qr_scans: %s", gid, e)
+    try:
+        _pg_table(sb, "qr_codes").delete().eq("game_id", gid).execute()
+    except Exception as e:
+        logger.debug("delete game %s: qr_codes: %s", gid, e)
+
+    sb.table("round_answers").delete().eq("game_id", gid).execute()
+    sb.table("spin_results").delete().eq("game_id", gid).execute()
+
+    try:
+        sb.table("leaderboard").delete().eq("game_id", gid).execute()
+    except Exception as e:
+        logger.debug("delete game %s: leaderboard: %s", gid, e)
+
+    # Sessions CASCADE round_answers/spin_results on some DBs; already cleared above for safety
+    try:
+        sb.table("game_sessions").delete().eq("game_id", gid).execute()
+    except Exception as e:
+        logger.debug("delete game %s: game_sessions: %s", gid, e)
+
+    try:
+        sb.table("game_questions").delete().eq("game_id", gid).execute()
+    except Exception as e:
+        logger.debug("delete game %s: game_questions: %s", gid, e)
+
+    try:
+        clear_prize_pool_cache(gid)
+    except Exception as e:
+        logger.debug("delete game %s: redis pool: %s", gid, e)
+
+    sb.table("games").delete().eq("id", gid).execute()
+
+
 @app.get("/api/games")
 async def list_games(
     request: Request, _=Depends(require_admin),
@@ -1838,6 +1887,43 @@ async def list_games(
         normalize_game_prize_fields(g)
         g["company_name"] = (g.pop("companies", None) or {}).get("name") or g.get("company_name")
     return {"data": games, "total": res.count or 0, "page": page, "per_page": per_page}
+
+
+# Must be registered BEFORE /api/games/{gid} — otherwise "bulk-delete" is captured as {gid} and POST returns 405.
+@app.post("/api/games/bulk-delete")
+async def bulk_delete_games(body: GamesBulkDeleteBody, _=Depends(require_admin)):
+    """
+    Admin: delete many games using the same cascade as DELETE /api/games/{gid}.
+    Returns per-id success/failure so the UI can report partial deletes.
+    """
+    sb = get_sb()
+    raw = [str(x).strip() for x in (body.game_ids or []) if str(x).strip()]
+    seen = set()
+    ids: List[str] = []
+    for x in raw:
+        if x not in seen:
+            seen.add(x)
+            ids.append(x)
+    if not ids:
+        raise HTTPException(400, "No game IDs provided")
+    if len(ids) > 200:
+        raise HTTPException(400, "Maximum 200 games per bulk delete")
+    deleted: List[str] = []
+    failed: List[Dict[str, str]] = []
+    for gid in ids:
+        try:
+            await run(lambda g=gid: _delete_game_cascade_sync(sb, g))
+            deleted.append(gid)
+        except Exception as e:
+            logger.warning("bulk_delete game %s: %s", gid, e)
+            failed.append({"id": gid, "error": str(e)})
+    return {
+        "deleted": deleted,
+        "failed": failed,
+        "deleted_count": len(deleted),
+        "failed_count": len(failed),
+    }
+
 
 @app.get("/api/games/{gid}")
 async def get_game(gid: str, _=Depends(require_admin)):
@@ -1929,6 +2015,7 @@ async def create_game(body: GameCreate, _=Depends(require_admin)):
         game_data["deposit_id"] = deposit_id
     return game_data
 
+
 @app.put("/api/games/{gid}")
 async def update_game(gid: str, body: GameUpdate, _=Depends(require_admin)):
     updates = body.dict(exclude_none=True)
@@ -1957,16 +2044,7 @@ async def update_game(gid: str, body: GameUpdate, _=Depends(require_admin)):
 async def delete_game(gid: str, _=Depends(require_admin)):
     """Delete a game after removing rows that reference it without ON DELETE CASCADE."""
     sb = get_sb()
-
-    def _delete_game_cascade():
-        # Tables that reference games(id) without CASCADE — delete in dependency order
-        _pg_table(sb, "qr_scans").delete().eq("game_id", gid).execute()
-        sb.table("round_answers").delete().eq("game_id", gid).execute()
-        sb.table("spin_results").delete().eq("game_id", gid).execute()
-        # Now delete game (CASCADE will remove game_sessions, game_questions, qr_codes, leaderboard)
-        sb.table("games").delete().eq("id", gid).execute()
-
-    await run(_delete_game_cascade)
+    await run(lambda g=gid: _delete_game_cascade_sync(sb, g))
     return {"message": "Game deleted"}
 
 @app.post("/api/games/{gid}/activate")
@@ -3751,6 +3829,43 @@ async def get_game_questions_public(game_id: str, session_id: str = ""):
 
     return questions
 
+
+def _coerce_pg_bool(val: Any) -> bool:
+    """Postgres/PostgREST may return bool or string for boolean columns."""
+    if val is True:
+        return True
+    if val is False or val is None:
+        return False
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "t", "1", "yes")
+    return bool(val)
+
+
+async def _resolve_round_answer_level(sb: Client, game_id: str, question_id: str) -> str:
+    """
+    round_answers.level is NOT NULL (question_level enum). Prefer game_questions.level
+    for this game, then questions.level, else 'easy'.
+    """
+    gq = await run(
+        lambda: sb.table("game_questions")
+        .select("level")
+        .eq("game_id", game_id)
+        .eq("question_id", question_id)
+        .limit(1)
+        .execute()
+    )
+    row = (gq.data or [{}])[0] if gq.data else {}
+    lvl = (row.get("level") or "").strip().lower()
+    if lvl in ("easy", "medium", "hard"):
+        return lvl
+    qr = await run(lambda: sb.table("questions").select("level").eq("id", question_id).limit(1).execute())
+    row2 = (qr.data or [{}])[0] if qr.data else {}
+    lvl2 = (row2.get("level") or "").strip().lower()
+    if lvl2 in ("easy", "medium", "hard"):
+        return lvl2
+    return "easy"
+
+
 @app.post("/api/game/answer")
 async def submit_answer(body: AnswerReq):
     """
@@ -3760,34 +3875,53 @@ async def submit_answer(body: AnswerReq):
     """
     sb = get_sb()
 
-    is_correct  = False
-    status_val  = "timeout"
+    is_correct = False
+    status_val = "timeout"
+    opt_id = str(body.selected_option_id).strip() if body.selected_option_id else ""
 
-    if body.selected_option_id:
-        # Server-side truth check — client never knows is_correct in advance
+    if opt_id:
+        # Server-side truth: option must belong to this question and is_correct from DB
         try:
-            opt_res = await run(lambda: sb.table("answer_options")
-                .select("is_correct").eq("id", str(body.selected_option_id).strip()).limit(1).execute())
+            opt_res = await run(
+                lambda oid=opt_id: sb.table("answer_options")
+                .select("is_correct,question_id")
+                .eq("id", oid)
+                .limit(1)
+                .execute()
+            )
             row = (opt_res.data or [{}])[0] if opt_res.data else {}
-            is_correct = row.get("is_correct") is True
-            status_val = "correct" if is_correct else "wrong"
+            if row.get("question_id") != body.question_id:
+                logger.warning(
+                    "submit_answer: option %s does not belong to question %s",
+                    opt_id,
+                    body.question_id,
+                )
+                is_correct = False
+                status_val = "wrong"
+            else:
+                is_correct = _coerce_pg_bool(row.get("is_correct"))
+                status_val = "correct" if is_correct else "wrong"
         except Exception as e:
             logger.warning("submit_answer option lookup: %s", e)
             is_correct = False
             status_val = "wrong"
 
-    ans_payload = {
-        "session_id":        body.session_id,
-        "user_id":           body.user_id,
-        "game_id":           body.game_id,
-        "question_id":       body.question_id,
+    q_level = await _resolve_round_answer_level(sb, body.game_id, body.question_id)
+
+    # Schema: round_answers requires `level` (enum). Do not send `question_number` unless the
+    # column exists — it is not in the stock SHAMO migration and breaks inserts (→ 500 → client shows "wrong").
+    ans_payload: Dict[str, Any] = {
+        "session_id": body.session_id,
+        "user_id": body.user_id,
+        "game_id": body.game_id,
+        "question_id": body.question_id,
+        "level": q_level,
         "selected_option_id": body.selected_option_id,
-        "question_number":   body.question_number,
-        "is_correct":        is_correct,
-        "status":            status_val,
-        "time_taken_ms":     body.time_taken_ms,
+        "is_correct": is_correct,
+        "status": status_val,
+        "time_taken_ms": body.time_taken_ms,
     }
-    await run(lambda: sb.table("round_answers").insert(ans_payload).execute())
+    await run(lambda pl=dict(ans_payload): sb.table("round_answers").insert(pl).execute())
 
     # DB trigger (trg_on_round_answer) updates wrong_count and cooldown automatically
     # Fetch updated session to return to client

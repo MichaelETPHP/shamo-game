@@ -81,6 +81,40 @@
             font-weight: 700;
             color: var(--gold);
         }
+
+        .bulk-bar {
+            display: none;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+            margin-bottom: 14px;
+            padding: 12px 16px;
+            background: rgba(239, 68, 68, 0.08);
+            border: 1px solid rgba(239, 68, 68, 0.35);
+            border-radius: 10px;
+            font-size: .85rem;
+        }
+
+        .bulk-bar.visible {
+            display: flex;
+        }
+
+        .th-check {
+            width: 44px;
+            text-align: center;
+        }
+
+        .td-check {
+            text-align: center;
+            vertical-align: middle;
+        }
+
+        .td-check input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            cursor: pointer;
+            accent-color: var(--gold);
+        }
     </style>
 </head>
 
@@ -104,7 +138,9 @@
                         <option value="">All companies</option>
                         <option value="__platform__">Platform only (no company)</option>
                     </select>
-                    <button class="btn btn-primary" onclick="openCreateGame()">＋ New Game</button>
+                    <button type="button" class="btn btn-primary" onclick="openCreateGame()">＋ New Game</button>
+                    <button type="button" class="btn btn-red" id="btnBulkDelete" disabled title="Select games on this page first"
+                        onclick="openBulkDeleteConfirm()">🗑 Bulk delete</button>
                 </div>
             </div>
 
@@ -118,9 +154,18 @@
                     <div class="stat-chip gold"><strong id="sPayout">—</strong>Total Paid Out (ETB)</div>
                 </div>
 
+                <div class="bulk-bar" id="bulkBar">
+                    <span><strong id="bulkSelectedCount">0</strong> selected on this page</span>
+                    <button type="button" class="btn btn-ghost btn-sm" onclick="clearGameSelection()">Clear selection</button>
+                </div>
+
                 <table class="data-table">
                     <thead>
                         <tr>
+                            <th class="th-check" title="Select all on this page">
+                                <input type="checkbox" id="selectAllGames" aria-label="Select all games on this page"
+                                    onchange="toggleSelectAllGames(this.checked)" />
+                            </th>
                             <th>Title</th>
                             <th>Status</th>
                             <th>Date / Time</th>
@@ -134,11 +179,29 @@
                     </thead>
                     <tbody id="gamesBody">
                         <tr>
-                            <td colspan="9" style="text-align:center;padding:2rem;color:var(--muted)">⏳ Loading…</td>
+                            <td colspan="10" style="text-align:center;padding:2rem;color:var(--muted)">⏳ Loading…</td>
                         </tr>
                     </tbody>
                 </table>
                 <div class="pagination" id="gPagination"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Bulk delete: Yes / No confirmation ───────────────────── -->
+    <div class="modal-overlay" id="modalBulkDeleteConfirm">
+        <div class="modal" style="max-width:440px;width:100%">
+            <div class="modal-header">
+                <h2>Delete games?</h2>
+                <button type="button" class="btn btn-ghost btn-icon" onclick="closeModal('modalBulkDeleteConfirm')">✕</button>
+            </div>
+            <div class="modal-body">
+                <p id="bulkDeleteConfirmText" style="margin:0 0 12px 0;line-height:1.6;color:var(--text)"></p>
+                <p style="margin:0;font-size:.82rem;color:var(--muted)">This removes selected games and related sessions, QR codes, leaderboard rows, etc. This cannot be undone.</p>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-ghost" onclick="closeModal('modalBulkDeleteConfirm')">No</button>
+                <button type="button" class="btn btn-red" id="bulkDeleteYesBtn" onclick="executeBulkDelete()">Yes, delete</button>
             </div>
         </div>
     </div>
@@ -240,6 +303,80 @@ Join SHAMO now. Test your knowledge. Spin. Win. Enjoy the game.</div>
         let gPage = 1;
         let allCompanies = [];
 
+        function getGameCheckboxes() {
+            return Array.from(document.querySelectorAll('input.game-cb[data-game-id]'));
+        }
+
+        function getSelectedGameIds() {
+            return getGameCheckboxes().filter(cb => cb.checked).map(cb => cb.getAttribute('data-game-id'));
+        }
+
+        function updateBulkSelectionUI() {
+            const ids = getSelectedGameIds();
+            const n = ids.length;
+            const bar = document.getElementById('bulkBar');
+            const btn = document.getElementById('btnBulkDelete');
+            const cnt = document.getElementById('bulkSelectedCount');
+            const allCb = document.getElementById('selectAllGames');
+            const boxes = getGameCheckboxes();
+            if (cnt) cnt.textContent = String(n);
+            if (bar) bar.classList.toggle('visible', n > 0);
+            if (btn) btn.disabled = n === 0;
+            if (allCb && boxes.length) {
+                allCb.checked = n === boxes.length && n > 0;
+                allCb.indeterminate = n > 0 && n < boxes.length;
+            }
+        }
+
+        function toggleSelectAllGames(checked) {
+            getGameCheckboxes().forEach(cb => { cb.checked = checked; });
+            updateBulkSelectionUI();
+        }
+
+        function clearGameSelection() {
+            getGameCheckboxes().forEach(cb => { cb.checked = false; });
+            const allCb = document.getElementById('selectAllGames');
+            if (allCb) { allCb.checked = false; allCb.indeterminate = false; }
+            updateBulkSelectionUI();
+        }
+
+        function openBulkDeleteConfirm() {
+            const ids = getSelectedGameIds();
+            if (!ids.length) { showToast('Select at least one game', 'warning'); return; }
+            const t = document.getElementById('bulkDeleteConfirmText');
+            if (t) {
+                t.textContent = `You are about to permanently delete ${ids.length} game(s).`;
+            }
+            openModal('modalBulkDeleteConfirm');
+        }
+
+        async function executeBulkDelete() {
+            const ids = getSelectedGameIds();
+            if (!ids.length) { closeModal('modalBulkDeleteConfirm'); return; }
+            const yesBtn = document.getElementById('bulkDeleteYesBtn');
+            if (yesBtn) { yesBtn.disabled = true; yesBtn.textContent = 'Deleting…'; }
+            showSpinner('Deleting games…');
+            try {
+                const r = await apiFetch('/games/bulk-delete', { method: 'POST', body: { game_ids: ids } });
+                closeModal('modalBulkDeleteConfirm');
+                clearGameSelection();
+                const dc = r.deleted_count ?? (r.deleted || []).length;
+                const fc = r.failed_count ?? (r.failed || []).length;
+                if (fc && r.failed && r.failed.length) {
+                    const err0 = r.failed[0].error || '';
+                    showToast(`Deleted ${dc}, failed ${fc}. ${err0}`, 'warning');
+                } else {
+                    showToast(`Deleted ${dc} game(s) ✅`, 'success');
+                }
+                loadGames(gPage);
+            } catch (e) {
+                showToast(e.message || 'Bulk delete failed', 'error');
+            } finally {
+                hideSpinner();
+                if (yesBtn) { yesBtn.disabled = false; yesBtn.textContent = 'Yes, delete'; }
+            }
+        }
+
         // Read-only description for all games (never edited)
         const SHAMO_GAME_DESCRIPTION = `SHAMO is a fast trivia game where you answer short questions and win real cash.
 
@@ -285,7 +422,9 @@ Join SHAMO now. Test your knowledge. Spin. Win. Enjoy the game.`;
         async function loadGames(page = gPage) {
             gPage = page;
             const tbody = document.getElementById('gamesBody');
-            tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;padding:2rem;color:var(--muted)">⏳ Loading…</td></tr>`;
+            const allCb = document.getElementById('selectAllGames');
+            if (allCb) { allCb.checked = false; allCb.indeterminate = false; }
+            tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;padding:2rem;color:var(--muted)">⏳ Loading…</td></tr>`;
             try {
                 const search = document.getElementById('searchG').value;
                 const status = document.getElementById('statusFilter').value;
@@ -304,12 +443,17 @@ Join SHAMO now. Test your knowledge. Spin. Win. Enjoy the game.`;
                 document.getElementById('sPayout').textContent = fmtN(Math.round(totalPayout)) + ' ETB';
 
                 if (!games.length) {
-                    tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;padding:3rem;color:var(--muted)">📭 No games found</td></tr>`;
+                    tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;padding:3rem;color:var(--muted)">📭 No games found</td></tr>`;
+                    updateBulkSelectionUI();
                     return;
                 }
 
                 tbody.innerHTML = games.map(g => `
 <tr class="game-row" style="cursor:pointer" onclick="toggleQuestions('${g.id}', this)">
+  <td class="td-check" onclick="event.stopPropagation()">
+    <input type="checkbox" class="game-cb" data-game-id="${g.id}" aria-label="Select ${(g.title || 'game').replace(/"/g, '&quot;')}"
+      onclick="event.stopPropagation()" onchange="updateBulkSelectionUI()" />
+  </td>
   <td>
     <div style="font-weight:700;color:var(--gold)">${g.title || '—'}</div>
     <div style="font-size:.68rem;color:var(--muted)">${fmtN(g.player_cap_pct || 0)}% player cap · fee ${g.platform_fee_pct || 0}%</div>
@@ -334,7 +478,7 @@ Join SHAMO now. Test your knowledge. Spin. Win. Enjoy the game.`;
   </td>
 </tr>
 <tr id="qs-${g.id}" style="display:none; background: rgba(0,0,0,0.15);">
-  <td colspan="9" style="padding: 0;">
+  <td colspan="10" style="padding: 0;">
     <div style="padding: 16px; border-left: 3px solid var(--gold); margin: 8px 16px; background: var(--surface); border-radius: 8px;">
       <div id="qs-content-${g.id}">⏳ Loading…</div>
       <div id="qr-content-${g.id}" style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border)"></div>
@@ -343,8 +487,10 @@ Join SHAMO now. Test your knowledge. Spin. Win. Enjoy the game.`;
 </tr>`).join('');
 
                 renderPagination('gPagination', r.page, r.total, r.per_page, 'loadGames');
+                updateBulkSelectionUI();
             } catch (e) {
-                tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;padding:2rem;color:var(--muted)">❌ ${e.message}</td></tr>`;
+                tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;padding:2rem;color:var(--muted)">❌ ${e.message}</td></tr>`;
+                updateBulkSelectionUI();
             }
         }
 
